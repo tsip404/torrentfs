@@ -326,6 +326,9 @@ impl InodeManager {
             kind: fuser::FileType::Directory,
             perm: if writable { 0o755 } else { 0o555 },
             nlink: 2,
+            // SAFETY: libc::getuid() / libc::getgid() are always safe to call
+            // in POSIX environments — they simply return the current process's
+            // real user/group IDs and have no preconditions.
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             rdev: 0,
@@ -346,6 +349,9 @@ impl InodeManager {
             kind: fuser::FileType::RegularFile,
             perm: 0o444,
             nlink: 1,
+            // SAFETY: libc::getuid() / libc::getgid() are always safe to call
+            // in POSIX environments — they simply return the current process's
+            // real user/group IDs and have no preconditions.
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             rdev: 0,
