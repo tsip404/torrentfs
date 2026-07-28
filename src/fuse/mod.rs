@@ -86,11 +86,6 @@ impl TorrentFs {
         )
     }
 
-    #[allow(dead_code)]
-    pub fn new_with_db(_db: Database) -> Self {
-        Self::new()
-    }
-
     pub fn new_with_db_and_cache(
         db: Database,
         cache_path: PathBuf,
