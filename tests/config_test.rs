@@ -1,0 +1,256 @@
+//! Tests for the --config parameter (TSI-1949, scenario 10).
+//!
+//! Validates the full config loading pipeline:
+//! 1. TOML parsing succeeds with all sections
+//! 2. Non-default values are correctly parsed
+//! 3. JSON serialization for libtorrent FFI works
+//! 4. Config file missing/broken yields appropriate errors
+
+use std::io::Write;
+use torrentfs::TorrentfsConfig;
+
+/// Helper: write a TOML string to a temp file and load it.
+fn load_config_from_str(toml_content: &str) -> Result<TorrentfsConfig, String> {
+    let mut file = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+    write!(file, "{}", toml_content).map_err(|e| e.to_string())?;
+    TorrentfsConfig::from_file(file.path()).map_err(|e| e.to_string())
+}
+
+#[test]
+fn test_load_default_config_is_all_none() {
+    let cfg = TorrentfsConfig::default_config();
+    // All fields should be None (default)
+    assert!(cfg.connections.listen_interfaces.is_none());
+    assert!(cfg.connections.max_connections.is_none());
+    assert!(cfg.dht.enabled.is_none());
+    assert!(cfg.cache.cache_size.is_none());
+    assert!(cfg.timeouts.read_timeout_secs.is_none());
+}
+
+#[test]
+fn test_load_config_with_connections() {
+    let toml = r#"
+[connections]
+listen_interfaces = "0.0.0.0:6881"
+max_connections = 200
+allow_multiple_connections_per_ip = true
+"#;
+    let cfg = load_config_from_str(toml).expect("Failed to load config");
+    assert_eq!(
+        cfg.connections.listen_interfaces,
+        Some("0.0.0.0:6881".to_string())
+    );
+    assert_eq!(cfg.connections.max_connections, Some(200));
+    assert_eq!(
+        cfg.connections.allow_multiple_connections_per_ip,
+        Some(true)
+    );
+}
+
+#[test]
+fn test_load_config_with_dht_disabled() {
+    let toml = r#"
+[dht]
+enabled = false
+max_dht_items = 500
+"#;
+    let cfg = load_config_from_str(toml).expect("Failed to load config");
+    assert_eq!(cfg.dht.enabled, Some(false));
+    assert_eq!(cfg.dht.max_dht_items, Some(500));
+}
+
+#[test]
+fn test_load_config_with_rate_limits() {
+    let toml = r#"
+[rate_limits]
+download_rate_limit = 1048576
+upload_rate_limit = 524288
+"#;
+    let cfg = load_config_from_str(toml).expect("Failed to load config");
+    assert_eq!(cfg.rate_limits.download_rate_limit, Some(1048576));
+    assert_eq!(cfg.rate_limits.upload_rate_limit, Some(524288));
+}
+
+#[test]
+fn test_load_config_with_cache() {
+    let toml = r#"
+[cache]
+cache_size = 67108864
+cache_expiry = 3600
+use_read_cache = true
+"#;
+    let cfg = load_config_from_str(toml).expect("Failed to load config");
+    assert_eq!(cfg.cache.cache_size, Some(67108864));
+    assert_eq!(cfg.cache.cache_expiry, Some(3600));
+    assert_eq!(cfg.cache.use_read_cache, Some(true));
+}
+
+#[test]
+fn test_load_config_with_timeouts() {
+    let toml = r#"
+[timeouts]
+read_timeout_secs = 60
+peer_timeout = 120
+"#;
+    let cfg = load_config_from_str(toml).expect("Failed to load config");
+    assert_eq!(cfg.timeouts.read_timeout_secs, Some(60));
+    assert_eq!(cfg.timeouts.peer_timeout, Some(120));
+}
+
+#[test]
+fn test_load_config_with_disk_io() {
+    let toml = r#"
+[disk_io]
+disk_io_write_mode = 1
+disk_io_read_mode = 1
+file_pool_size = 40
+"#;
+    let cfg = load_config_from_str(toml).expect("Failed to load config");
+    assert_eq!(cfg.disk_io.disk_io_write_mode, Some(1));
+    assert_eq!(cfg.disk_io.disk_io_read_mode, Some(1));
+    assert_eq!(cfg.disk_io.file_pool_size, Some(40));
+}
+
+#[test]
+fn test_load_config_with_multiple_sections() {
+    let toml = r#"
+[connections]
+listen_interfaces = "0.0.0.0:6881"
+max_connections = 100
+allow_multiple_connections_per_ip = true
+
+[dht]
+enabled = false
+
+[local_discovery]
+lsd_enabled = true
+upnp_enabled = false
+natpmp_enabled = false
+
+[rate_limits]
+download_rate_limit = 1048576
+upload_rate_limit = 524288
+
+[cache]
+cache_size = 67108864
+
+[timeouts]
+read_timeout_secs = 60
+
+[disk_io]
+disk_io_write_mode = 1
+disk_io_read_mode = 1
+"#;
+    let cfg = load_config_from_str(toml).expect("Failed to load multi-section config");
+
+    // Verify connections
+    assert_eq!(
+        cfg.connections.listen_interfaces,
+        Some("0.0.0.0:6881".to_string())
+    );
+    assert_eq!(cfg.connections.max_connections, Some(100));
+    assert_eq!(
+        cfg.connections.allow_multiple_connections_per_ip,
+        Some(true)
+    );
+
+    // Verify DHT
+    assert_eq!(cfg.dht.enabled, Some(false));
+
+    // Verify local discovery
+    assert_eq!(cfg.local_discovery.lsd_enabled, Some(true));
+    assert_eq!(cfg.local_discovery.upnp_enabled, Some(false));
+    assert_eq!(cfg.local_discovery.natpmp_enabled, Some(false));
+
+    // Verify rate limits
+    assert_eq!(cfg.rate_limits.download_rate_limit, Some(1048576));
+    assert_eq!(cfg.rate_limits.upload_rate_limit, Some(524288));
+
+    // Verify cache
+    assert_eq!(cfg.cache.cache_size, Some(67108864));
+
+    // Verify timeouts
+    assert_eq!(cfg.timeouts.read_timeout_secs, Some(60));
+
+    // Verify disk IO
+    assert_eq!(cfg.disk_io.disk_io_write_mode, Some(1));
+    assert_eq!(cfg.disk_io.disk_io_read_mode, Some(1));
+}
+
+#[test]
+fn test_load_config_empty_file_defaults() {
+    let toml = "";
+    let cfg = load_config_from_str(toml).expect("Empty config should load with defaults");
+    // Empty TOML should produce all-None config (same as default)
+    assert!(cfg.connections.max_connections.is_none());
+    assert!(cfg.dht.enabled.is_none());
+    assert!(cfg.cache.cache_size.is_none());
+}
+
+#[test]
+fn test_load_config_invalid_toml_returns_error() {
+    let toml = "this is not valid toml {{{";
+    let result = load_config_from_str(toml);
+    assert!(result.is_err(), "Invalid TOML should return error");
+}
+
+#[test]
+fn test_load_config_nonexistent_file_returns_error() {
+    let result = TorrentfsConfig::from_file(std::path::Path::new("/nonexistent/config/path.toml"));
+    assert!(result.is_err(), "Nonexistent file should return error");
+}
+
+#[test]
+fn test_config_to_settings_json() {
+    let toml = r#"
+[connections]
+listen_interfaces = "0.0.0.0:6881"
+max_connections = 100
+
+[dht]
+enabled = false
+"#;
+    let cfg = load_config_from_str(toml).expect("Failed to load config");
+
+    let json = cfg.to_settings_json();
+    assert!(json.contains("listen_interfaces"));
+    assert!(json.contains("0.0.0.0:6881"));
+    assert!(json.contains("max_connections"));
+    assert!(json.contains("100"));
+    assert!(json.contains("enable_dht"));
+    assert!(json.contains("false"));
+}
+
+#[test]
+fn test_config_to_settings_json_default_is_empty() {
+    let cfg = TorrentfsConfig::default_config();
+    let json = cfg.to_settings_json();
+    // Default config with all None should produce empty JSON object
+    assert_eq!(json, "{}");
+}
+
+#[test]
+fn test_load_test_config_file() {
+    // Load the test-config.toml that ships with the project
+    let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-config.toml");
+    let cfg =
+        TorrentfsConfig::from_file(&config_path).expect("Failed to load project test-config.toml");
+
+    // Verify key non-default values from the file
+    assert_eq!(
+        cfg.connections.listen_interfaces,
+        Some("0.0.0.0:6881".to_string())
+    );
+    assert_eq!(cfg.connections.max_connections, Some(100));
+    assert_eq!(
+        cfg.connections.allow_multiple_connections_per_ip,
+        Some(true)
+    );
+    assert_eq!(cfg.dht.enabled, Some(false));
+    assert_eq!(cfg.rate_limits.download_rate_limit, Some(1048576));
+    assert_eq!(cfg.rate_limits.upload_rate_limit, Some(524288));
+    assert_eq!(cfg.cache.cache_size, Some(67108864));
+    assert_eq!(cfg.timeouts.read_timeout_secs, Some(60));
+    assert_eq!(cfg.disk_io.disk_io_write_mode, Some(1));
+    assert_eq!(cfg.disk_io.disk_io_read_mode, Some(1));
+}

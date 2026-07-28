@@ -1,0 +1,29 @@
+# Test configuration file for --config parameter validation (TSI-1949, scenario 10)
+# Uses non-default values to verify config loading pipeline works end-to-end
+
+[connections]
+listen_interfaces = "0.0.0.0:6881"
+max_connections = 100
+allow_multiple_connections_per_ip = true
+
+[dht]
+enabled = false
+
+[local_discovery]
+lsd_enabled = true
+upnp_enabled = false
+natpmp_enabled = false
+
+[rate_limits]
+download_rate_limit = 1048576
+upload_rate_limit = 524288
+
+[cache]
+cache_size = 67108864
+
+[timeouts]
+read_timeout_secs = 60
+
+[disk_io]
+disk_io_write_mode = 1
+disk_io_read_mode = 1
