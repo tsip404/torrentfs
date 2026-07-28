@@ -639,7 +639,14 @@ impl Filesystem for TorrentFs {
                     let source_path = self.inode_mgr.extract_source_path(parent);
 
                     {
-                        let mut processing = self.processing_torrents.lock().unwrap();
+                        let mut processing = match self.processing_torrents.lock() {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                error!("Mutex poisoned in release(): {}", e);
+                                reply.error(EIO);
+                                return;
+                            }
+                        };
                         if processing.contains_key(&source_path) {
                             warn!(
                                 "Torrent {} already being processed, skipping",
@@ -658,7 +665,14 @@ impl Filesystem for TorrentFs {
                             }
                             Err(e) => {
                                 error!("Failed to process torrent {}: {}", name, e);
-                                let mut processing = self.processing_torrents.lock().unwrap();
+                                let mut processing = match self.processing_torrents.lock() {
+                                    Ok(guard) => guard,
+                                    Err(poison) => {
+                                        error!("Mutex poisoned in release() error path: {}", poison);
+                                        reply.error(EIO);
+                                        return;
+                                    }
+                                };
                                 processing.remove(&source_path);
                             }
                         }
@@ -670,8 +684,15 @@ impl Filesystem for TorrentFs {
                         );
                     }
 
-                    let mut processing = self.processing_torrents.lock().unwrap();
-                    processing.remove(&source_path);
+                    let mut processing = match self.processing_torrents.lock() {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        error!("Mutex poisoned in release() cleanup: {}", e);
+                        reply.error(EIO);
+                        return;
+                    }
+                };
+                processing.remove(&source_path);
                 }
             }
         }
@@ -1279,13 +1300,27 @@ impl Filesystem for TorrentFs {
                                     _ => true,
                                 });
 
-                            let mut processing = self.processing_torrents.lock().unwrap();
-                            processing.remove(&source_path);
-                            drop(processing);
+                            let mut processing = match self.processing_torrents.lock() {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                error!("Mutex poisoned in unlink() processing_torrents: {}", e);
+                                reply.error(EIO);
+                                return;
+                            }
+                        };
+                        processing.remove(&source_path);
+                        drop(processing);
 
-                            let mut cache = self.torrent_data_cache.lock().unwrap();
-                            cache.remove(&source_path);
-                            drop(cache);
+                        let mut cache = match self.torrent_data_cache.lock() {
+                            Ok(guard) => guard,
+                            Err(e) => {
+                                error!("Mutex poisoned in unlink() torrent_data_cache: {}", e);
+                                reply.error(EIO);
+                                return;
+                            }
+                        };
+                        cache.remove(&source_path);
+                        drop(cache);
 
                             info!(
                                 "Deleted torrent '{}' (id={}, source_path='{}')",
