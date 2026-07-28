@@ -31,6 +31,11 @@ impl From<std::io::Error> for TorrentError {
 
 pub type TorrentResult<T> = Result<T, TorrentError>;
 
+/// Convert a C `lt_error_t` pointer into a `TorrentError`.
+///
+/// # Safety
+///
+/// `error` must be either null or a valid, aligned pointer to an `lt_error_t`.
 pub(crate) unsafe fn error_from_c(error: *const libtorrent_sys::lt_error_t) -> TorrentError {
     if error.is_null() {
         return TorrentError::Unknown {
@@ -39,10 +44,14 @@ pub(crate) unsafe fn error_from_c(error: *const libtorrent_sys::lt_error_t) -> T
         };
     }
 
+    // SAFETY: `error` was checked for null above; if non-null it is a valid
+    // pointer from libtorrent that remains valid for the duration of this call.
     let error_ref = &*error;
     let message = if error_ref.message.is_null() {
         "Unknown error".to_string()
     } else {
+        // SAFETY: `message` was checked for non-null above; the C string is
+        // NUL-terminated per libtorrent's contract and remains valid here.
         CStr::from_ptr(error_ref.message)
             .to_string_lossy()
             .into_owned()
