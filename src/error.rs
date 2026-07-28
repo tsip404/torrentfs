@@ -31,19 +31,6 @@ impl From<std::io::Error> for TorrentError {
 
 pub type TorrentResult<T> = Result<T, TorrentError>;
 
-#[derive(Error, Debug)]
-#[allow(dead_code)]
-pub enum TorrentfsError {
-    #[error("Initialization error: {0}")]
-    Initialization(String),
-
-    #[error("Mount error: {0}")]
-    Mount(String),
-
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-}
-
 pub(crate) unsafe fn error_from_c(error: *const libtorrent_sys::lt_error_t) -> TorrentError {
     if error.is_null() {
         return TorrentError::Unknown {
