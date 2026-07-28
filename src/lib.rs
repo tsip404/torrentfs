@@ -10,7 +10,6 @@ pub mod seeding;
 pub mod services;
 pub mod storage;
 pub mod torrent;
-pub mod torrent_info;
 
 // Re-exports for backward compatibility
 pub use cache::{CacheManager, PieceMetadata};
