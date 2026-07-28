@@ -30,21 +30,82 @@ pub fn format_bytes(bytes: u64) -> String {
 
 /// Format a number with thousand separators.
 pub fn format_num(n: u64) -> String {
-    if n == 0 {
-        return "0".to_string();
-    }
-    let mut s = String::new();
-    let mut remaining = n;
-    let mut count = 0;
-    while remaining > 0 {
-        if count > 0 && count % 3 == 0 {
-            s.push(',');
+    let s = n.to_string();
+    let len = s.len();
+    // Pre-allocate: each group of 3 digits gets a comma (except the first group)
+    let mut result = String::with_capacity(len + (len.saturating_sub(1)) / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            result.push(',');
         }
-        s.push(((remaining % 10) as u8 + b'0') as char);
-        remaining /= 10;
-        count += 1;
+        result.push(c);
     }
-    s.chars().rev().collect()
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_num_zero() {
+        assert_eq!(format_num(0), "0");
+    }
+
+    #[test]
+    fn test_format_num_single_digit() {
+        assert_eq!(format_num(5), "5");
+    }
+
+    #[test]
+    fn test_format_num_two_digits() {
+        assert_eq!(format_num(42), "42");
+    }
+
+    #[test]
+    fn test_format_num_three_digits() {
+        assert_eq!(format_num(999), "999");
+    }
+
+    #[test]
+    fn test_format_num_thousand() {
+        assert_eq!(format_num(1000), "1,000");
+    }
+
+    #[test]
+    fn test_format_num_ten_thousand() {
+        assert_eq!(format_num(10000), "10,000");
+    }
+
+    #[test]
+    fn test_format_num_hundred_thousand() {
+        assert_eq!(format_num(100000), "100,000");
+    }
+
+    #[test]
+    fn test_format_num_million() {
+        assert_eq!(format_num(1000000), "1,000,000");
+    }
+
+    #[test]
+    fn test_format_num_seven_digits() {
+        assert_eq!(format_num(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn test_format_num_eight_digits() {
+        assert_eq!(format_num(12345678), "12,345,678");
+    }
+
+    #[test]
+    fn test_format_num_nine_digits() {
+        assert_eq!(format_num(123456789), "123,456,789");
+    }
+
+    #[test]
+    fn test_format_num_u64_max() {
+        assert_eq!(format_num(u64::MAX), "18,446,744,073,709,551,615");
+    }
 }
 
 /// Generate the .stats file content.
