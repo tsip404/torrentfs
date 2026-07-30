@@ -1111,9 +1111,11 @@ public:
     void free_disk_buffer(char* b) override {
         std::free(b);
     }
+#if LIBTORRENT_VERSION_NUM >= 20100
     void free_multiple_buffers(lt::span<char*> bufs) override {
         for (auto* b : bufs) std::free(b);
     }
+#endif
 
     // disk_interface: new_torrent
     lt::storage_holder new_torrent(lt::storage_params const& p,
