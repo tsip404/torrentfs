@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod config;
 pub mod db;
+pub mod domain;
 pub mod download;
 pub mod error;
 pub mod fuse;
@@ -17,6 +18,12 @@ pub use config::TorrentfsConfig;
 pub use db::{
     Database, DbError, FileEntry, InsertTorrentResult, Torrent, TorrentDirectory, TorrentFile,
     TorrentStatus,
+};
+pub use domain::{
+    DbError as DomainDbError, FileEntry as DomainFileEntry, FileRepository,
+    InsertTorrentResult as DomainInsertResult, Torrent as DomainTorrent,
+    TorrentDirectory as DomainTorrentDirectory, TorrentFile as DomainTorrentFile,
+    TorrentRepository, TorrentStatus as DomainTorrentStatus,
 };
 pub use download::{
     DownloadManager, FilePieceInfo, Session, TorrentHandle, TorrentState,
