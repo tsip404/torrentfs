@@ -1154,10 +1154,18 @@ public:
         }
 
         if (ps->read_piece(static_cast<int>(r.piece), r.start, buf, r.length)) {
+#if LIBTORRENT_VERSION_NUM >= 20100
             handler(lt::disk_buffer_holder(*this, buf), lt::storage_error());
+#else
+            handler(lt::disk_buffer_holder(*this, buf, r.length), lt::storage_error());
+#endif
         } else {
             std::memset(buf, 0, r.length);
+#if LIBTORRENT_VERSION_NUM >= 20100
             handler(lt::disk_buffer_holder(*this, buf), lt::storage_error());
+#else
+            handler(lt::disk_buffer_holder(*this, buf, r.length), lt::storage_error());
+#endif
         }
     }
 
