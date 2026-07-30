@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cctype>
 #include <map>
+#include <set>
 #include <fstream>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -1109,11 +1110,28 @@ public:
 
     // buffer_allocator_interface
     void free_disk_buffer(char* b) override {
-        std::free(b);
+        if (b) {
+            std::lock_guard<std::mutex> lock(m_alloc_mutex);
+            auto it = m_allocated.find(b);
+            if (it != m_allocated.end()) {
+                m_allocated.erase(it);
+                std::free(b);
+            }
+            // else: double-free, silently ignore
+        }
     }
 #if LIBTORRENT_VERSION_NUM >= 20100
     void free_multiple_buffers(lt::span<char*> bufs) override {
-        for (auto* b : bufs) std::free(b);
+        std::lock_guard<std::mutex> lock(m_alloc_mutex);
+        for (auto* b : bufs) {
+            if (b) {
+                auto it = m_allocated.find(b);
+                if (it != m_allocated.end()) {
+                    m_allocated.erase(it);
+                    std::free(b);
+                }
+            }
+        }
     }
 #endif
 
@@ -1154,6 +1172,10 @@ public:
                 lt::storage_error(lt::error_code(boost::system::errc::not_enough_memory, boost::system::generic_category())));
             return;
         }
+        {
+            std::lock_guard<std::mutex> lock(m_alloc_mutex);
+            m_allocated.insert(buf);
+        }
 
         if (ps->read_piece(static_cast<int>(r.piece), r.start, buf, r.length)) {
 #if LIBTORRENT_VERSION_NUM >= 20100
@@ -1162,12 +1184,13 @@ public:
             handler(lt::disk_buffer_holder(*this, buf, r.length), lt::storage_error());
 #endif
         } else {
-            std::memset(buf, 0, r.length);
-#if LIBTORRENT_VERSION_NUM >= 20100
-            handler(lt::disk_buffer_holder(*this, buf), lt::storage_error());
-#else
-            handler(lt::disk_buffer_holder(*this, buf, r.length), lt::storage_error());
-#endif
+            {
+                std::lock_guard<std::mutex> lock(m_alloc_mutex);
+                m_allocated.erase(buf);
+            }
+            std::free(buf);
+            handler(lt::disk_buffer_holder(),
+                lt::storage_error(lt::error_code(boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
         }
     }
 
@@ -1333,6 +1356,8 @@ private:
     std::mutex m_mutex;
     std::map<lt::storage_index_t, std::unique_ptr<PieceStorage>> m_storages;
     lt::storage_index_t m_next_index{0};
+    std::set<char*> m_allocated;
+    std::mutex m_alloc_mutex;
 };
 
 } // anonymous namespace
@@ -1369,9 +1394,9 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(
 
         // Replace the existing session with our custom-disk-io session
         std::lock_guard<std::mutex> lock(wrapper->mutex);
+        wrapper->session->abort();
         delete wrapper->session;
         wrapper->session = new lt::session(std::move(params));
-
         // Add the torrent
         lt::add_torrent_params atp;
         atp.ti = std::make_shared<lt::torrent_info>(*ti);
@@ -1417,9 +1442,9 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
 
         // Replace the existing session with our custom-disk-io session
         std::lock_guard<std::mutex> lock(wrapper->mutex);
+        wrapper->session->abort();
         delete wrapper->session;
         wrapper->session = new lt::session(std::move(params));
-
         // Add the torrent with upload_mode: connect to trackers/peers but never request pieces
         lt::add_torrent_params atp;
         atp.ti = std::make_shared<lt::torrent_info>(*ti);
