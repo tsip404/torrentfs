@@ -84,7 +84,7 @@ lt_torrent_info_t lt_torrent_info_create(const char* filepath, lt_error_t* error
 lt_torrent_info_t lt_torrent_info_create_from_buffer(const uint8_t* data, size_t size, lt_error_t* error) {
     try {
         lt::error_code ec;
-        lt::torrent_info ti(reinterpret_cast<const char*>(data), static_cast<int>(size), ec);
+        lt::torrent_info ti(lt::span<char const>(reinterpret_cast<const char*>(data), size), ec, lt::from_span);
         if (ec) {
             if (error) {
                 error->code = ec.value();
