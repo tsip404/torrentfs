@@ -1219,7 +1219,12 @@ public:
         lt::move_flags_t /*flags*/,
         std::function<void(lt::status_t, std::string const&, lt::storage_error const&)> handler) override
     {
+#if LIBTORRENT_VERSION_NUM >= 20100
         handler(lt::disk_status::fatal_disk_error, std::string(),
+#else
+        // libtorrent 2.0.x: disk_status namespace not available, use default status_t
+        handler(lt::status_t{}, std::string(),
+#endif
             lt::storage_error(lt::error_code(boost::system::errc::not_supported, boost::system::generic_category())));
     }
 

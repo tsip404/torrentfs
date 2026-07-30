@@ -1,17 +1,6 @@
 # Stage 1: Build
 FROM rust:1.97-bookworm AS builder
 
-# Add Debian testing repos for libtorrent >=2.1.0 (not in bookworm)
-# Pin everything from testing to low priority, only libtorrent gets priority 500
-RUN echo 'deb http://deb.debian.org/debian testing main' > /etc/apt/sources.list.d/testing.list && \
-    echo 'Package: *' > /etc/apt/preferences.d/testing && \
-    echo 'Pin: release a=testing' >> /etc/apt/preferences.d/testing && \
-    echo 'Pin-Priority: 100' >> /etc/apt/preferences.d/testing && \
-    echo '' >> /etc/apt/preferences.d/testing && \
-    echo 'Package: libtorrent-rasterbar*' >> /etc/apt/preferences.d/testing && \
-    echo 'Pin: release a=testing' >> /etc/apt/preferences.d/testing && \
-    echo 'Pin-Priority: 500' >> /etc/apt/preferences.d/testing
-
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libtorrent-rasterbar-dev \
     libssl-dev \
@@ -30,13 +19,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release && \
     cp target/release/torrentfs /torrentfs
 
-# Stage 2: Runtime — Debian testing for libtorrent >=2.1.0
-FROM debian:testing-slim
+# Stage 2: Runtime
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libtorrent-rasterbar \
-    libssl3t64 \
-    libfuse2t64 \
+    libtorrent-rasterbar2.0 \
+    libssl3 \
+    libfuse2 \
     fuse3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
