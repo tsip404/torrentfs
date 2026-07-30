@@ -2,10 +2,15 @@
 FROM rust:1.97-bookworm AS builder
 
 # Add Debian testing repos for libtorrent >=2.1.0 (not in bookworm)
+# Pin everything from testing to low priority, only libtorrent gets priority 500
 RUN echo 'deb http://deb.debian.org/debian testing main' > /etc/apt/sources.list.d/testing.list && \
-    echo 'Package: libtorrent-rasterbar*' > /etc/apt/preferences.d/libtorrent && \
-    echo 'Pin: release a=testing' >> /etc/apt/preferences.d/libtorrent && \
-    echo 'Pin-Priority: 500' >> /etc/apt/preferences.d/libtorrent
+    echo 'Package: *' > /etc/apt/preferences.d/testing && \
+    echo 'Pin: release a=testing' >> /etc/apt/preferences.d/testing && \
+    echo 'Pin-Priority: 100' >> /etc/apt/preferences.d/testing && \
+    echo '' >> /etc/apt/preferences.d/testing && \
+    echo 'Package: libtorrent-rasterbar*' >> /etc/apt/preferences.d/testing && \
+    echo 'Pin: release a=testing' >> /etc/apt/preferences.d/testing && \
+    echo 'Pin-Priority: 500' >> /etc/apt/preferences.d/testing
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libtorrent-rasterbar-dev \
