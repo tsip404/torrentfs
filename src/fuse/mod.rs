@@ -28,9 +28,9 @@ use self::stats::generate_stats;
 
 use crate::cache::CacheManager;
 use crate::db::Database;
-use crate::download::DownloadManager;
 use crate::metadata::TorrentInfo;
-use crate::seeding::SeedingManager;
+use crate::services::download::DownloadService;
+use crate::services::seeding::SeedingService;
 use crate::services::torrent::TorrentService;
 
 pub struct TorrentFs {
@@ -38,7 +38,7 @@ pub struct TorrentFs {
     pub db: Option<Arc<Mutex<Database>>>,
     pub torrent_service: Option<TorrentService>,
     pub processing_torrents: Arc<Mutex<HashMap<String, ()>>>,
-    pub download_manager: Option<Arc<Mutex<DownloadManager>>>,
+    pub download_service: Option<DownloadService>,
     pub torrent_data_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
@@ -50,13 +50,12 @@ impl TorrentFs {
             }
         }
 
-        let mut download_manager = DownloadManager::new(cache_path.as_path(), config).ok();
+        let download_service = DownloadService::new(cache_path.as_path(), config).ok();
 
-        // Register SeedingManager as eviction callback on the DownloadManager's CacheManager
-        if let Some(ref mut dm) = download_manager {
-            if let Ok(seeding) = SeedingManager::new(&cache_path, config) {
-                let seeding = std::sync::Arc::new(seeding);
-                dm.register_seeding_callback(seeding);
+        // Register SeedingManager as eviction callback on the DownloadService's CacheManager
+        if let Some(ref ds) = download_service {
+            if let Ok(seeding_svc) = SeedingService::new(&cache_path, config) {
+                ds.register_seeding_callback(seeding_svc.get_seeding_manager());
                 info!("SeedingManager registered as CacheManager eviction callback");
             }
         }
@@ -73,7 +72,7 @@ impl TorrentFs {
             db: None,
             torrent_service: None,
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
-            download_manager: download_manager.map(|dm| Arc::new(Mutex::new(dm))),
+            download_service,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -112,12 +111,9 @@ impl TorrentFs {
         fs
     }
 
-    /// Get the CacheManager shared with DownloadManager.
+    /// Get the CacheManager shared with DownloadService.
     pub fn get_cache_manager(&self) -> Option<Arc<Mutex<CacheManager>>> {
-        self.download_manager
-            .as_ref()
-            .and_then(|dm| dm.lock().ok())
-            .map(|guard| guard.get_cache_manager())
+        self.download_service.as_ref().and_then(|ds| ds.get_cache_manager())
     }
 
     /// Read torrent file data from the BitTorrent network.
@@ -178,19 +174,14 @@ impl TorrentFs {
             }
         }
 
-        if let Some(dm) = &self.download_manager {
+        if let Some(ds) = &self.download_service {
             let torrent_data = self.get_torrent_raw_data(&source_path)?;
             let info = TorrentInfo::from_bytes(torrent_data).map_err(|e| {
                 error!("Failed to parse torrent info for download: {:?}", e);
                 EIO
             })?;
 
-            let mut dm_guard = dm.lock().map_err(|_| {
-                error!("Download manager lock poisoned");
-                EIO
-            })?;
-
-            match dm_guard.read_file_range(&info, file_index, offset as u64, size as u32) {
+            match ds.read_file_range(&info, file_index, offset as u64, size as u32) {
                 Ok(data) => {
                     info!(
                         "Successfully read {} bytes from torrent file (torrent_id={}, file_id={})",
@@ -1447,7 +1438,7 @@ impl TorrentFs {
         generate_stats(
             self.inode_mgr.creation_time,
             &self.db,
-            &self.download_manager,
+            &self.download_service,
             get_cm,
             &self.torrent_data_cache,
         )

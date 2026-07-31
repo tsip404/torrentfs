@@ -7,7 +7,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use crate::cache::CacheManager;
 use crate::db::{Database, TorrentStatus};
-use crate::download::DownloadManager;
+use crate::services::download::DownloadService;
 use crate::metadata::TorrentInfo;
 use tracing::warn;
 
@@ -112,7 +112,7 @@ mod tests {
 pub fn generate_stats(
     creation_time: Duration,
     db: &Option<Arc<Mutex<Database>>>,
-    download_manager: &Option<Arc<Mutex<DownloadManager>>>,
+    download_service: &Option<DownloadService>,
     get_cache_manager: impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
     torrent_data_cache: &Arc<Mutex<HashMap<String, Vec<u8>>>>,
 ) -> Vec<u8> {
@@ -177,12 +177,8 @@ pub fn generate_stats(
     ));
 
     // Session stats
-    let session_stats = if let Some(ref dm) = download_manager {
-        if let Ok(dm_guard) = dm.lock() {
-            dm_guard.get_session_stats().ok()
-        } else {
-            None
-        }
+    let session_stats = if let Some(ref ds) = download_service {
+        ds.get_session_stats().ok()
     } else {
         None
     };
@@ -279,25 +275,21 @@ pub fn generate_stats(
     output.push_str("\n── 种子详情 ──\n");
 
     // Pre-pass: ensure lightweight handles exist for all torrents
-    if let Some(ref dm) = download_manager {
+    if let Some(ref ds) = download_service {
         if let Some(db) = db.as_ref() {
             if let Ok(db_guard) = db.lock() {
                 if let Ok(torrents) = db_guard.get_all_torrents() {
-                    if let Ok(mut dm_guard) = dm.lock() {
-                        for t in &torrents {
-                            if dm_guard.query_torrent_status(&t.info_hash).is_none() {
-                                if let Some(ref torrent_data) = t.torrent_data {
-                                    if let Ok(info) =
-                                        TorrentInfo::from_bytes(torrent_data.clone())
-                                    {
-                                        if let Err(e) =
-                                            dm_guard.ensure_handle_lightweight(&info)
-                                        {
-                                            warn!(
-                                                "Failed to create lightweight handle for {} ({}): {:?}",
-                                                t.name, &t.info_hash[..std::cmp::min(10, t.info_hash.len())], e
-                                            );
-                                        }
+                    for t in &torrents {
+                        if ds.query_torrent_status(&t.info_hash).is_none() {
+                            if let Some(ref torrent_data) = t.torrent_data {
+                                if let Ok(info) =
+                                    TorrentInfo::from_bytes(torrent_data.clone())
+                                {
+                                    if let Err(e) = ds.ensure_handle_lightweight(&info) {
+                                        warn!(
+                                            "Failed to create lightweight handle for {} ({}): {:?}",
+                                            t.name, &t.info_hash[..std::cmp::min(10, t.info_hash.len())], e
+                                        );
                                     }
                                 }
                             }
@@ -333,28 +325,24 @@ pub fn generate_stats(
                         total_done,
                         total_upload,
                         total_download,
-                    ) = if let Some(ref dm) = download_manager {
-                        if let Ok(dm_guard) = dm.lock() {
-                            let handles = dm_guard.get_all_handles();
-                            if let Some((_, handle)) =
-                                handles.iter().find(|(ih, _)| ih == &t.info_hash)
-                            {
-                                if let Ok(h) = handle.lock() {
-                                    if let Ok(status) = h.status() {
-                                        (
-                                            status.download_rate,
-                                            status.upload_rate,
-                                            status.num_peers,
-                                            status.num_seeds,
-                                            status.progress,
-                                            status.total,
-                                            status.total_done,
-                                            status.total_upload,
-                                            status.total_download,
-                                        )
-                                    } else {
-                                        (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
-                                    }
+                    ) = if let Some(ref ds) = download_service {
+                        let handles = ds.get_all_handles();
+                        if let Some((_, handle)) =
+                            handles.iter().find(|(ih, _)| ih == &t.info_hash)
+                        {
+                            if let Ok(h) = handle.lock() {
+                                if let Ok(status) = h.status() {
+                                    (
+                                        status.download_rate,
+                                        status.upload_rate,
+                                        status.num_peers,
+                                        status.num_seeds,
+                                        status.progress,
+                                        status.total,
+                                        status.total_done,
+                                        status.total_upload,
+                                        status.total_download,
+                                    )
                                 } else {
                                     (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
                                 }
