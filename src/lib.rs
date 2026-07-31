@@ -31,3 +31,5 @@ pub use domain::{
 pub use error::{TorrentError, TorrentResult};
 pub use fuse::TorrentFs;
 pub use seeding::{SeedingInfo, SeedingManager, SeedingState};
+pub use services::download::DownloadService;
+pub use services::seeding::SeedingService;
