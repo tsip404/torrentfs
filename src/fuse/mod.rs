@@ -124,27 +124,17 @@ impl TorrentFs {
         offset: usize,
         size: usize,
     ) -> Result<Vec<u8>, i32> {
-        let db = DataResolver::get_db(&self.db)?;
-        let db_guard = db.lock().map_err(|_| {
-            error!("Database lock poisoned");
+        let ts = self.torrent_service.as_ref().ok_or_else(|| {
+            error!("Torrent service not available");
             EIO
         })?;
 
-        let torrent = db_guard
-            .get_torrent_by_id(torrent_id)
-            .map_err(|e| {
-                error!("Failed to get torrent by id: {:?}", e);
-                EIO
-            })?
+        let (info_hash, source_path, files) = ts
+            .get_torrent_with_files(torrent_id)?
             .ok_or_else(|| {
                 error!("Torrent not found: {}", torrent_id);
                 ENOENT
             })?;
-
-        let files = db_guard.get_files_by_torrent_id(torrent_id).map_err(|e| {
-            error!("Failed to get files for torrent: {:?}", e);
-            EIO
-        })?;
 
         let _file = files.iter().find(|f| f.id == file_id).ok_or_else(|| {
             error!("File not found: {}", file_id);
@@ -155,11 +145,6 @@ impl TorrentFs {
             error!("File index not found for file_id: {}", file_id);
             EIO
         })? as i32;
-
-        drop(db_guard);
-
-        let source_path = torrent.source_path.clone();
-        let info_hash = torrent.info_hash.clone();
 
         let cache_key = format!("{}:{}", info_hash, file_id);
         {
@@ -387,22 +372,20 @@ impl Filesystem for TorrentFs {
 
                     let torrent_id = (ino - inodes::DATA_TORRENT_INO_BASE) as i64;
                     if (inodes::DATA_TORRENT_INO_BASE..inodes::DATA_DIR_INO_BASE).contains(&ino) {
-                        if let Ok(db) = DataResolver::get_db(&self.db) {
-                            if let Ok(db_guard) = db.lock() {
-                                if db_guard
-                                    .get_torrent_by_id(torrent_id)
-                                    .ok()
-                                    .flatten()
-                                    .is_some()
-                                {
-                                    reply.attr(
-                                        &Duration::from_secs(1),
-                                        &self.inode_mgr.attr_for_dir(ino, false),
-                                    );
-                                    return;
-                                }
-                            }
+                        if self
+                            .torrent_service
+                            .as_ref()
+                            .map(|ts| ts.torrent_exists_by_id(torrent_id))
+                            .unwrap_or(false)
+                        {
+                            reply.attr(
+                                &Duration::from_secs(1),
+                                &self.inode_mgr.attr_for_dir(ino, false),
+                            );
+                        } else {
+                            reply.error(ENOENT);
                         }
+                        return;
                     }
 
                     reply.error(ENOENT);

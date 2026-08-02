@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::db::{Database, FileEntry, InsertTorrentResult};
+use crate::db::{Database, FileEntry, InsertTorrentResult, TorrentFile};
 use crate::metadata::TorrentInfo;
 use tracing::{error, info, warn};
 
@@ -201,5 +201,41 @@ impl TorrentService {
                 );
                 libc::EIO
             })
+    }
+
+    /// Check if a torrent with the given id exists in the database.
+    pub fn torrent_exists_by_id(&self, id: i64) -> bool {
+        let db_guard = match self.db.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        db_guard.get_torrent_by_id(id).ok().flatten().is_some()
+    }
+
+    /// Get torrent with its files by torrent_id.
+    /// Returns (info_hash, source_path, files) on success.
+    pub fn get_torrent_with_files(
+        &self,
+        torrent_id: i64,
+    ) -> Result<Option<(String, String, Vec<TorrentFile>)>, i32> {
+        let db_guard = self.db.lock().map_err(|_| {
+            error!("Database lock poisoned");
+            libc::EIO
+        })?;
+
+        let torrent = match db_guard.get_torrent_by_id(torrent_id).map_err(|e| {
+            error!("Failed to get torrent by id: {:?}", e);
+            libc::EIO
+        })? {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let files = db_guard.get_files_by_torrent_id(torrent_id).map_err(|e| {
+            error!("Failed to get files for torrent: {:?}", e);
+            libc::EIO
+        })?;
+
+        Ok(Some((torrent.info_hash, torrent.source_path, files)))
     }
 }
