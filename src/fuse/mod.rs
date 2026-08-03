@@ -24,7 +24,7 @@ use self::inodes::{
     DataInode, InodeData, InodeManager, DATA_INO, METADATA_INO, ROOT_INO, STATS_INO,
 };
 use self::lookup::DataResolver;
-use self::stats::generate_stats;
+use self::stats::{generate_directory_stats, generate_global_stats, generate_torrent_stats};
 
 use crate::cache::CacheManager;
 use crate::db::Database;
@@ -284,6 +284,60 @@ impl Filesystem for TorrentFs {
             return;
         }
 
+        // Handle .stats virtual file for data/ subtree directories.
+        // Must be intercepted before the normal data/ lookup so that
+        // .stats is not resolved as a torrent name or source path.
+        if name_str == ".stats" {
+            if parent == DATA_INO {
+                let stats_ino = InodeManager::make_stats_ino(parent);
+                let content = self.generate_dir_stats_content("");
+                reply.entry(
+                    &Duration::from_secs(1),
+                    &self
+                        .inode_mgr
+                        .attr_for_file(stats_ino, content.len() as u64),
+                    0,
+                );
+                return;
+            }
+
+            if let Some(data_inode) = self.inode_mgr.data_inodes.get(&parent) {
+                match data_inode {
+                    DataInode::SourcePathDir { path } => {
+                        let stats_ino = InodeManager::make_stats_ino(parent);
+                        let content = self.generate_dir_stats_content(path);
+                        reply.entry(
+                            &Duration::from_secs(1),
+                            &self
+                                .inode_mgr
+                                .attr_for_file(stats_ino, content.len() as u64),
+                            0,
+                        );
+                        return;
+                    }
+                    DataInode::TorrentRoot { torrent_id, .. } => {
+                        let stats_ino = InodeManager::make_stats_ino(parent);
+                        let content = self.generate_torrent_stats_for_id(*torrent_id);
+                        reply.entry(
+                            &Duration::from_secs(1),
+                            &self
+                                .inode_mgr
+                                .attr_for_file(stats_ino, content.len() as u64),
+                            0,
+                        );
+                        return;
+                    }
+                    _ => {
+                        reply.error(ENOENT);
+                        return;
+                    }
+                }
+            }
+            // Parent not yet cached in data_inodes — fall through to
+            // normal data/ lookup below.  If the parent doesn't exist,
+            // the lookup will return ENOENT as expected.
+        }
+
         if parent == DATA_INO || InodeManager::is_data_ino(parent) {
             if let Some(db) = &self.db {
                 if let Some((ino, kind, size)) =
@@ -357,13 +411,22 @@ impl Filesystem for TorrentFs {
                 &self.inode_mgr.attr_for_dir(ino, false),
             ),
             STATS_INO => {
-                let stats_size = self.generate_stats().len() as u64;
+                let stats_size = self.generate_global_stats_content().len() as u64;
                 reply.attr(
                     &Duration::from_secs(1),
                     &self.inode_mgr.attr_for_file(ino, stats_size),
                 );
             }
             _ => {
+                if InodeManager::is_stats_ino(ino) {
+                    let content = self.generate_data_stats_for_ino(ino);
+                    reply.attr(
+                        &Duration::from_secs(1),
+                        &self.inode_mgr.attr_for_file(ino, content.len() as u64),
+                    );
+                    return;
+                }
+
                 if InodeManager::is_data_ino(ino) {
                     if let Some(data_inode) = self.inode_mgr.data_inodes.get(&ino) {
                         match data_inode {
@@ -530,6 +593,13 @@ impl Filesystem for TorrentFs {
                 reply.opened(fh, 0);
             }
             _ => {
+                if InodeManager::is_stats_ino(ino) {
+                    let fh = inodes::NEXT_FH.fetch_add(1, Ordering::SeqCst);
+                    self.inode_mgr.open_files.insert(fh, ino);
+                    reply.opened(fh, 0);
+                    return;
+                }
+
                 if InodeManager::is_data_ino(ino) {
                     if let Some(DataInode::TorrentFile { .. }) =
                         self.inode_mgr.data_inodes.get(&ino)
@@ -702,7 +772,7 @@ impl Filesystem for TorrentFs {
             ROOT_INO | METADATA_INO | DATA_INO => reply.error(EISDIR),
             STATS_INO => {
                 let offset = offset as usize;
-                let stats = self.generate_stats();
+                let stats = self.generate_global_stats_content();
                 if offset >= stats.len() {
                     reply.data(&[]);
                 } else {
@@ -711,6 +781,18 @@ impl Filesystem for TorrentFs {
                 }
             }
             _ => {
+                if InodeManager::is_stats_ino(ino) {
+                    let stats = self.generate_data_stats_for_ino(ino);
+                    let offset = offset as usize;
+                    if offset >= stats.len() {
+                        reply.data(&[]);
+                    } else {
+                        let end = std::cmp::min(offset + size as usize, stats.len());
+                        reply.data(&stats[offset..end]);
+                    }
+                    return;
+                }
+
                 if InodeManager::is_data_ino(ino) {
                     if let Some(DataInode::TorrentFile {
                         torrent_id,
@@ -916,7 +998,7 @@ impl Filesystem for TorrentFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        if ino == STATS_INO {
+        if ino == STATS_INO || InodeManager::is_stats_ino(ino) {
             reply.error(EROFS);
             return;
         }
@@ -1416,16 +1498,71 @@ impl Filesystem for TorrentFs {
 }
 
 impl TorrentFs {
-    /// Generate stats by delegating to the StatsGenerator.
+    /// Generate global stats (delegates to StatsGenerator).
     pub fn generate_stats(&self) -> Vec<u8> {
+        self.generate_global_stats_content()
+    }
+
+    /// Generate global stats content for root .stats file.
+    fn generate_global_stats_content(&self) -> Vec<u8> {
         let get_cm = || self.get_cache_manager();
-        generate_stats(
+        generate_global_stats(
             self.inode_mgr.creation_time,
             &self.db,
             &self.download_service,
             get_cm,
-            &self.torrent_data_cache,
             &self.listen_addr,
         )
+    }
+
+    /// Generate directory-aggregated stats for a source_path.
+    fn generate_dir_stats_content(&self, source_path: &str) -> Vec<u8> {
+        let get_cm = || self.get_cache_manager();
+        generate_directory_stats(source_path, &self.db, &self.download_service, get_cm)
+    }
+
+    /// Generate single-torrent stats for a torrent_id.
+    fn generate_torrent_stats_for_id(&self, torrent_id: i64) -> Vec<u8> {
+        // Extract info_hash inside a short-lived lock scope, then release before
+        // calling generate_torrent_stats() which acquires its own lock (avoids Mutex
+        // deadlock — std::sync::Mutex is not reentrant).
+        let info_hash = {
+            let db_guard = match self.db.as_ref().and_then(|db| db.lock().ok()) {
+                Some(g) => g,
+                None => return b"Database not available\n".to_vec(),
+            };
+            match db_guard.get_torrent_by_id(torrent_id).ok().flatten() {
+                Some(t) => t.info_hash,
+                None => return format!("Torrent not found (id={})\n", torrent_id).into_bytes(),
+            }
+        };
+        let get_cm = || self.get_cache_manager();
+        generate_torrent_stats(
+            torrent_id,
+            &info_hash,
+            &self.db,
+            &self.download_service,
+            get_cm,
+        )
+    }
+
+    /// Dispatch stats generation for a stats inode based on its parent directory inode.
+    fn generate_data_stats_for_ino(&self, ino: u64) -> Vec<u8> {
+        let dir_ino = match InodeManager::stats_ino_to_dir_ino(ino) {
+            Some(d) => d,
+            None => return b"Invalid stats inode\n".to_vec(),
+        };
+
+        if dir_ino == DATA_INO {
+            return self.generate_dir_stats_content("");
+        }
+
+        match self.inode_mgr.data_inodes.get(&dir_ino) {
+            Some(DataInode::SourcePathDir { path }) => self.generate_dir_stats_content(path),
+            Some(DataInode::TorrentRoot { torrent_id, .. }) => {
+                self.generate_torrent_stats_for_id(*torrent_id)
+            }
+            _ => b"Stats not available for this inode\n".to_vec(),
+        }
     }
 }
