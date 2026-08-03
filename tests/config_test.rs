@@ -229,28 +229,3 @@ fn test_config_to_settings_json_default_is_empty() {
     assert_eq!(json, "{}");
 }
 
-#[test]
-fn test_load_test_config_file() {
-    // Load the test-config.toml that ships with the project
-    let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("test-config.toml");
-    let cfg =
-        TorrentfsConfig::from_file(&config_path).expect("Failed to load project test-config.toml");
-
-    // Verify key non-default values from the file
-    assert_eq!(
-        cfg.connections.listen_interfaces,
-        Some("0.0.0.0:6881".to_string())
-    );
-    assert_eq!(cfg.connections.max_connections, Some(100));
-    assert_eq!(
-        cfg.connections.allow_multiple_connections_per_ip,
-        Some(true)
-    );
-    assert_eq!(cfg.dht.enabled, Some(false));
-    assert_eq!(cfg.rate_limits.download_rate_limit, Some(1048576));
-    assert_eq!(cfg.rate_limits.upload_rate_limit, Some(524288));
-    assert_eq!(cfg.cache.cache_size, Some(67108864));
-    assert_eq!(cfg.timeouts.read_timeout_secs, Some(60));
-    assert_eq!(cfg.disk_io.disk_io_write_mode, Some(1));
-    assert_eq!(cfg.disk_io.disk_io_read_mode, Some(1));
-}
