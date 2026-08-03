@@ -28,7 +28,9 @@ fn skip_if_ci() -> bool {
 /// the local HTTP tracker and establish peer connections.
 #[test]
 fn test_peer_discovery_via_tracker() {
-    if skip_if_ci() { return; }
+    if skip_if_ci() {
+        return;
+    }
     // ── Setup: start tracker + seeder ──────────────────────────────────
     let harness = TestHarness::new();
 
@@ -38,22 +40,15 @@ fn test_peer_discovery_via_tracker() {
         harness.tracker.announce_count()
     );
 
-    let info_hash = hex::encode(
-        harness
-            .info
-            .info_hash()
-            .expect("Failed to get info hash"),
-    );
+    let info_hash = hex::encode(harness.info.info_hash().expect("Failed to get info hash"));
     println!("Info hash: {}", info_hash);
 
     // ── Create downloader session directly (bypass DownloadManager) ────
     let config = local_test_config();
     let mut dl_session =
-        torrentfs::download::Session::new(&config)
-            .expect("Failed to create downloader session");
+        torrentfs::download::Session::new(&config).expect("Failed to create downloader session");
 
-    let cache_dir =
-        tempfile::TempDir::new().expect("Failed to create cache dir");
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
 
     // Re-parse torrent data from the harness (fresh TorrentInfo)
     let torrent_data = harness.torrent_data.clone();
@@ -118,10 +113,7 @@ fn test_peer_discovery_via_tracker() {
 
     // ── Verify tracker received the downloader's announce ──────────────
     let final_announce_count = harness.tracker.announce_count();
-    println!(
-        "Tracker final announce count: {}",
-        final_announce_count
-    );
+    println!("Tracker final announce count: {}", final_announce_count);
 
     if !peers_found {
         panic!(
@@ -155,7 +147,10 @@ fn test_peer_discovery_via_tracker() {
         Err(e) => {
             // Piece read can fail if not downloaded yet - that's OK
             // as long as we proved peer connectivity
-            println!("Piece read failed (expected if not yet downloaded): {:?}", e);
+            println!(
+                "Piece read failed (expected if not yet downloaded): {:?}",
+                e
+            );
         }
     }
 
@@ -172,7 +167,9 @@ fn test_peer_discovery_via_tracker() {
 /// (within a few seconds, not the full timeout).
 #[test]
 fn test_transient_peer_fast_exit() {
-    if skip_if_ci() { return; }
+    if skip_if_ci() {
+        return;
+    }
     use common::{create_test_torrent_with_tracker, MiniTracker};
 
     // ── Start tracker ──────────────────────────────────────────────────
@@ -182,8 +179,8 @@ fn test_transient_peer_fast_exit() {
 
     // ── Create torrent data ────────────────────────────────────────────
     let (torrent_data, file_content) = create_test_torrent_with_tracker(&announce_url);
-    let info = torrentfs::TorrentInfo::from_bytes(torrent_data.clone())
-        .expect("Failed to parse torrent");
+    let info =
+        torrentfs::TorrentInfo::from_bytes(torrent_data.clone()).expect("Failed to parse torrent");
 
     let info_hash = hex::encode(info.info_hash().expect("Failed to get info hash"));
     println!("Info hash: {}", info_hash);
@@ -195,11 +192,9 @@ fn test_transient_peer_fast_exit() {
     // that briefly appears and disappears.
     {
         let torrent_data_for_seeder = torrent_data.clone();
-        let seed_dir = tempfile::TempDir::new()
-            .expect("Failed to create seed temp dir");
+        let seed_dir = tempfile::TempDir::new().expect("Failed to create seed temp dir");
         let seed_file = seed_dir.path().join("final_verification.txt");
-        std::fs::write(&seed_file, &file_content)
-            .expect("Failed to write seed file");
+        std::fs::write(&seed_file, &file_content).expect("Failed to write seed file");
 
         let config = local_test_config();
         let mut session = torrentfs::download::Session::new(&config)
@@ -298,7 +293,10 @@ fn test_transient_peer_fast_exit() {
                 "NoPeers error took too long ({:.2}s). Expected fast exit (<10s).",
                 elapsed.as_secs_f64()
             );
-            println!("✓ Fast exit verified: NoPeers in {:.2}s (timeout is 15s)", elapsed.as_secs_f64());
+            println!(
+                "✓ Fast exit verified: NoPeers in {:.2}s (timeout is 15s)",
+                elapsed.as_secs_f64()
+            );
         }
         Err(e) => {
             println!(
@@ -312,7 +310,10 @@ fn test_transient_peer_fast_exit() {
                 "Error took too long ({:.2}s). Expected fast exit (<10s).",
                 elapsed.as_secs_f64()
             );
-            println!("✓ Fast exit verified (non-NoPeers error) in {:.2}s", elapsed.as_secs_f64());
+            println!(
+                "✓ Fast exit verified (non-NoPeers error) in {:.2}s",
+                elapsed.as_secs_f64()
+            );
         }
         Ok(data) => {
             println!(
@@ -333,7 +334,10 @@ fn test_transient_peer_fast_exit() {
                 &file_content[..50.min(data.len())],
                 "Downloaded data doesn't match seed content"
             );
-            println!("✓ Fast completion verified: read in {:.2}s", elapsed.as_secs_f64());
+            println!(
+                "✓ Fast completion verified: read in {:.2}s",
+                elapsed.as_secs_f64()
+            );
         }
     }
 

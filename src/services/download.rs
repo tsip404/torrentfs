@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::cache::CacheManager;
 use crate::infrastructure::config::TorrentfsConfig;
-use crate::infrastructure::download::{DownloadManager, SessionStats, TorrentHandle, TorrentStatus};
+use crate::infrastructure::download::{
+    DownloadManager, SessionStats, TorrentHandle, TorrentStatus,
+};
 use crate::infrastructure::metadata::TorrentInfo;
 use crate::seeding::SeedingManager;
 
@@ -43,12 +45,13 @@ impl DownloadService {
         &self,
         info: &TorrentInfo,
     ) -> TorrentResult<Arc<Mutex<TorrentHandle>>> {
-        let mut dm = self.download_manager.lock().map_err(|_| {
-            TorrentError::Unknown {
+        let mut dm = self
+            .download_manager
+            .lock()
+            .map_err(|_| TorrentError::Unknown {
                 code: -1,
                 message: "DownloadManager lock poisoned".to_string(),
-            }
-        })?;
+            })?;
         dm.ensure_handle_lightweight(info)
     }
 
@@ -60,23 +63,25 @@ impl DownloadService {
         offset: u64,
         size: u32,
     ) -> TorrentResult<Vec<u8>> {
-        let mut dm = self.download_manager.lock().map_err(|_| {
-            TorrentError::Unknown {
+        let mut dm = self
+            .download_manager
+            .lock()
+            .map_err(|_| TorrentError::Unknown {
                 code: -1,
                 message: "DownloadManager lock poisoned".to_string(),
-            }
-        })?;
+            })?;
         dm.read_file_range(info, file_index, offset, size)
     }
 
     /// Get session-level stats.
     pub fn get_session_stats(&self) -> TorrentResult<SessionStats> {
-        let dm = self.download_manager.lock().map_err(|_| {
-            TorrentError::Unknown {
+        let dm = self
+            .download_manager
+            .lock()
+            .map_err(|_| TorrentError::Unknown {
                 code: -1,
                 message: "DownloadManager lock poisoned".to_string(),
-            }
-        })?;
+            })?;
         dm.get_session_stats()
     }
 

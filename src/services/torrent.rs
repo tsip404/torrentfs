@@ -195,10 +195,7 @@ impl TorrentService {
         db_guard
             .rename_metadata_directory(old_path, new_name, new_path)
             .map_err(|e| {
-                error!(
-                    "Failed to rename metadata directory in database: {:?}",
-                    e
-                );
+                error!("Failed to rename metadata directory in database: {:?}", e);
                 libc::EIO
             })
     }

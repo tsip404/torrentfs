@@ -130,24 +130,15 @@ fn test_read_file_range_with_test_harness() {
         harness.tracker.announce_count()
     );
 
-    let info_hash = hex::encode(
-        harness
-            .info
-            .info_hash()
-            .expect("Failed to get info hash"),
-    );
+    let info_hash = hex::encode(harness.info.info_hash().expect("Failed to get info hash"));
     println!("Info hash: {}", info_hash);
 
     // Create a downloader session using DownloadManager with local test config
     let config = common::local_test_config();
-    let cache_dir =
-        tempfile::TempDir::new().expect("Failed to create cache dir");
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
 
-    let mut dm = torrentfs::download::DownloadManager::new(
-        cache_dir.path(),
-        &config,
-    )
-    .expect("Failed to create DownloadManager");
+    let mut dm = torrentfs::download::DownloadManager::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadManager");
 
     // Re-parse torrent data (raw pointer in TorrentInfo can't be shared)
     let dl_info = torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())

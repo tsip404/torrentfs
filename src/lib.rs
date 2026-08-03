@@ -7,13 +7,13 @@ pub mod services;
 
 // Re-exports for backward compatibility — old paths still work
 // infrastructure layer
-pub use infrastructure::{
-    cache, config, db, download, metadata, CacheManager, Database, DownloadManager, FilePieceInfo,
-    PieceMetadata, Session, TorrentHandle, TorrentInfo, TorrentState, TorrentfsConfig,
-    DownloadTorrentStatus,
-};
 pub use infrastructure::db::{
     DbError, FileEntry, InsertTorrentResult, Torrent, TorrentDirectory, TorrentFile, TorrentStatus,
+};
+pub use infrastructure::{
+    cache, config, db, download, metadata, CacheManager, Database, DownloadManager,
+    DownloadTorrentStatus, FilePieceInfo, PieceMetadata, Session, TorrentHandle, TorrentInfo,
+    TorrentState, TorrentfsConfig,
 };
 
 // domain layer re-exports

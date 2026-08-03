@@ -175,9 +175,7 @@ fn main() {
             }
         }
     } else {
-        warn!(
-            "user_allow_other not set in /etc/fuse.conf, mount will only be accessible by owner"
-        );
+        warn!("user_allow_other not set in /etc/fuse.conf, mount will only be accessible by owner");
     }
 
     let options = vec![
@@ -220,9 +218,7 @@ fn main() {
                 }
 
                 if !user_in_fuse_group() {
-                    hints.push(
-                        "user may not be in the 'fuse' group (some systems require this)",
-                    );
+                    hints.push("user may not be in the 'fuse' group (some systems require this)");
                 }
 
                 hints.push("running in a container or restricted environment");

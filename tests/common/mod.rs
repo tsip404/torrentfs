@@ -51,8 +51,7 @@ impl MiniTracker {
     /// Start the tracker on `127.0.0.1:0` (OS-assigned port).
     /// Spawns a background thread to handle HTTP requests.
     pub fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .expect("MiniTracker: failed to bind");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("MiniTracker: failed to bind");
         let addr = listener
             .local_addr()
             .expect("MiniTracker: failed to get local addr");
@@ -403,19 +402,15 @@ impl TestHarness {
         let tracker = MiniTracker::start();
         let announce_url = tracker.announce_url();
 
-        eprintln!(
-            "TestHarness: tracker started at {}",
-            announce_url
-        );
+        eprintln!("TestHarness: tracker started at {}", announce_url);
 
-        let (torrent_data, file_content) =
-            create_test_torrent_with_tracker(&announce_url);
+        let (torrent_data, file_content) = create_test_torrent_with_tracker(&announce_url);
 
         let info = TorrentInfo::from_bytes(torrent_data.clone())
             .expect("TestHarness: failed to parse torrent");
 
-        let seed_dir = tempfile::TempDir::new()
-            .expect("TestHarness: failed to create seed temp dir");
+        let seed_dir =
+            tempfile::TempDir::new().expect("TestHarness: failed to create seed temp dir");
 
         // Write the file data to the seed directory so libtorrent finds it complete
         let seed_file_path = seed_dir.path().join("final_verification.txt");
@@ -451,10 +446,7 @@ impl TestHarness {
             let seeder_info = match TorrentInfo::from_bytes(torrent_data_for_seeder) {
                 Ok(info) => info,
                 Err(e) => {
-                    eprintln!(
-                        "TestHarness seeder: failed to parse torrent: {:?}",
-                        e
-                    );
+                    eprintln!("TestHarness seeder: failed to parse torrent: {:?}", e);
                     return;
                 }
             };
@@ -499,10 +491,7 @@ impl TestHarness {
                                 }
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "TestHarness seeder: status error: {:?}",
-                                    e
-                                );
+                                eprintln!("TestHarness seeder: status error: {:?}", e);
                                 break;
                             }
                         }
@@ -521,10 +510,7 @@ impl TestHarness {
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "TestHarness seeder: failed to add torrent: {:?}",
-                        e
-                    );
+                    eprintln!("TestHarness seeder: failed to add torrent: {:?}", e);
                 }
             }
         });
