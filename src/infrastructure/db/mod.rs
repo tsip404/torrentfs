@@ -34,7 +34,14 @@ impl TorrentRepository for Database {
         info_hash: &str,
         file_count: i64,
     ) -> Result<InsertTorrentResult, DbError> {
-        self.insert_torrent(source_path, name, filename, total_size, info_hash, file_count)
+        self.insert_torrent(
+            source_path,
+            name,
+            filename,
+            total_size,
+            info_hash,
+            file_count,
+        )
     }
 
     fn insert_torrent_with_files(
@@ -48,7 +55,13 @@ impl TorrentRepository for Database {
         files: &[FileEntry],
     ) -> Result<InsertTorrentResult, DbError> {
         self.insert_torrent_with_files(
-            source_path, name, filename, total_size, info_hash, file_count, files,
+            source_path,
+            name,
+            filename,
+            total_size,
+            info_hash,
+            file_count,
+            files,
         )
     }
 
@@ -60,7 +73,11 @@ impl TorrentRepository for Database {
         self.set_resume_data(torrent_id, data)
     }
 
-    fn set_torrent_status(&mut self, torrent_id: i64, status: &TorrentStatus) -> Result<(), DbError> {
+    fn set_torrent_status(
+        &mut self,
+        torrent_id: i64,
+        status: &TorrentStatus,
+    ) -> Result<(), DbError> {
         self.set_torrent_status(torrent_id, status)
     }
 

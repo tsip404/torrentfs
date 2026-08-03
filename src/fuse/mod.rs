@@ -40,10 +40,14 @@ pub struct TorrentFs {
     pub processing_torrents: Arc<Mutex<HashMap<String, ()>>>,
     pub download_service: Option<DownloadService>,
     pub torrent_data_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    pub listen_addr: String,
 }
 
 impl TorrentFs {
-    pub fn new_with_cache_path(cache_path: PathBuf, config: &crate::config::TorrentfsConfig) -> Self {
+    pub fn new_with_cache_path(
+        cache_path: PathBuf,
+        config: &crate::config::TorrentfsConfig,
+    ) -> Self {
         if !cache_path.exists() {
             if let Err(e) = std::fs::create_dir_all(&cache_path) {
                 warn!("Failed to create cache directory {:?}: {:?}", cache_path, e);
@@ -67,6 +71,12 @@ impl TorrentFs {
                 .as_secs(),
         );
 
+        let listen_addr = config
+            .connections
+            .listen_interfaces
+            .clone()
+            .unwrap_or_else(|| "0.0.0.0:6881".to_string());
+
         Self {
             inode_mgr: InodeManager::new(creation_time),
             db: None,
@@ -74,6 +84,7 @@ impl TorrentFs {
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             download_service,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
+            listen_addr,
         }
     }
 
@@ -113,7 +124,9 @@ impl TorrentFs {
 
     /// Get the CacheManager shared with DownloadService.
     pub fn get_cache_manager(&self) -> Option<Arc<Mutex<CacheManager>>> {
-        self.download_service.as_ref().and_then(|ds| ds.get_cache_manager())
+        self.download_service
+            .as_ref()
+            .and_then(|ds| ds.get_cache_manager())
     }
 
     /// Read torrent file data from the BitTorrent network.
@@ -129,9 +142,8 @@ impl TorrentFs {
             EIO
         })?;
 
-        let (info_hash, _source_path, files) = ts
-            .get_torrent_with_files(torrent_id)?
-            .ok_or_else(|| {
+        let (info_hash, _source_path, files) =
+            ts.get_torrent_with_files(torrent_id)?.ok_or_else(|| {
                 error!("Torrent not found: {}", torrent_id);
                 ENOENT
             })?;
@@ -332,15 +344,18 @@ impl Filesystem for TorrentFs {
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match ino {
-            ROOT_INO => {
-                reply.attr(&Duration::from_secs(1), &self.inode_mgr.attr_for_dir(ino, false))
-            }
-            METADATA_INO => {
-                reply.attr(&Duration::from_secs(1), &self.inode_mgr.attr_for_dir(ino, true))
-            }
-            DATA_INO => {
-                reply.attr(&Duration::from_secs(1), &self.inode_mgr.attr_for_dir(ino, false))
-            }
+            ROOT_INO => reply.attr(
+                &Duration::from_secs(1),
+                &self.inode_mgr.attr_for_dir(ino, false),
+            ),
+            METADATA_INO => reply.attr(
+                &Duration::from_secs(1),
+                &self.inode_mgr.attr_for_dir(ino, true),
+            ),
+            DATA_INO => reply.attr(
+                &Duration::from_secs(1),
+                &self.inode_mgr.attr_for_dir(ino, false),
+            ),
             STATS_INO => {
                 let stats_size = self.generate_stats().len() as u64;
                 reply.attr(
@@ -407,9 +422,7 @@ impl Filesystem for TorrentFs {
                         } => {
                             reply.attr(
                                 &Duration::from_secs(1),
-                                &self
-                                    .inode_mgr
-                                    .attr_for_file(ino, file_data.len() as u64),
+                                &self.inode_mgr.attr_for_file(ino, file_data.len() as u64),
                             );
                         }
                     }
@@ -430,12 +443,9 @@ impl Filesystem for TorrentFs {
     ) {
         if ino == DATA_INO || InodeManager::is_data_ino(ino) {
             if let Some(db) = &self.db {
-                if let Some(entries) = DataResolver::readdir_data(
-                    &mut self.inode_mgr,
-                    db,
-                    ino,
-                    offset,
-                ) {
+                if let Some(entries) =
+                    DataResolver::readdir_data(&mut self.inode_mgr, db, ino, offset)
+                {
                     for (entry_ino, entry_offset, kind, name) in entries {
                         if reply.add(entry_ino, entry_offset, kind, &name) {
                             break;
@@ -454,9 +464,19 @@ impl Filesystem for TorrentFs {
 
         if ino == ROOT_INO {
             entries.push((ROOT_INO, 2, fuser::FileType::Directory, "..".to_string()));
-            entries.push((METADATA_INO, 3, fuser::FileType::Directory, "metadata".to_string()));
+            entries.push((
+                METADATA_INO,
+                3,
+                fuser::FileType::Directory,
+                "metadata".to_string(),
+            ));
             entries.push((DATA_INO, 4, fuser::FileType::Directory, "data".to_string()));
-            entries.push((STATS_INO, 5, fuser::FileType::RegularFile, ".stats".to_string()));
+            entries.push((
+                STATS_INO,
+                5,
+                fuser::FileType::RegularFile,
+                ".stats".to_string(),
+            ));
         } else if let Some(InodeData::Directory { parent, .. }) = self.inode_mgr.inodes.get(&ino) {
             entries.push((*parent, 2, fuser::FileType::Directory, "..".to_string()));
 
@@ -469,14 +489,14 @@ impl Filesystem for TorrentFs {
                 .filter_map(|(child_ino, data)| match data {
                     InodeData::Directory {
                         parent: p, name, ..
-                    } if *p == ino && !name.is_empty() => Some((
-                        *child_ino,
-                        fuser::FileType::Directory,
-                        name.clone(),
-                    )),
+                    } if *p == ino && !name.is_empty() => {
+                        Some((*child_ino, fuser::FileType::Directory, name.clone()))
+                    }
                     InodeData::File {
                         parent: p, name, ..
-                    } if *p == ino => Some((*child_ino, fuser::FileType::RegularFile, name.clone())),
+                    } if *p == ino => {
+                        Some((*child_ino, fuser::FileType::RegularFile, name.clone()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -534,14 +554,7 @@ impl Filesystem for TorrentFs {
         }
     }
 
-    fn flush(
-        &mut self,
-        _req: &Request,
-        ino: u64,
-        _fh: u64,
-        _lock_owner: u64,
-        reply: ReplyEmpty,
-    ) {
+    fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
         if let Some(InodeData::File { data, name, .. }) = self.inode_mgr.inodes.get(&ino) {
             if name.ends_with(".torrent") {
                 if data.is_empty() {
@@ -622,10 +635,7 @@ impl Filesystem for TorrentFs {
                             }
                         };
                         if processing.contains_key(&source_path) {
-                            warn!(
-                                "Torrent {} already being processed, skipping",
-                                source_path
-                            );
+                            warn!("Torrent {} already being processed, skipping", source_path);
                             reply.ok();
                             return;
                         }
@@ -642,7 +652,10 @@ impl Filesystem for TorrentFs {
                                 let mut processing = match self.processing_torrents.lock() {
                                     Ok(guard) => guard,
                                     Err(poison) => {
-                                        error!("Mutex poisoned in release() error path: {}", poison);
+                                        error!(
+                                            "Mutex poisoned in release() error path: {}",
+                                            poison
+                                        );
                                         reply.error(EIO);
                                         return;
                                     }
@@ -659,14 +672,14 @@ impl Filesystem for TorrentFs {
                     }
 
                     let mut processing = match self.processing_torrents.lock() {
-                    Ok(guard) => guard,
-                    Err(e) => {
-                        error!("Mutex poisoned in release() cleanup: {}", e);
-                        reply.error(EIO);
-                        return;
-                    }
-                };
-                processing.remove(&source_path);
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            error!("Mutex poisoned in release() cleanup: {}", e);
+                            reply.error(EIO);
+                            return;
+                        }
+                    };
+                    processing.remove(&source_path);
                 }
             }
         }
@@ -774,14 +787,7 @@ impl Filesystem for TorrentFs {
         }
     }
 
-    fn releasedir(
-        &mut self,
-        _req: &Request,
-        _ino: u64,
-        _fh: u64,
-        _flags: i32,
-        reply: ReplyEmpty,
-    ) {
+    fn releasedir(&mut self, _req: &Request, _ino: u64, _fh: u64, _flags: i32, reply: ReplyEmpty) {
         reply.ok();
     }
 
@@ -806,7 +812,11 @@ impl Filesystem for TorrentFs {
             return;
         }
 
-        if self.inode_mgr.find_child_by_name(parent, &name_str).is_some() {
+        if self
+            .inode_mgr
+            .find_child_by_name(parent, &name_str)
+            .is_some()
+        {
             reply.error(EEXIST);
             return;
         }
@@ -856,7 +866,11 @@ impl Filesystem for TorrentFs {
             return;
         }
 
-        if self.inode_mgr.find_child_by_name(parent, &name_str).is_some() {
+        if self
+            .inode_mgr
+            .find_child_by_name(parent, &name_str)
+            .is_some()
+        {
             reply.error(EEXIST);
             return;
         }
@@ -952,7 +966,11 @@ impl Filesystem for TorrentFs {
 
         let name_str = name.to_string_lossy();
 
-        if self.inode_mgr.find_child_by_name(parent, &name_str).is_some() {
+        if self
+            .inode_mgr
+            .find_child_by_name(parent, &name_str)
+            .is_some()
+        {
             reply.error(EEXIST);
             return;
         }
@@ -1018,10 +1036,9 @@ impl Filesystem for TorrentFs {
                 InodeData::Directory { .. } => {
                     reply.attr(
                         &Duration::from_secs(1),
-                        &self.inode_mgr.attr_for_dir(
-                            ino,
-                            self.inode_mgr.is_metadata_child(ino),
-                        ),
+                        &self
+                            .inode_mgr
+                            .attr_for_dir(ino, self.inode_mgr.is_metadata_child(ino)),
                     );
                 }
                 InodeData::File {
@@ -1029,9 +1046,7 @@ impl Filesystem for TorrentFs {
                 } => {
                     reply.attr(
                         &Duration::from_secs(1),
-                        &self
-                            .inode_mgr
-                            .attr_for_file(ino, file_data.len() as u64),
+                        &self.inode_mgr.attr_for_file(ino, file_data.len() as u64),
                     );
                 }
             }
@@ -1053,8 +1068,7 @@ impl Filesystem for TorrentFs {
         let name_str = name.to_string_lossy();
         let newname_str = newname.to_string_lossy();
 
-        if !self.inode_mgr.is_metadata_child(parent)
-            || !self.inode_mgr.is_metadata_child(newparent)
+        if !self.inode_mgr.is_metadata_child(parent) || !self.inode_mgr.is_metadata_child(newparent)
         {
             error!("Rename only allowed within metadata/ directory");
             reply.error(EACCES);
@@ -1120,19 +1134,15 @@ impl Filesystem for TorrentFs {
                         if path == &old_source_path {
                             *path = new_source_path.clone();
                         } else if path.starts_with(&old_prefix) {
-                            *path =
-                                format!("{}{}", new_prefix, &path[old_prefix.len()..]);
+                            *path = format!("{}{}", new_prefix, &path[old_prefix.len()..]);
                         }
                     }
                     DataInode::TorrentRoot { source_path, .. } => {
                         if source_path == &old_source_path {
                             *source_path = new_source_path.clone();
                         } else if source_path.starts_with(&old_prefix) {
-                            *source_path = format!(
-                                "{}{}",
-                                new_prefix,
-                                &source_path[old_prefix.len()..]
-                            );
+                            *source_path =
+                                format!("{}{}", new_prefix, &source_path[old_prefix.len()..]);
                         }
                     }
                     _ => {}
@@ -1141,11 +1151,9 @@ impl Filesystem for TorrentFs {
 
             // Persist to database
             if let Some(ref ts) = self.torrent_service {
-                if let Err(e) = ts.rename_metadata_directory(
-                    &old_source_path,
-                    &newname_str,
-                    &new_source_path,
-                ) {
+                if let Err(e) =
+                    ts.rename_metadata_directory(&old_source_path, &newname_str, &new_source_path)
+                {
                     error!("Failed to rename metadata directory in database: {:?}", e);
                     reply.error(EIO);
                     return;
@@ -1193,12 +1201,9 @@ impl Filesystem for TorrentFs {
                 let old_source_path = self.inode_mgr.extract_source_path(parent);
                 let new_source_path = self.inode_mgr.extract_source_path(newparent);
 
-                if let Err(e) = ts.rename_torrent(
-                    &old_name,
-                    &old_source_path,
-                    &newname_str,
-                    &new_source_path,
-                ) {
+                if let Err(e) =
+                    ts.rename_torrent(&old_name, &old_source_path, &newname_str, &new_source_path)
+                {
                     error!("Failed to rename torrent in database: {:?}", e);
                     reply.error(EIO);
                     return;
@@ -1275,26 +1280,26 @@ impl Filesystem for TorrentFs {
                                 });
 
                             let mut processing = match self.processing_torrents.lock() {
-                            Ok(guard) => guard,
-                            Err(e) => {
-                                error!("Mutex poisoned in unlink() processing_torrents: {}", e);
-                                reply.error(EIO);
-                                return;
-                            }
-                        };
-                        processing.remove(&source_path);
-                        drop(processing);
+                                Ok(guard) => guard,
+                                Err(e) => {
+                                    error!("Mutex poisoned in unlink() processing_torrents: {}", e);
+                                    reply.error(EIO);
+                                    return;
+                                }
+                            };
+                            processing.remove(&source_path);
+                            drop(processing);
 
-                        let mut cache = match self.torrent_data_cache.lock() {
-                            Ok(guard) => guard,
-                            Err(e) => {
-                                error!("Mutex poisoned in unlink() torrent_data_cache: {}", e);
-                                reply.error(EIO);
-                                return;
-                            }
-                        };
-                        cache.remove(&source_path);
-                        drop(cache);
+                            let mut cache = match self.torrent_data_cache.lock() {
+                                Ok(guard) => guard,
+                                Err(e) => {
+                                    error!("Mutex poisoned in unlink() torrent_data_cache: {}", e);
+                                    reply.error(EIO);
+                                    return;
+                                }
+                            };
+                            cache.remove(&source_path);
+                            drop(cache);
 
                             info!(
                                 "Deleted torrent '{}' (id={}, source_path='{}')",
@@ -1306,10 +1311,7 @@ impl Filesystem for TorrentFs {
                             self.inode_mgr
                                 .open_files
                                 .retain(|_, &mut open_ino| open_ino != ino);
-                            info!(
-                                "Deleted file '{}' (not yet in database)",
-                                filename
-                            );
+                            info!("Deleted file '{}' (not yet in database)", filename);
                         }
                         Err(e) => {
                             error!("Failed to delete torrent: {:?}", e);
@@ -1358,12 +1360,11 @@ impl Filesystem for TorrentFs {
 
         match self.inode_mgr.inodes.get(&ino) {
             Some(InodeData::Directory { .. }) => {
-                let has_children =
-                    self.inode_mgr.inodes.iter().any(|(_, data)| match data {
-                        InodeData::Directory { parent: p, .. } if *p == ino => true,
-                        InodeData::File { parent: p, .. } if *p == ino => true,
-                        _ => false,
-                    });
+                let has_children = self.inode_mgr.inodes.iter().any(|(_, data)| match data {
+                    InodeData::Directory { parent: p, .. } if *p == ino => true,
+                    InodeData::File { parent: p, .. } if *p == ino => true,
+                    _ => false,
+                });
 
                 if has_children {
                     error!("Directory not empty: {}", name_str);
@@ -1376,8 +1377,9 @@ impl Filesystem for TorrentFs {
                 self.inode_mgr.inodes.remove(&ino);
 
                 // Clean up data_inodes cache
-                self.inode_mgr.data_inodes.retain(|_, data_inode| {
-                    match data_inode {
+                self.inode_mgr
+                    .data_inodes
+                    .retain(|_, data_inode| match data_inode {
                         DataInode::SourcePathDir { path } => {
                             if path == &source_path {
                                 false
@@ -1388,8 +1390,7 @@ impl Filesystem for TorrentFs {
                             }
                         }
                         _ => true,
-                    }
-                });
+                    });
 
                 if let Some(ref ts) = self.torrent_service {
                     let _ = ts.delete_metadata_directory(&source_path);
@@ -1424,6 +1425,7 @@ impl TorrentFs {
             &self.download_service,
             get_cm,
             &self.torrent_data_cache,
+            &self.listen_addr,
         )
     }
 }

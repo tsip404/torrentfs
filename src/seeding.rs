@@ -76,24 +76,26 @@ impl SeedingManager {
             })?;
 
             let custom_active = {
-                let flag = self.custom_storage_active.lock().map_err(|_| {
-                    TorrentError::Unknown {
-                        code: -1,
-                        message: "Custom storage flag lock poisoned".to_string(),
-                    }
-                })?;
+                let flag =
+                    self.custom_storage_active
+                        .lock()
+                        .map_err(|_| TorrentError::Unknown {
+                            code: -1,
+                            message: "Custom storage flag lock poisoned".to_string(),
+                        })?;
                 *flag
             };
 
             if !custom_active {
                 // First seed: replace session with custom-storage session
                 let h = session.add_torrent_with_custom_storage(info, &self.cache_dir)?;
-                let mut flag = self.custom_storage_active.lock().map_err(|_| {
-                    TorrentError::Unknown {
-                        code: -1,
-                        message: "Custom storage flag lock poisoned".to_string(),
-                    }
-                })?;
+                let mut flag =
+                    self.custom_storage_active
+                        .lock()
+                        .map_err(|_| TorrentError::Unknown {
+                            code: -1,
+                            message: "Custom storage flag lock poisoned".to_string(),
+                        })?;
                 *flag = true;
                 h
             } else {

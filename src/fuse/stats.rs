@@ -8,8 +8,6 @@ use std::time::{Duration, UNIX_EPOCH};
 use crate::cache::CacheManager;
 use crate::db::{Database, TorrentStatus};
 use crate::services::download::DownloadService;
-use crate::metadata::TorrentInfo;
-use tracing::warn;
 
 /// Format bytes into human-readable form.
 pub fn format_bytes(bytes: u64) -> String {
@@ -32,7 +30,6 @@ pub fn format_bytes(bytes: u64) -> String {
 pub fn format_num(n: u64) -> String {
     let s = n.to_string();
     let len = s.len();
-    // Pre-allocate: each group of 3 digits gets a comma (except the first group)
     let mut result = String::with_capacity(len + (len.saturating_sub(1)) / 3);
     for (i, c) in s.chars().enumerate() {
         if i > 0 && (len - i) % 3 == 0 {
@@ -41,6 +38,556 @@ pub fn format_num(n: u64) -> String {
         result.push(c);
     }
     result
+}
+
+// ── Shared helpers ──────────────────────────────────────────────────────────
+
+const BANNER: &str = "===========================================================\n";
+const BANNER_LINE: &str = "===========================================================";
+
+fn write_banner(output: &mut String, subtitle: Option<&str>) {
+    let version = env!("CARGO_PKG_VERSION");
+    output.push_str(BANNER);
+    if let Some(sub) = subtitle {
+        output.push_str(&format!("  torrentfs v{} — {}\n", version, sub));
+    } else {
+        output.push_str(&format!("  torrentfs v{}\n", version));
+    }
+    output.push_str(BANNER);
+    output.push_str("\n\n");
+}
+
+fn write_overview(
+    output: &mut String,
+    creation_time: Duration,
+    db: &Option<Arc<Mutex<Database>>>,
+    download_service: &Option<DownloadService>,
+    get_cache_manager: &impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
+    listen_addr: &str,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let uptime_secs = now.as_secs().saturating_sub(creation_time.as_secs());
+    let uptime_h = uptime_secs / 3600;
+    let uptime_m = (uptime_secs % 3600) / 60;
+    let uptime_s = uptime_secs % 60;
+
+    output.push_str("-- Overview --\n");
+    output.push_str(&format!(
+        "  Uptime:       {}h {}m {}s\n",
+        uptime_h, uptime_m, uptime_s
+    ));
+    output.push_str("  Mount:        (dynamic)\n");
+
+    let db_path = if db.is_some() { "(active)" } else { "(none)" };
+    output.push_str(&format!("  Database:     {}\n", db_path));
+
+    let (cache_total_size, cache_max_size, cache_dir_str) =
+        if let Some(ref cm) = get_cache_manager() {
+            if let Ok(cm_guard) = cm.lock() {
+                (
+                    cm_guard.current_size(),
+                    cm_guard.max_cache_size(),
+                    "(cache)",
+                )
+            } else {
+                (0, 0, "(locked)")
+            }
+        } else {
+            (0, 0, "(none)")
+        };
+    let cache_pct = if cache_max_size > 0 {
+        (cache_total_size as f64 / cache_max_size as f64) * 100.0
+    } else {
+        0.0
+    };
+    output.push_str(&format!("  Cache Dir:    {}\n", cache_dir_str));
+    output.push_str(&format!(
+        "  Cache Usage:  {} / {} ({:.1}%)\n",
+        format_bytes(cache_total_size),
+        format_bytes(cache_max_size),
+        cache_pct
+    ));
+
+    let session_stats = if let Some(ref ds) = download_service {
+        ds.get_session_stats().ok()
+    } else {
+        None
+    };
+
+    if let Some(ref ss) = session_stats {
+        output.push_str(&format!("  Listen:       {}\n", listen_addr));
+        output.push_str(&format!("  DHT Nodes:    {}\n", ss.dht_nodes));
+    } else {
+        output.push_str("  Listen:       (not available)\n");
+        output.push_str("  DHT Nodes:    —\n");
+    }
+}
+
+fn write_global_rates(output: &mut String, download_service: &Option<DownloadService>) {
+    let session_stats = if let Some(ref ds) = download_service {
+        ds.get_session_stats().ok()
+    } else {
+        None
+    };
+
+    output.push_str("\n-- Global Rates --\n");
+    if let Some(ref ss) = session_stats {
+        output.push_str(&format!(
+            "  Download Rate:  {}/s\n",
+            format_bytes(ss.download_rate as u64)
+        ));
+        output.push_str(&format!(
+            "  Upload Rate:    {}/s\n",
+            format_bytes(ss.upload_rate as u64)
+        ));
+        output.push_str(&format!(
+            "  Total DL:       {}\n",
+            format_bytes(ss.total_downloaded as u64)
+        ));
+        output.push_str(&format!(
+            "  Total UL:       {}\n",
+            format_bytes(ss.total_uploaded as u64)
+        ));
+    } else {
+        output.push_str("  Download Rate:  —\n");
+        output.push_str("  Upload Rate:    —\n");
+        output.push_str("  Total DL:       —\n");
+        output.push_str("  Total UL:       —\n");
+    }
+}
+
+fn write_connections(output: &mut String, download_service: &Option<DownloadService>) {
+    let session_stats = if let Some(ref ds) = download_service {
+        ds.get_session_stats().ok()
+    } else {
+        None
+    };
+
+    output.push_str("\n-- Connections --\n");
+    if let Some(ref ss) = session_stats {
+        output.push_str(&format!("  Connected:      {}\n", ss.peers_connected));
+        output.push_str(&format!("  Half-open:      {}\n", ss.half_open_connections));
+        output.push_str("  Total Attempts: —\n");
+    } else {
+        output.push_str("  Connected:      —\n");
+        output.push_str("  Half-open:      —\n");
+        output.push_str("  Total Attempts: —\n");
+    }
+}
+
+fn write_torrent_overview_counts(output: &mut String, db: &Option<Arc<Mutex<Database>>>) {
+    output.push_str("\n-- Torrents --\n");
+    let (pending, downloading, seeding, error, total_torrents) = if let Some(db) = db.as_ref() {
+        if let Ok(db_guard) = db.lock() {
+            db_guard
+                .get_torrent_counts_by_status()
+                .unwrap_or((0, 0, 0, 0, 0))
+        } else {
+            (0, 0, 0, 0, 0)
+        }
+    } else {
+        (0, 0, 0, 0, 0)
+    };
+
+    let unique_info_hashes = if let Some(db) = db.as_ref() {
+        if let Ok(db_guard) = db.lock() {
+            if let Ok(torrents) = db_guard.get_all_torrents() {
+                let mut set: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for t in &torrents {
+                    set.insert(t.info_hash.as_str());
+                }
+                set.len() as i64
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    output.push_str(&format!(
+        "  Total: {}  Unique: {}  Pending: {}  Downloading: {}  Seeding: {}  Error: {}\n",
+        total_torrents, unique_info_hashes, pending, downloading, seeding, error
+    ));
+}
+
+fn write_global_cache_summary(
+    output: &mut String,
+    get_cache_manager: &impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
+) {
+    output.push_str("\n-- Cache --\n");
+    let (global_hits, global_misses) = if let Some(ref cm) = get_cache_manager() {
+        if let Ok(cm_guard) = cm.lock() {
+            (cm_guard.hit_count, cm_guard.miss_count)
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
+    let global_total = global_hits + global_misses;
+    let hit_rate = if global_total > 0 {
+        (global_hits as f64 / global_total as f64) * 100.0
+    } else {
+        0.0
+    };
+    output.push_str(&format!(
+        "  Hits: {}  Misses: {}  Hit Rate: {:.1}%  Evictions: 0\n",
+        format_num(global_hits),
+        format_num(global_misses),
+        hit_rate
+    ));
+}
+
+fn write_performance(output: &mut String) {
+    output.push_str("\n-- Performance --\n");
+    output.push_str("  Tick Interval:  1000 ms\n");
+    output.push_str("  Memory (RSS):   —\n");
+}
+
+fn status_to_english(status: &TorrentStatus) -> &'static str {
+    match status {
+        TorrentStatus::Pending => "Pending",
+        TorrentStatus::Downloading => "Downloading",
+        TorrentStatus::Seeding => "Seeding",
+        TorrentStatus::Error => "Error",
+    }
+}
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+/// Generate global stats (no per-torrent details, no per-infohash cache breakdown).
+pub fn generate_global_stats(
+    creation_time: Duration,
+    db: &Option<Arc<Mutex<Database>>>,
+    download_service: &Option<DownloadService>,
+    get_cache_manager: impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
+    listen_addr: &str,
+) -> Vec<u8> {
+    let mut output = String::new();
+
+    write_banner(&mut output, None);
+    write_overview(
+        &mut output,
+        creation_time,
+        db,
+        download_service,
+        &get_cache_manager,
+        listen_addr,
+    );
+    write_global_rates(&mut output, download_service);
+    write_connections(&mut output, download_service);
+    write_torrent_overview_counts(&mut output, db);
+    write_global_cache_summary(&mut output, &get_cache_manager);
+    write_performance(&mut output);
+
+    output.push('\n');
+    output.push_str(BANNER_LINE);
+    output.push('\n');
+    output.into_bytes()
+}
+
+/// Generate stats for a single torrent identified by torrent_id and info_hash.
+pub fn generate_torrent_stats(
+    torrent_id: i64,
+    info_hash: &str,
+    db: &Option<Arc<Mutex<Database>>>,
+    download_service: &Option<DownloadService>,
+    get_cache_manager: impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
+) -> Vec<u8> {
+    let mut output = String::new();
+
+    write_banner(&mut output, Some("Torrent Stats"));
+
+    let torrent = if let Some(db) = db.as_ref() {
+        if let Ok(db_guard) = db.lock() {
+            db_guard.get_torrent_by_id(torrent_id).ok().flatten()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let t = match torrent {
+        Some(t) => t,
+        None => {
+            output.push_str(&format!(
+                "  Torrent not found (id={}, info_hash={}...)\n",
+                torrent_id,
+                &info_hash[..std::cmp::min(10, info_hash.len())]
+            ));
+            output.push('\n');
+            output.push_str(BANNER_LINE);
+            output.push('\n');
+            return output.into_bytes();
+        }
+    };
+
+    output.push_str(&format!("  Name: {}\n", t.name));
+
+    let status_str = status_to_english(&t.status);
+
+    let (
+        dl_rate,
+        ul_rate,
+        num_peers,
+        num_seeds,
+        progress,
+        total_size,
+        total_done,
+        total_upload,
+        total_download,
+    ) = if let Some(ref ds) = download_service {
+        let handles = ds.get_all_handles();
+        if let Some((_, handle)) = handles.iter().find(|(ih, _)| ih == info_hash) {
+            if let Ok(h) = handle.lock() {
+                if let Ok(status) = h.status() {
+                    (
+                        status.download_rate,
+                        status.upload_rate,
+                        status.num_peers,
+                        status.num_seeds,
+                        status.progress,
+                        status.total,
+                        status.total_done,
+                        status.total_upload,
+                        status.total_download,
+                    )
+                } else {
+                    (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
+                }
+            } else {
+                (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
+            }
+        } else {
+            (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
+        }
+    } else {
+        (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
+    };
+
+    let prog_pct = if total_size > 0 {
+        progress * 100.0
+    } else {
+        0.0
+    };
+
+    output.push_str(&format!(
+        "  Status: {}  Progress: {:.1}%  Size: {}\n",
+        status_str,
+        prog_pct,
+        format_bytes(t.total_size as u64)
+    ));
+
+    let share = if total_download > 0 {
+        format!("{:.2}", total_upload as f64 / total_download as f64)
+    } else {
+        "—".to_string()
+    };
+
+    output.push_str(&format!(
+        "  DL: {}  UL: {}  Ratio: {}\n",
+        format_bytes(total_done),
+        format_bytes(total_upload as u64),
+        share
+    ));
+
+    output.push_str(&format!(
+        "  Rate: ↓ {}/s  ↑ {}/s  Peers: {}  Seeds: {}\n",
+        format_bytes(dl_rate as u64),
+        format_bytes(ul_rate as u64),
+        num_peers,
+        num_seeds
+    ));
+
+    if num_peers == 0 && num_seeds == 0 {
+        output.push_str("  ⚠ Health: 0 peers / 0 seeds — tracker may be unreachable\n");
+    }
+
+    if let Some(ref cm) = get_cache_manager() {
+        if let Ok(cm_guard) = cm.lock() {
+            let cache_stats = cm_guard.get_cache_stats_by_infohash(info_hash);
+            output.push_str(&format!(
+                "  Cache: {} pieces  {}\n",
+                cache_stats.piece_count,
+                format_bytes(cache_stats.total_size)
+            ));
+        }
+    }
+
+    output.push_str(&format!("  info_hash: {}\n", t.info_hash));
+    output.push_str(&format!("  source_path: \"{}\"\n", t.source_path));
+
+    output.push('\n');
+    output.push_str(BANNER_LINE);
+    output.push('\n');
+    output.into_bytes()
+}
+
+/// Generate aggregated stats for all torrents under a given source_path.
+pub fn generate_directory_stats(
+    source_path: &str,
+    db: &Option<Arc<Mutex<Database>>>,
+    download_service: &Option<DownloadService>,
+    get_cache_manager: impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
+) -> Vec<u8> {
+    let _ = get_cache_manager;
+    let mut output = String::new();
+
+    write_banner(&mut output, Some("Directory Stats"));
+
+    output.push_str(&format!("  Source Path: \"{}\"\n\n", source_path));
+
+    let torrents = if let Some(db) = db.as_ref() {
+        if let Ok(db_guard) = db.lock() {
+            db_guard
+                .get_torrents_by_source_path(source_path)
+                .unwrap_or_default()
+        } else {
+            vec![]
+        }
+    } else {
+        vec![]
+    };
+
+    if torrents.is_empty() {
+        output.push_str("  No torrents found under this path.\n");
+        output.push('\n');
+        output.push_str(BANNER_LINE);
+        output.push('\n');
+        return output.into_bytes();
+    }
+
+    let torrent_count = torrents.len();
+    let mut total_size: u64 = 0;
+    let mut total_done: u64 = 0;
+    let mut total_upload: u64 = 0;
+    let mut total_download: u64 = 0;
+    let mut aggregate_dl_rate: i64 = 0;
+    let mut aggregate_ul_rate: i64 = 0;
+    let mut aggregate_peers: i32 = 0;
+    let mut aggregate_seeds: i32 = 0;
+
+    for t in &torrents {
+        total_size += t.total_size as u64;
+        if let Some(ref ds) = download_service {
+            let handles = ds.get_all_handles();
+            if let Some((_, handle)) = handles.iter().find(|(ih, _)| ih == &t.info_hash) {
+                if let Ok(h) = handle.lock() {
+                    if let Ok(status) = h.status() {
+                        total_done += status.total_done;
+                        total_upload += status.total_upload as u64;
+                        total_download += status.total_download as u64;
+                        aggregate_dl_rate += status.download_rate;
+                        aggregate_ul_rate += status.upload_rate;
+                        aggregate_peers += status.num_peers;
+                        aggregate_seeds += status.num_seeds;
+                    }
+                }
+            }
+        }
+    }
+
+    output.push_str("-- Summary --\n");
+    output.push_str(&format!(
+        "  Torrents: {}  Total Size: {}  Downloaded: {}\n",
+        torrent_count,
+        format_bytes(total_size),
+        format_bytes(total_done)
+    ));
+    output.push_str(&format!(
+        "  DL Rate: ↓ {}/s  UL Rate: ↑ {}/s\n",
+        format_bytes(aggregate_dl_rate as u64),
+        format_bytes(aggregate_ul_rate as u64)
+    ));
+    output.push_str(&format!(
+        "  Total UL: {}  Total DL: {}\n",
+        format_bytes(total_upload),
+        format_bytes(total_download)
+    ));
+    output.push_str(&format!(
+        "  Peers: {}  Seeds: {}\n",
+        aggregate_peers, aggregate_seeds
+    ));
+
+    output.push_str("\n-- Torrents --\n");
+    for (idx, t) in torrents.iter().enumerate() {
+        let status_str = status_to_english(&t.status);
+
+        let (dl_rate, ul_rate, peers, seeds, progress, ts) = if let Some(ref ds) = download_service
+        {
+            let handles = ds.get_all_handles();
+            if let Some((_, handle)) = handles.iter().find(|(ih, _)| ih == &t.info_hash) {
+                if let Ok(h) = handle.lock() {
+                    if let Ok(status) = h.status() {
+                        (
+                            status.download_rate,
+                            status.upload_rate,
+                            status.num_peers,
+                            status.num_seeds,
+                            status.progress,
+                            status.total,
+                        )
+                    } else {
+                        (0, 0, 0, 0, 0.0, 0)
+                    }
+                } else {
+                    (0, 0, 0, 0, 0.0, 0)
+                }
+            } else {
+                (0, 0, 0, 0, 0.0, 0)
+            }
+        } else {
+            (0, 0, 0, 0, 0.0, 0)
+        };
+
+        let prog_pct = if ts > 0 { progress * 100.0 } else { 0.0 };
+
+        output.push_str(&format!(
+            "  #{:<3} {:<40} {}  {:>5.1}%  ↓ {:<10}/s  ↑ {:<10}/s  {:>3}P/{:<3}S\n",
+            idx + 1,
+            if t.name.len() > 40 {
+                t.name.chars().take(37).collect::<String>() + "..."
+            } else {
+                t.name.clone()
+            },
+            status_str,
+            prog_pct,
+            format_bytes(dl_rate as u64),
+            format_bytes(ul_rate as u64),
+            peers,
+            seeds,
+        ));
+    }
+
+    output.push('\n');
+    output.push_str(BANNER_LINE);
+    output.push('\n');
+    output.into_bytes()
+}
+
+/// Generate the .stats file content (compatibility wrapper).
+pub fn generate_stats(
+    creation_time: Duration,
+    db: &Option<Arc<Mutex<Database>>>,
+    download_service: &Option<DownloadService>,
+    get_cache_manager: impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
+    torrent_data_cache: &Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    listen_addr: &str,
+) -> Vec<u8> {
+    let _ = torrent_data_cache;
+    generate_global_stats(
+        creation_time,
+        db,
+        download_service,
+        get_cache_manager,
+        listen_addr,
+    )
 }
 
 #[cfg(test)]
@@ -106,391 +653,156 @@ mod tests {
     fn test_format_num_u64_max() {
         assert_eq!(format_num(u64::MAX), "18,446,744,073,709,551,615");
     }
-}
 
-/// Generate the .stats file content.
-pub fn generate_stats(
-    creation_time: Duration,
-    db: &Option<Arc<Mutex<Database>>>,
-    download_service: &Option<DownloadService>,
-    get_cache_manager: impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
-    torrent_data_cache: &Arc<Mutex<HashMap<String, Vec<u8>>>>,
-) -> Vec<u8> {
-    let _ = torrent_data_cache; // kept for future use
-    let mut output = String::new();
-
-    // Header
-    output.push_str("═══════════════════════════════════════════════════════════════\n");
-    output.push_str("  torrentfs v0.1.0\n");
-    output.push_str("═══════════════════════════════════════════════════════════════\n\n");
-
-    // --- 概况 ---
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let uptime_secs = now.as_secs().saturating_sub(creation_time.as_secs());
-    let uptime_h = uptime_secs / 3600;
-    let uptime_m = (uptime_secs % 3600) / 60;
-    let uptime_s = uptime_secs % 60;
-
-    output.push_str("── 概况 ──\n");
-    output.push_str(&format!(
-        "  运行时间:    {}h {}m {}s\n",
-        uptime_h, uptime_m, uptime_s
-    ));
-    output.push_str("  挂载点:      (dynamic)\n");
-
-    // DB path
-    let db_path = if db.is_some() {
-        "(active)"
-    } else {
-        "(none)"
-    };
-    output.push_str(&format!("  数据库:      {}\n", db_path));
-
-    // Cache info
-    let (cache_total_size, cache_max_size, cache_dir_str) =
-        if let Some(ref cm) = get_cache_manager() {
-            if let Ok(cm_guard) = cm.lock() {
-                (
-                    cm_guard.current_size(),
-                    cm_guard.max_cache_size(),
-                    "(cache)",
-                )
-            } else {
-                (0, 0, "(locked)")
-            }
-        } else {
-            (0, 0, "(none)")
-        };
-    let cache_pct = if cache_max_size > 0 {
-        (cache_total_size as f64 / cache_max_size as f64) * 100.0
-    } else {
-        0.0
-    };
-    output.push_str(&format!("  缓存目录:    {}\n", cache_dir_str));
-    output.push_str(&format!(
-        "  缓存总用量:  {} / {} ({:.1}%)\n",
-        format_bytes(cache_total_size),
-        format_bytes(cache_max_size),
-        cache_pct
-    ));
-
-    // Session stats
-    let session_stats = if let Some(ref ds) = download_service {
-        ds.get_session_stats().ok()
-    } else {
-        None
-    };
-
-    if let Some(ref ss) = session_stats {
-        output.push_str("  监听地址:    0.0.0.0:6881\n");
-        output.push_str(&format!("  DHT 节点:    {}\n", ss.dht_nodes));
-    } else {
-        output.push_str("  监听地址:    (not available)\n");
-        output.push_str("  DHT 节点:    —\n");
+    #[test]
+    fn test_global_stats_header_present() {
+        let stats = generate_global_stats(
+            Duration::from_secs(0),
+            &None,
+            &None,
+            || None,
+            "0.0.0.0:6881",
+        );
+        let text = String::from_utf8_lossy(&stats);
+        assert!(text.contains("torrentfs v0.1.0"));
+        assert!(text.contains("-- Overview --"));
     }
 
-    // --- 全局速率 ---
-    output.push_str("\n── 全局速率 ──\n");
-    if let Some(ref ss) = session_stats {
-        output.push_str(&format!(
-            "  下载速率:    {}/s\n",
-            format_bytes(ss.download_rate as u64)
-        ));
-        output.push_str(&format!(
-            "  上传速率:    {}/s\n",
-            format_bytes(ss.upload_rate as u64)
-        ));
-        output.push_str(&format!(
-            "  累计下载:    {}\n",
-            format_bytes(ss.total_downloaded as u64)
-        ));
-        output.push_str(&format!(
-            "  累计上传:    {}\n",
-            format_bytes(ss.total_uploaded as u64)
-        ));
-    } else {
-        output.push_str("  下载速率:    —\n");
-        output.push_str("  上传速率:    —\n");
-        output.push_str("  累计下载:    —\n");
-        output.push_str("  累计上传:    —\n");
+    #[test]
+    fn test_global_stats_no_torrent_details() {
+        let stats = generate_global_stats(
+            Duration::from_secs(0),
+            &None,
+            &None,
+            || None,
+            "0.0.0.0:6881",
+        );
+        let text = String::from_utf8_lossy(&stats);
+        assert!(!text.contains("── 种子详情 ──"));
     }
 
-    // --- 连接 ---
-    output.push_str("\n── 连接 ──\n");
-    if let Some(ref ss) = session_stats {
-        output.push_str(&format!("  已连接 peers:   {}\n", ss.peers_connected));
-        output.push_str(&format!(
-            "  半开连接:        {}\n",
-            ss.half_open_connections
-        ));
-        output.push_str("  累计尝试:      —\n");
-    } else {
-        output.push_str("  已连接 peers:   —\n");
-        output.push_str("  半开连接:       —\n");
-        output.push_str("  累计尝试:      —\n");
+    #[test]
+    fn test_global_stats_no_per_infohash_cache() {
+        let stats = generate_global_stats(
+            Duration::from_secs(0),
+            &None,
+            &None,
+            || None,
+            "0.0.0.0:6881",
+        );
+        let text = String::from_utf8_lossy(&stats);
+        assert!(!text.contains("[info_hash]"));
     }
 
-    // --- 种子总览 ---
-    output.push_str("\n── 种子总览 ──\n");
-    let (pending, downloading, seeding, error, total_torrents) =
-        if let Some(db) = db.as_ref() {
-            if let Ok(db_guard) = db.lock() {
-                db_guard
-                    .get_torrent_counts_by_status()
-                    .unwrap_or((0, 0, 0, 0, 0))
-            } else {
-                (0, 0, 0, 0, 0)
-            }
-        } else {
-            (0, 0, 0, 0, 0)
-        };
-
-    // Count unique info_hashes
-    let unique_info_hashes = if let Some(db) = db.as_ref() {
-        if let Ok(db_guard) = db.lock() {
-            if let Ok(torrents) = db_guard.get_all_torrents() {
-                let mut set: std::collections::HashSet<&str> = std::collections::HashSet::new();
-                for t in &torrents {
-                    set.insert(t.info_hash.as_str());
-                }
-                set.len() as i64
-            } else {
-                0
-            }
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-
-    output.push_str(&format!(
-        "  种子实例: {}    info_hash 去重: {}    等待: {}    下载: {}    做种: {}    错误: {}\n",
-        total_torrents, unique_info_hashes, pending, downloading, seeding, error
-    ));
-
-    // --- 种子详情 ---
-    output.push_str("\n── 种子详情 ──\n");
-
-    // Pre-pass: ensure lightweight handles exist for all torrents
-    if let Some(ref ds) = download_service {
-        if let Some(db) = db.as_ref() {
-            if let Ok(db_guard) = db.lock() {
-                if let Ok(torrents) = db_guard.get_all_torrents() {
-                    for t in &torrents {
-                        if ds.query_torrent_status(&t.info_hash).is_none() {
-                            if let Some(ref torrent_data) = t.torrent_data {
-                                if let Ok(info) =
-                                    TorrentInfo::from_bytes(torrent_data.clone())
-                                {
-                                    if let Err(e) = ds.ensure_handle_lightweight(&info) {
-                                        warn!(
-                                            "Failed to create lightweight handle for {} ({}): {:?}",
-                                            t.name, &t.info_hash[..std::cmp::min(10, t.info_hash.len())], e
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    #[test]
+    fn test_torrent_stats_not_found() {
+        let stats = generate_torrent_stats(999, "deadbeef", &None, &None, || None);
+        let text = String::from_utf8_lossy(&stats);
+        assert!(text.contains("Torrent not found"));
     }
 
-    if let Some(db) = db.as_ref() {
-        if let Ok(db_guard) = db.lock() {
-            if let Ok(torrents) = db_guard.get_all_torrents() {
-                let mut torrent_idx = 0usize;
-                for t in &torrents {
-                    torrent_idx += 1;
-                    output.push_str(&format!("  #{}  {}\n", torrent_idx, t.name));
-
-                    let status_str = match t.status {
-                        TorrentStatus::Pending => "等待",
-                        TorrentStatus::Downloading => "下载",
-                        TorrentStatus::Seeding => "做种",
-                        TorrentStatus::Error => "错误",
-                    };
-
-                    let (
-                        dl_rate,
-                        ul_rate,
-                        num_peers,
-                        num_seeds,
-                        progress,
-                        total_size,
-                        total_done,
-                        total_upload,
-                        total_download,
-                    ) = if let Some(ref ds) = download_service {
-                        let handles = ds.get_all_handles();
-                        if let Some((_, handle)) =
-                            handles.iter().find(|(ih, _)| ih == &t.info_hash)
-                        {
-                            if let Ok(h) = handle.lock() {
-                                if let Ok(status) = h.status() {
-                                    (
-                                        status.download_rate,
-                                        status.upload_rate,
-                                        status.num_peers,
-                                        status.num_seeds,
-                                        status.progress,
-                                        status.total,
-                                        status.total_done,
-                                        status.total_upload,
-                                        status.total_download,
-                                    )
-                                } else {
-                                    (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
-                                }
-                            } else {
-                                (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
-                            }
-                        } else {
-                            (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
-                        }
-                    } else {
-                        (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
-                    };
-
-                    let prog_pct = if total_size > 0 {
-                        progress * 100.0
-                    } else {
-                        0.0
-                    };
-
-                    output.push_str(&format!(
-                        "      状态: {}     进度: {:.1}%    大小: {}\n",
-                        status_str,
-                        prog_pct,
-                        format_bytes(t.total_size as u64)
-                    ));
-
-                    let share = if total_download > 0 {
-                        format!("{:.2}", total_upload as f64 / total_download as f64)
-                    } else {
-                        "—".to_string()
-                    };
-
-                    output.push_str(&format!(
-                        "      下载: {}   上传: {}   分享率: {}\n",
-                        format_bytes(total_done),
-                        format_bytes(total_upload as u64),
-                        share
-                    ));
-
-                    output.push_str(&format!(
-                        "      速度: ↓ {}/s   ↑ {}/s  peers: {}   seeds: {}\n",
-                        format_bytes(dl_rate as u64),
-                        format_bytes(ul_rate as u64),
-                        num_peers,
-                        num_seeds
-                    ));
-
-                    if num_peers == 0 && num_seeds == 0 {
-                        output.push_str(
-                            "      ⚠ 健康警告: 0 peers / 0 seeds — tracker 可能无响应或种子无活跃节点\n",
-                        );
-                    }
-
-                    output.push_str(&format!(
-                        "      source_path: \"{}\"                       info_hash: {}...\n",
-                        if t.source_path.is_empty() {
-                            ""
-                        } else {
-                            &t.source_path
-                        },
-                        &t.info_hash[..std::cmp::min(10, t.info_hash.len())]
-                    ));
-
-                    output.push('\n');
-                }
-            }
-        }
+    #[test]
+    fn test_directory_stats_empty_path() {
+        let stats = generate_directory_stats("/nonexistent", &None, &None, || None);
+        let text = String::from_utf8_lossy(&stats);
+        assert!(text.contains("No torrents found"));
     }
 
-    // --- 缓存详情 ---
-    output.push_str("── 缓存详情 ──\n");
-    let (global_hits, global_misses) = if let Some(ref cm) = get_cache_manager() {
-        if let Ok(cm_guard) = cm.lock() {
-            (cm_guard.hit_count, cm_guard.miss_count)
-        } else {
-            (0, 0)
-        }
-    } else {
-        (0, 0)
-    };
-    let global_total = global_hits + global_misses;
-    let hit_rate = if global_total > 0 {
-        (global_hits as f64 / global_total as f64) * 100.0
-    } else {
-        0.0
-    };
-    output.push_str(&format!(
-        "  全局命中: {}    全局未命中: {}    全局命中率: {:.1}%    淘汰: 0\n\n",
-        format_num(global_hits),
-        format_num(global_misses),
-        hit_rate
-    ));
-
-    // Per-info_hash cache stats
-    if let Some(ref cm) = get_cache_manager() {
-        if let Ok(cm_guard) = cm.lock() {
-            let infohashes = cm_guard.get_all_infohashes();
-            for ih in &infohashes {
-                let stats = cm_guard.get_cache_stats_by_infohash(ih);
-                output.push_str(&format!(
-                    "  [info_hash] {}...\n",
-                    &ih[..std::cmp::min(10, ih.len())]
-                ));
-                output.push_str(&format!(
-                    "    缓存:  {} pieces    {}    命中: {}    淘汰: 0\n",
-                    stats.piece_count,
-                    format_bytes(stats.total_size),
-                    format_num(stats.hit_count)
-                ));
-                output.push_str("    种子:\n");
-
-                // Query DB for associated torrents
-                if let Some(db) = db.as_ref() {
-                    if let Ok(db_guard) = db.lock() {
-                        if let Ok(associated) = db_guard.get_torrents_by_infohash(ih) {
-                            for (torrent_id, name, _filename, source_path) in &associated {
-                                let idx_str = if let Ok(all) = db_guard.get_all_torrents() {
-                                    all.iter()
-                                        .position(|t| t.id == *torrent_id)
-                                        .map(|p| format!("#{}", p + 1))
-                                        .unwrap_or_else(|| "#?".to_string())
-                                } else {
-                                    "#?".to_string()
-                                };
-                                let sp = if source_path.is_empty() {
-                                    ""
-                                } else {
-                                    source_path
-                                };
-                                output.push_str(&format!(
-                                    "      {}  {:<40}  source_path: \"{}\"\n",
-                                    idx_str, name, sp
-                                ));
-                            }
-                        }
-                    }
-                }
-                output.push('\n');
-            }
-        }
+    #[test]
+    fn test_generate_stats_is_wrapper() {
+        let global = generate_global_stats(
+            Duration::from_secs(0),
+            &None,
+            &None,
+            || None,
+            "0.0.0.0:6881",
+        );
+        let wrapper = generate_stats(
+            Duration::from_secs(0),
+            &None,
+            &None,
+            || None,
+            &Arc::new(Mutex::new(HashMap::new())),
+            "0.0.0.0:6881",
+        );
+        let gtext = String::from_utf8_lossy(&global);
+        let wtext = String::from_utf8_lossy(&wrapper);
+        assert_eq!(
+            gtext, wtext,
+            "generate_stats should produce same output as generate_global_stats"
+        );
     }
 
-    // --- 性能 ---
-    output.push_str("── 性能 ──\n");
-    output.push_str("  tick 间隔:      1000 ms\n");
-    output.push_str("  内存 (RSS):     —\n");
+    #[test]
+    fn test_name_truncation_utf8_safe() {
+        let long_cjk = "这是一个很长的种子文件名测试用例".to_string(); // 16 chars, 48 bytes
+        assert!(long_cjk.len() > 40);
+        let truncated = long_cjk.chars().take(37).collect::<String>() + "...";
+        assert_eq!(truncated.chars().count(), 16 + 3);
+    }
 
-    output.push_str("\n═══════════════════════════════════════════════════════════════\n");
+    #[test]
+    fn test_global_stats_ascii_borders() {
+        let stats = generate_global_stats(
+            Duration::from_secs(0),
+            &None,
+            &None,
+            || None,
+            "0.0.0.0:6881",
+        );
+        let text = String::from_utf8_lossy(&stats);
+        assert!(text.contains("====="), "borders must be ASCII '='");
+        assert!(!text.contains('\u{2550}'), "no Unicode double-line borders");
+    }
 
-    output.into_bytes()
+    #[test]
+    fn test_global_stats_english_headers() {
+        let stats = generate_global_stats(
+            Duration::from_secs(0),
+            &None,
+            &None,
+            || None,
+            "0.0.0.0:6881",
+        );
+        let text = String::from_utf8_lossy(&stats);
+        assert!(text.contains("-- Overview --"));
+        assert!(text.contains("-- Global Rates --"));
+        assert!(text.contains("-- Connections --"));
+        assert!(text.contains("-- Torrents --"));
+        assert!(text.contains("-- Cache --"));
+        assert!(text.contains("-- Performance --"));
+    }
+
+    #[test]
+    fn test_global_stats_total_unique_format() {
+        let stats = generate_global_stats(
+            Duration::from_secs(0),
+            &None,
+            &None,
+            || None,
+            "0.0.0.0:6881",
+        );
+        let text = String::from_utf8_lossy(&stats);
+        assert!(text.contains("Total: "));
+        assert!(text.contains("Unique: "));
+    }
+
+    #[test]
+    fn test_torrent_stats_english_status() {
+        // Without a real DB, this should just not panic with "Torrent not found"
+        let stats = generate_torrent_stats(1, "abc", &None, &None, || None);
+        let text = String::from_utf8_lossy(&stats);
+        assert!(!text.contains("等待"));
+        assert!(!text.contains("下载"));
+        assert!(!text.contains("做种"));
+        assert!(!text.contains("错误"));
+    }
+
+    #[test]
+    fn test_directory_stats_english_headers() {
+        let stats = generate_directory_stats("/nonexistent", &None, &None, || None);
+        let text = String::from_utf8_lossy(&stats);
+        assert!(!text.contains("──"));
+        assert!(text.contains("No torrents found"));
+    }
 }

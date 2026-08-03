@@ -37,10 +37,7 @@ impl DataResolver {
         }
     }
 
-    fn resolve_data_root_lookup(
-        db: &Arc<Mutex<Database>>,
-        name: &str,
-    ) -> Option<(u64, DataInode)> {
+    fn resolve_data_root_lookup(db: &Arc<Mutex<Database>>, name: &str) -> Option<(u64, DataInode)> {
         let db_guard = db.lock().ok()?;
 
         let prefixes = db_guard.get_source_path_prefixes("").ok()?;

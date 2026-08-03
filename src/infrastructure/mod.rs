@@ -20,6 +20,7 @@ pub use db::{
     TorrentStatus,
 };
 pub use download::{
-    DownloadManager, FilePieceInfo, Session, TorrentHandle, TorrentState, TorrentStatus as DownloadTorrentStatus,
+    DownloadManager, FilePieceInfo, Session, TorrentHandle, TorrentState,
+    TorrentStatus as DownloadTorrentStatus,
 };
 pub use metadata::TorrentInfo;

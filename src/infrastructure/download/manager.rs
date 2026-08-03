@@ -276,9 +276,8 @@ impl DownloadManager {
         // Peer discovery wait
         if status.num_peers == 0 && status.num_seeds == 0 {
             let peer_wait_start = std::time::Instant::now();
-            let peer_wait_timeout = std::time::Duration::from_secs(
-                std::cmp::min(self.read_timeout_secs, 10)
-            );
+            let peer_wait_timeout =
+                std::time::Duration::from_secs(std::cmp::min(self.read_timeout_secs, 10));
             let mut poll_count: u32 = 0;
             loop {
                 if peer_wait_start.elapsed() >= peer_wait_timeout {
@@ -300,17 +299,18 @@ impl DownloadManager {
                         }
                         if poll_count >= 3 {
                             let all_cached = {
-                                let cache = self
-                                    .cache_manager
-                                    .lock()
-                                    .map_err(|_| TorrentError::Unknown {
+                                let cache = self.cache_manager.lock().map_err(|_| {
+                                    TorrentError::Unknown {
                                         code: -1,
                                         message: "Cache lock poisoned".to_string(),
-                                    })?;
+                                    }
+                                })?;
                                 let mut all_found = true;
                                 for piece_idx in start_piece..=end_piece {
                                     let piece_key = Self::make_piece_key(&info_hash, piece_idx);
-                                    if !cache.has_piece(&piece_key) && !cache.has_piece_on_disk(&piece_key) {
+                                    if !cache.has_piece(&piece_key)
+                                        && !cache.has_piece_on_disk(&piece_key)
+                                    {
                                         all_found = false;
                                         break;
                                     }

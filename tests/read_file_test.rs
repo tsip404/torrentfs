@@ -26,16 +26,13 @@ fn skip_if_ci() -> bool {
 /// validating that the lazy-loading flow works end-to-end.
 #[test]
 fn test_read_file_range_with_local_seeder() {
-    if skip_if_ci() { return; }
+    if skip_if_ci() {
+        return;
+    }
     // ── Setup: start tracker + seeder ──────────────────────────────────
     let harness = TestHarness::new();
 
-    let info_hash = hex::encode(
-        harness
-            .info
-            .info_hash()
-            .expect("Failed to get info hash"),
-    );
+    let info_hash = hex::encode(harness.info.info_hash().expect("Failed to get info hash"));
     println!("TestHarness ready. Info hash: {}", info_hash);
     println!(
         "Tracker URL: {}, announces: {}",
@@ -105,7 +102,9 @@ fn test_read_file_range_with_local_seeder() {
 /// combinations, validating boundary handling.
 #[test]
 fn test_read_file_range_boundaries() {
-    if skip_if_ci() { return; }
+    if skip_if_ci() {
+        return;
+    }
     let harness = TestHarness::new();
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
@@ -162,7 +161,9 @@ fn test_read_file_range_boundaries() {
 /// peers/seeds are available AND no cached pieces exist.
 #[test]
 fn test_read_file_range_no_peers_error() {
-    if skip_if_ci() { return; }
+    if skip_if_ci() {
+        return;
+    }
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
 
     // Use config with DHT disabled so we don't accidentally find peers
@@ -178,8 +179,7 @@ fn test_read_file_range_no_peers_error() {
     let (torrent_data, _file_content) =
         common::create_test_torrent_with_tracker("http://127.0.0.1:19999/announce");
 
-    let info = torrentfs::TorrentInfo::from_bytes(torrent_data)
-        .expect("Failed to parse torrent");
+    let info = torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent");
 
     // This should fail with NoPeers since the tracker doesn't exist
     let result = dm.read_file_range(&info, 0, 0, 50);
@@ -190,7 +190,10 @@ fn test_read_file_range_no_peers_error() {
         }
         Err(e) => {
             // Could also be InvalidFile if timeout occurs in state checking
-            println!("Got error: {:?} (NoPeers expected but other error acceptable)", e);
+            println!(
+                "Got error: {:?} (NoPeers expected but other error acceptable)",
+                e
+            );
         }
         Ok(data) => {
             // Not expected but could happen if pieces somehow cached

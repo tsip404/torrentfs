@@ -60,8 +60,7 @@ impl Database {
             self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
             Self::migrate_v5(&self.conn)?;
             self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-            self.conn
-                .pragma_update(None, "user_version", 5)?;
+            self.conn.pragma_update(None, "user_version", 5)?;
         }
 
         if user_version < 3 {

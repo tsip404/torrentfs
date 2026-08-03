@@ -228,4 +228,3 @@ fn test_config_to_settings_json_default_is_empty() {
     // Default config with all None should produce empty JSON object
     assert_eq!(json, "{}");
 }
-
