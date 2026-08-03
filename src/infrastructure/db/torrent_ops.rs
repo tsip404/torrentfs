@@ -17,8 +17,8 @@ impl Database {
         let existing: Option<i64> = self
             .conn
             .query_row(
-                "SELECT id FROM torrents WHERE info_hash = ? AND source_path = ?",
-                params![info_hash, source_path],
+                "SELECT id FROM torrents WHERE source_path = ? AND filename = ?",
+                params![source_path, filename],
                 |row| row.get(0),
             )
             .optional()?
@@ -93,11 +93,11 @@ impl Database {
     ) -> Result<InsertTorrentResult, DbError> {
         let tx = self.conn.transaction()?;
 
-        // Check for existing torrent with same info_hash and source_path
+        // Check for existing torrent with same source_path and filename
         let existing: Option<i64> = tx
             .query_row(
-                "SELECT id FROM torrents WHERE info_hash = ? AND source_path = ?",
-                params![info_hash, source_path],
+                "SELECT id FROM torrents WHERE source_path = ? AND filename = ?",
+                params![source_path, filename],
                 |row| row.get(0),
             )
             .optional()?

@@ -53,6 +53,17 @@ impl Database {
 
         tx.commit()?;
 
+        // v5 runs outside any transaction so that PRAGMA foreign_keys = OFF
+        // takes effect — inside a transaction it is silently ignored, causing
+        // DROP TABLE to cascade-delete child rows.
+        if user_version < 5 {
+            self.conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+            Self::migrate_v5(&self.conn)?;
+            self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+            self.conn
+                .pragma_update(None, "user_version", 5)?;
+        }
+
         if user_version < 3 {
             let paths: Vec<String> = {
                 let mut stmt = self
@@ -72,7 +83,7 @@ impl Database {
         Ok(())
     }
 
-    fn migrate_v1(conn: &Connection) -> Result<(), DbError> {
+    pub(crate) fn migrate_v1(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS torrents (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,7 +149,7 @@ impl Database {
         Ok(())
     }
 
-    fn migrate_v2(conn: &Connection) -> Result<(), DbError> {
+    pub(crate) fn migrate_v2(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
             "ALTER TABLE torrents ADD COLUMN file_count INTEGER NOT NULL DEFAULT 1;
              ALTER TABLE torrents ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';
@@ -157,7 +168,7 @@ impl Database {
         Ok(())
     }
 
-    fn migrate_v3(conn: &Connection) -> Result<(), DbError> {
+    pub(crate) fn migrate_v3(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS metadata_directories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -184,10 +195,59 @@ impl Database {
         Ok(())
     }
 
-    fn migrate_v4(conn: &Connection) -> Result<(), DbError> {
+    pub(crate) fn migrate_v4(conn: &Connection) -> Result<(), DbError> {
         conn.execute_batch(
             "ALTER TABLE torrents ADD COLUMN filename TEXT NOT NULL DEFAULT '';
              UPDATE torrents SET filename = name WHERE filename = '';",
+        )?;
+        Ok(())
+    }
+
+    /// Change UNIQUE constraint from (info_hash, source_path) to (source_path, filename)
+    /// so that the same info_hash at different source_paths or with different filenames
+    /// produces independent data/ mirrors.
+    ///
+    /// Caller MUST have disabled foreign_keys before calling this, otherwise
+    /// DROP TABLE will cascade-delete child rows in torrent_directories /
+    /// directory_closure / torrent_files.
+    pub(crate) fn migrate_v5(conn: &Connection) -> Result<(), DbError> {
+        conn.execute_batch(
+            "CREATE TABLE torrents_v5 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                info_hash TEXT NOT NULL,
+                name TEXT NOT NULL,
+                total_size INTEGER NOT NULL,
+                file_count INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending',
+                source_path TEXT NOT NULL DEFAULT '',
+                torrent_data BLOB,
+                resume_data BLOB,
+                created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+                filename TEXT NOT NULL DEFAULT '',
+                UNIQUE(source_path, filename)
+            );
+
+            -- Keep the latest row for each (source_path, filename) to satisfy
+            -- the new UNIQUE constraint; old UNIQUE(info_hash, source_path) could
+            -- have left multiple rows with same source_path+filename.
+            INSERT INTO torrents_v5
+                (id, info_hash, name, total_size, file_count, status,
+                 source_path, torrent_data, resume_data, created_at, filename)
+            SELECT id, info_hash, name, total_size, file_count, status,
+                   source_path, torrent_data, resume_data, created_at, filename
+            FROM torrents
+            WHERE id IN (
+                SELECT MAX(id) FROM torrents GROUP BY source_path, filename
+            );
+
+            DROP TABLE torrents;
+
+            ALTER TABLE torrents_v5 RENAME TO torrents;
+
+            CREATE INDEX IF NOT EXISTS idx_torrents_info_hash ON torrents(info_hash);
+            CREATE INDEX IF NOT EXISTS idx_torrents_status ON torrents(status);
+            CREATE INDEX IF NOT EXISTS idx_torrents_info_hash_source_path ON torrents(info_hash, source_path);
+            CREATE INDEX IF NOT EXISTS idx_torrents_source_path ON torrents(source_path);",
         )?;
         Ok(())
     }

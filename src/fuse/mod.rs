@@ -129,7 +129,7 @@ impl TorrentFs {
             EIO
         })?;
 
-        let (info_hash, source_path, files) = ts
+        let (info_hash, _source_path, files) = ts
             .get_torrent_with_files(torrent_id)?
             .ok_or_else(|| {
                 error!("Torrent not found: {}", torrent_id);
@@ -160,7 +160,7 @@ impl TorrentFs {
         }
 
         if let Some(ds) = &self.download_service {
-            let torrent_data = self.get_torrent_raw_data(&source_path)?;
+            let torrent_data = self.get_torrent_raw_data(torrent_id)?;
             let info = TorrentInfo::from_bytes(torrent_data).map_err(|e| {
                 error!("Failed to parse torrent info for download: {:?}", e);
                 EIO
@@ -192,7 +192,7 @@ impl TorrentFs {
         }
     }
 
-    fn get_torrent_raw_data(&self, source_path: &str) -> Result<Vec<u8>, i32> {
+    fn get_torrent_raw_data(&self, torrent_id: i64) -> Result<Vec<u8>, i32> {
         let db = DataResolver::get_db(&self.db)?;
         let db_guard = db.lock().map_err(|_| {
             error!("Database lock poisoned");
@@ -200,13 +200,13 @@ impl TorrentFs {
         })?;
 
         let torrent = db_guard
-            .get_torrent_by_source_path(source_path)
+            .get_torrent_by_id(torrent_id)
             .map_err(|e| {
                 error!("Failed to get torrent: {:?}", e);
                 EIO
             })?
             .ok_or_else(|| {
-                error!("Torrent not found for source_path: {}", source_path);
+                error!("Torrent not found for id: {}", torrent_id);
                 ENOENT
             })?;
 
