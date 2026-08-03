@@ -22,6 +22,7 @@ pub const DATA_TORRENT_INO_BASE: u64 = 1_000_000;
 pub const DATA_DIR_INO_BASE: u64 = 2_000_000;
 pub const DATA_FILE_INO_BASE: u64 = 3_000_000;
 pub const SOURCE_PATH_DIR_INO_BASE: u64 = 4_000_000;
+pub const STATS_INO_OFFSET: u64 = 10_000_000;
 
 pub static NEXT_INO: AtomicU64 = AtomicU64::new(5);
 pub static NEXT_FH: AtomicU64 = AtomicU64::new(1);
@@ -138,6 +139,25 @@ impl InodeManager {
 
     pub fn is_data_ino(ino: u64) -> bool {
         ino >= DATA_TORRENT_INO_BASE
+    }
+
+    /// Derive a stats inode from a directory inode.
+    pub fn make_stats_ino(dir_ino: u64) -> u64 {
+        dir_ino + STATS_INO_OFFSET
+    }
+
+    /// Check if an inode is a stats inode (derived from a directory inode).
+    pub fn is_stats_ino(ino: u64) -> bool {
+        ino >= STATS_INO_OFFSET && ino < STATS_INO_OFFSET + 10_000_000
+    }
+
+    /// Get the parent directory inode from a stats inode.
+    pub fn stats_ino_to_dir_ino(ino: u64) -> Option<u64> {
+        if Self::is_stats_ino(ino) {
+            Some(ino - STATS_INO_OFFSET)
+        } else {
+            None
+        }
     }
 
     // ── Path resolution ──
@@ -358,5 +378,56 @@ impl InodeManager {
             blksize: 512,
             flags: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── stats ino derivation round-trip ──
+
+    #[test]
+    fn test_make_stats_ino_derives_from_dir_ino() {
+        assert_eq!(InodeManager::make_stats_ino(DATA_INO), DATA_INO + STATS_INO_OFFSET);
+        assert_eq!(InodeManager::make_stats_ino(ROOT_INO), ROOT_INO + STATS_INO_OFFSET);
+        assert_eq!(InodeManager::make_stats_ino(METADATA_INO), METADATA_INO + STATS_INO_OFFSET);
+    }
+
+    #[test]
+    fn test_is_stats_ino_true_for_derived_inos() {
+        assert!(InodeManager::is_stats_ino(InodeManager::make_stats_ino(DATA_INO)));
+        assert!(InodeManager::is_stats_ino(InodeManager::make_stats_ino(ROOT_INO)));
+    }
+
+    #[test]
+    fn test_is_stats_ino_false_for_regular_inos() {
+        assert!(!InodeManager::is_stats_ino(DATA_INO));
+        assert!(!InodeManager::is_stats_ino(ROOT_INO));
+        assert!(!InodeManager::is_stats_ino(METADATA_INO));
+        assert!(!InodeManager::is_stats_ino(0));
+    }
+
+    #[test]
+    fn test_is_stats_ino_boundaries() {
+        // STATS_INO_OFFSET (10_000_000) is included, STATS_INO_OFFSET + 10_000_000 is excluded
+        assert!(InodeManager::is_stats_ino(STATS_INO_OFFSET));
+        assert!(InodeManager::is_stats_ino(STATS_INO_OFFSET + 10_000_000 - 1));
+        assert!(!InodeManager::is_stats_ino(STATS_INO_OFFSET + 10_000_000));
+        assert!(!InodeManager::is_stats_ino(STATS_INO_OFFSET - 1));
+    }
+
+    #[test]
+    fn test_stats_ino_to_dir_ino_round_trip() {
+        let dir_ino = DATA_INO;
+        let stats_ino = InodeManager::make_stats_ino(dir_ino);
+        assert_eq!(InodeManager::stats_ino_to_dir_ino(stats_ino), Some(dir_ino));
+    }
+
+    #[test]
+    fn test_stats_ino_to_dir_ino_none_for_regular_ino() {
+        assert_eq!(InodeManager::stats_ino_to_dir_ino(DATA_INO), None);
+        assert_eq!(InodeManager::stats_ino_to_dir_ino(ROOT_INO), None);
+        assert_eq!(InodeManager::stats_ino_to_dir_ino(0), None);
     }
 }

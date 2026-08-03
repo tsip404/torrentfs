@@ -241,6 +241,15 @@ impl DataResolver {
                     ));
                     offset_counter += 1;
                 }
+
+                // Inject .stats virtual file for data/ directory
+                let stats_ino = InodeManager::make_stats_ino(DATA_INO);
+                entries.push((
+                    stats_ino,
+                    offset_counter,
+                    fuser::FileType::RegularFile,
+                    ".stats".to_string(),
+                ));
             }
 
             for (cache_ino, cache_inode) in cache_entries {
@@ -318,6 +327,15 @@ impl DataResolver {
                         ));
                         offset_counter += 1;
                     }
+
+                    // Inject .stats virtual file for source_path directory
+                    let stats_ino = InodeManager::make_stats_ino(ino);
+                    entries.push((
+                        stats_ino,
+                        offset_counter,
+                        fuser::FileType::RegularFile,
+                        ".stats".to_string(),
+                    ));
                 }
 
                 for (cache_ino, cache_inode) in cache_entries {
@@ -401,6 +419,15 @@ impl DataResolver {
                         ));
                         offset_counter += 1;
                     }
+
+                    // Inject .stats virtual file for torrent root
+                    let stats_ino = InodeManager::make_stats_ino(ino);
+                    entries.push((
+                        stats_ino,
+                        offset_counter,
+                        fuser::FileType::RegularFile,
+                        ".stats".to_string(),
+                    ));
                 }
 
                 for (cache_ino, cache_inode) in cache_entries {
