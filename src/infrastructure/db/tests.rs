@@ -1,5 +1,6 @@
 use super::*;
 use tempfile::{NamedTempFile, TempDir};
+use rusqlite::Connection;
 
     #[test]
     fn test_open_in_memory() {
@@ -52,15 +53,22 @@ use tempfile::{NamedTempFile, TempDir};
     }
 
     #[test]
-    fn test_duplicate_info_hash_and_source_path() {
+    fn test_duplicate_source_path_and_filename() {
         let mut db = Database::open_in_memory().unwrap();
 
+        // Same source_path + same filename → Duplicate
         db.insert_torrent("path1", "Torrent 1", "Torrent 1", 1024, "hash1", 1)
             .unwrap();
         let result = db
-            .insert_torrent("path1", "Torrent 2", "Torrent 2", 2048, "hash1", 2)
+            .insert_torrent("path1", "Torrent 1 again", "Torrent 1", 2048, "hash1", 2)
             .unwrap();
         assert_eq!(result, InsertTorrentResult::Duplicate(1));
+
+        // Same source_path + different filename → Inserted (independent mirror)
+        let result = db
+            .insert_torrent("path1", "Torrent 2", "Torrent 2", 2048, "hash1", 2)
+            .unwrap();
+        assert!(matches!(result, InsertTorrentResult::Inserted(_)));
     }
 
     #[test]
@@ -709,7 +717,21 @@ use tempfile::{NamedTempFile, TempDir};
             .unwrap();
         assert!(matches!(result, InsertTorrentResult::Inserted(_)));
 
-        // Second insert with same info_hash and source_path should return Duplicate
+        // Same source_path + different filename → Inserted (independent mirror)
+        let result = db
+            .insert_torrent_with_files(
+                "path1",
+                "Test Torrent 2",
+                "Test Torrent 2.torrent",
+                200,
+                "hash1",
+                1,
+                &files,
+            )
+            .unwrap();
+        assert!(matches!(result, InsertTorrentResult::Inserted(_)));
+
+        // Same source_path + same filename → Duplicate
         let result = db
             .insert_torrent_with_files(
                 "path1",
@@ -921,4 +943,106 @@ use tempfile::{NamedTempFile, TempDir};
         assert_eq!(t1.source_path, "z/b");
         let t2 = db.get_torrent_by_id(2).unwrap().unwrap();
         assert_eq!(t2.source_path, "z/c");
-    }
+        }
+
+        #[test]
+        fn test_migrate_v5_preserves_child_data() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create a v4 database with pre-existing data (torrent + files + directories)
+        let torrent_id = {
+            let mut db = Database::open(&db_path).unwrap();
+
+            let files = vec![
+                FileEntry {
+                    path: "dir1/file1.txt".to_string(),
+                    size: 100,
+                },
+                FileEntry {
+                    path: "file2.txt".to_string(),
+                    size: 200,
+                },
+            ];
+
+            let result = db
+                .insert_torrent_with_files(
+                    "music",
+                    "Album",
+                    "Album.torrent",
+                    300,
+                    "abc123",
+                    2,
+                    &files,
+                )
+                .unwrap();
+            match result {
+                InsertTorrentResult::Inserted(id) => id,
+                _ => panic!("Expected Inserted"),
+            }
+        };
+
+        // Re-open: triggers all migrations including v5
+        {
+            let db = Database::open(&db_path).unwrap();
+
+            // Verify torrent survived migration
+            let torrent = db.get_torrent_by_id(torrent_id).unwrap().unwrap();
+            assert_eq!(torrent.name, "Album");
+            assert_eq!(torrent.source_path, "music");
+
+            // Verify child data preserved (was NOT cascade-deleted by DROP TABLE)
+            let files = db.get_files_by_torrent_id(torrent_id).unwrap();
+            assert_eq!(files.len(), 2, "torrent_files should survive v5 migration");
+
+            let dirs = db
+                .get_torrent_directories_by_parent(None, torrent_id)
+                .unwrap();
+            assert_eq!(dirs.len(), 1, "torrent_directories should survive v5 migration");
+        }
+        }
+
+        #[test]
+        fn test_migrate_v5_dedup_conflicting_rows() {
+            let temp_dir = TempDir::new().unwrap();
+            let db_path = temp_dir.path().join("test.db");
+
+            // Build a v4 database manually so the new UNIQUE(source_path, filename)
+            // is NOT yet active. Then insert two rows with same (source_path, filename)
+            // but different info_hash — legal under old UNIQUE(info_hash, source_path).
+            {
+                let conn = Connection::open(&db_path).unwrap();
+                conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+                Database::migrate_v1(&conn).unwrap();
+        // v1 already includes v2 columns (file_count, status, etc.)
+        Database::migrate_v3(&conn).unwrap();
+        Database::migrate_v4(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+
+                conn.execute(
+                    "INSERT INTO torrents (info_hash, name, total_size, file_count, status, source_path, filename)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params!["hash1", "Torrent Old", 100i64, 1i64, "pending", "a", "T.torrent"],
+                ).unwrap();
+
+                conn.execute(
+                    "INSERT INTO torrents (info_hash, name, total_size, file_count, status, source_path, filename)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params!["hash2", "Torrent New", 200i64, 1i64, "pending", "a", "T.torrent"],
+                ).unwrap();
+            }
+
+            // Re-open via Database::open — triggers v5 migration, must dedup and succeed
+            {
+                let db = Database::open(&db_path).unwrap();
+
+                let torrents = db.get_torrents_by_source_path("a").unwrap();
+                assert_eq!(
+                    torrents.len(),
+                    1,
+                    "dedup should keep one row per (source_path, filename)"
+                );
+                assert_eq!(torrents[0].info_hash, "hash2", "should keep the later row (MAX id)");
+                assert_eq!(torrents[0].name, "Torrent New");
+            }
+        }
