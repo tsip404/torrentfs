@@ -2,11 +2,8 @@ pub mod domain;
 pub mod error;
 pub mod fuse;
 pub mod infrastructure;
-pub mod network;
 pub mod seeding;
 pub mod services;
-pub mod storage;
-pub mod torrent;
 
 // Re-exports for backward compatibility — old paths still work
 // infrastructure layer
