@@ -446,7 +446,7 @@ pub fn generate_directory_stats(
     let torrents = if let Some(db) = db.as_ref() {
         if let Ok(db_guard) = db.lock() {
             db_guard
-                .get_torrents_by_source_path(source_path)
+                .get_torrents_by_source_path_prefix(source_path)
                 .unwrap_or_default()
         } else {
             vec![]
