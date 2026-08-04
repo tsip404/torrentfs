@@ -356,7 +356,11 @@ impl Database {
             "SELECT id, source_path, name, filename, total_size, info_hash, file_count, status, torrent_data, resume_data, created_at
              FROM torrents WHERE source_path = ?1 OR source_path LIKE ?2 ORDER BY id",
         )?;
-        let pattern = format!("{}/%", source_path);
+        let pattern = if source_path.is_empty() {
+            "%".to_string()
+        } else {
+            format!("{}/%", source_path)
+        };
 
         let torrents = stmt
             .query_map(params![source_path, pattern], |row| {

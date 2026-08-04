@@ -495,7 +495,9 @@ fn test_get_torrents_by_source_path_prefix() {
     assert_eq!(torrents[0].name, "Other");
 
     // Non-existent prefix returns empty
-    let torrents = db.get_torrents_by_source_path_prefix("nonexistent").unwrap();
+    let torrents = db
+        .get_torrents_by_source_path_prefix("nonexistent")
+        .unwrap();
     assert_eq!(torrents.len(), 0);
 }
 
