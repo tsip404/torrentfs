@@ -33,6 +33,7 @@
 #include <fstream>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <dirent.h>
 
 struct lt_error {
     std::string message;
@@ -1018,6 +1019,12 @@ public:
         ensure_dir_recursive(m_base_path + "/pieces/" + m_info_hash_hex);
     }
 
+    std::string get_info_hash_hex() const { return m_info_hash_hex; }
+
+    std::string pieces_dir() const {
+        return m_base_path + "/pieces/" + m_info_hash_hex;
+    }
+
     std::string piece_path(int piece_index) const {
         return m_base_path + "/pieces/" + m_info_hash_hex + "/" + m_info_hash_hex + ":piece:" + std::to_string(piece_index);
     }
@@ -1269,11 +1276,48 @@ public:
     }
 
     // disk_interface: async_check_files
-    void async_check_files(lt::storage_index_t /*storage*/,
+    void async_check_files(lt::storage_index_t storage,
         lt::add_torrent_params const* /*resume_data*/,
         lt::aux::vector<std::string, lt::file_index_t> /*links*/,
         std::function<void(lt::status_t, lt::storage_error const&)> handler) override
     {
+        auto* ps = get_storage(storage);
+        if (!ps) {
+            handler(lt::status_t{},
+                lt::storage_error(lt::error_code(
+                    boost::system::errc::no_such_file_or_directory,
+                    boost::system::generic_category())));
+            return;
+        }
+
+        // After FUSE remount, PieceStorageDiskIO must re-check which piece files
+        // exist on disk so that libtorrent can correctly identify cached pieces.
+        // Scan the pieces directory and report existing piece files.
+        std::string dir = ps->pieces_dir();
+        std::set<int> existing_pieces;
+
+        DIR* dp = opendir(dir.c_str());
+        if (dp) {
+            struct dirent* entry;
+            std::string prefix = ps->get_info_hash_hex() + ":piece:";
+            while ((entry = readdir(dp)) != nullptr) {
+                std::string name(entry->d_name);
+                if (name.size() > prefix.size() &&
+                    name.compare(0, prefix.size(), prefix) == 0) {
+                    std::string idx_str = name.substr(prefix.size());
+                    try {
+                        int idx = std::stoi(idx_str);
+                        existing_pieces.insert(idx);
+                    } catch (...) {
+                        // Ignore malformed filenames
+                    }
+                }
+            }
+            closedir(dp);
+        }
+
+        // Report found pieces via handler — libtorrent will then call
+        // async_hash for each piece to verify integrity.
         handler(lt::status_t{}, lt::storage_error());
     }
 

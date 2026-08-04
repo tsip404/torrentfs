@@ -325,11 +325,13 @@ impl DownloadManager {
                                 );
                                 break;
                             }
+                            // All needed pieces are cached locally — no need to wait for peers
                             tracing::debug!(
-                                "read_file_range: still 0 peers after {} polls ({:.1}s), but pieces are cached, continuing wait",
+                                "read_file_range: all needed pieces cached locally after {} polls ({:.1}s), proceeding without peers",
                                 poll_count,
                                 peer_wait_start.elapsed().as_secs_f64()
                             );
+                            break;
                         }
                     }
                     Err(_) => break,
