@@ -58,8 +58,9 @@ impl Session {
     }
 
     /// Re-apply saved settings JSON to the libtorrent session.
-    /// Called after C++ session rebuild (add_torrent_with_custom_storage) to
-    /// restore settings like allow_multiple_connections_per_ip that are lost.
+    /// No longer needed in normal flow: settings are now baked into session_params
+    /// on the C++ side during session rebuild. Kept for testing / manual recovery.
+    #[allow(dead_code)]
     fn reapply_settings(&self) {
         if self.settings_json.as_bytes() != b"{}" {
             unsafe {
@@ -122,6 +123,7 @@ impl Session {
                 self.inner,
                 info.inner,
                 piece_cache_dir_c.as_ptr(),
+                self.settings_json.as_ptr(),
                 &mut error,
             )
         };
@@ -129,9 +131,8 @@ impl Session {
         if handle.is_null() {
             Err(unsafe { error_from_c(&error) })
         } else {
-            // C++ side destroyed and recreated the session with only disk_io_constructor.
-            // Re-apply all user settings (allow_multiple_connections_per_ip, etc.).
-            self.reapply_settings();
+            // Session settings are now baked into session_params on the C++ side,
+            // so no need for post-hoc reapply_settings().
             let info_hash = hex::encode(info.info_hash()?);
             Ok(TorrentHandle {
                 inner: handle,
@@ -199,6 +200,7 @@ impl Session {
                 self.inner,
                 info.inner,
                 piece_cache_dir_c.as_ptr(),
+                self.settings_json.as_ptr(),
                 &mut error,
             )
         };
@@ -206,9 +208,8 @@ impl Session {
         if handle.is_null() {
             Err(unsafe { error_from_c(&error) })
         } else {
-            // C++ side destroyed and recreated the session with only disk_io_constructor.
-            // Re-apply all user settings (allow_multiple_connections_per_ip, etc.).
-            self.reapply_settings();
+            // Session settings are now baked into session_params on the C++ side,
+            // so no need for post-hoc reapply_settings().
             let info_hash = hex::encode(info.info_hash()?);
             Ok(TorrentHandle {
                 inner: handle,

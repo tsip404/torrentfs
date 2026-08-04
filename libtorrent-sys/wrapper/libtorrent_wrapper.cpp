@@ -877,15 +877,14 @@ static void apply_bool_setting(lt::settings_pack& pack, const std::string& key, 
     // Unknown keys are silently ignored
 }
 
-void lt_session_apply_settings(lt_session_t session, const char* settings_json) {
-    if (!session || !settings_json || !*settings_json) return;
-
-    auto wrapper = static_cast<lt_session_wrapper*>(session);
+// Build a settings_pack from a JSON string (shared by session creation and runtime apply)
+static lt::settings_pack build_settings_pack(const char* settings_json) {
     lt::settings_pack pack;
-    const char* p = settings_json;
+    if (!settings_json || !*settings_json) return pack;
 
+    const char* p = settings_json;
     skip_json_ws(p);
-    if (*p != '{') return;
+    if (*p != '{') return pack;
     p++;
 
     while (*p) {
@@ -920,6 +919,14 @@ void lt_session_apply_settings(lt_session_t session, const char* settings_json) 
         }
     }
 
+    return pack;
+}
+
+void lt_session_apply_settings(lt_session_t session, const char* settings_json) {
+    if (!session) return;
+
+    auto pack = build_settings_pack(settings_json);
+    auto wrapper = static_cast<lt_session_wrapper*>(session);
     std::lock_guard<std::mutex> lock(wrapper->mutex);
     wrapper->session->apply_settings(pack);
 }
@@ -1369,7 +1376,7 @@ private:
 
 lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(
     lt_session_t session, lt_torrent_info_t info,
-    const char* piece_cache_dir, lt_error_t* error)
+    const char* piece_cache_dir, const char* settings_json, lt_error_t* error)
 {
     if (!session || !info) {
         if (error) {
@@ -1385,8 +1392,9 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(
 
         std::string cache_dir(piece_cache_dir ? piece_cache_dir : "/tmp/torrentfs-cache");
 
-        // Build session_params with custom disk_io_constructor
+        // Build session_params with custom disk_io_constructor and original settings
         lt::session_params params;
+        params.settings = build_settings_pack(settings_json);
         params.disk_io_constructor = [cache_dir](lt::io_context& ios,
             lt::settings_interface const&, lt::counters&) -> std::unique_ptr<lt::disk_interface> {
             return std::make_unique<PieceStorageDiskIO>(ios, cache_dir);
@@ -1417,7 +1425,7 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(
 
 lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
     lt_session_t session, lt_torrent_info_t info,
-    const char* piece_cache_dir, lt_error_t* error)
+    const char* piece_cache_dir, const char* settings_json, lt_error_t* error)
 {
     if (!session || !info) {
         if (error) {
@@ -1433,8 +1441,9 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
 
         std::string cache_dir(piece_cache_dir ? piece_cache_dir : "/tmp/torrentfs-cache");
 
-        // Build session_params with custom disk_io_constructor
+        // Build session_params with custom disk_io_constructor and original settings
         lt::session_params params;
+        params.settings = build_settings_pack(settings_json);
         params.disk_io_constructor = [cache_dir](lt::io_context& ios,
             lt::settings_interface const&, lt::counters&) -> std::unique_ptr<lt::disk_interface> {
             return std::make_unique<PieceStorageDiskIO>(ios, cache_dir);
