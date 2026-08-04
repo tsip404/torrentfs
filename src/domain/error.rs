@@ -21,6 +21,9 @@ pub enum TorrentError {
     #[error("No peers available: {0}. Tracker returned 0 peers and 0 seeds. Check tracker health or try again later.")]
     NoPeers(String),
 
+    #[error("Piece not ready: {0}")]
+    PieceNotReady(String),
+
     #[error("Unknown error: code {code}, message: {message}")]
     Unknown { code: i32, message: String },
 }

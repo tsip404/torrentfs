@@ -668,4 +668,168 @@ mod tests {
 
         Ok(())
     }
+
+    // ── Cache consistency: partial write / metadata-disk mismatch ──────
+    //
+    // These tests cover the scenario where cache metadata (has_piece) and
+    // the on-disk piece file are out of sync — a key root-cause suspect
+    // for the premature-EOF bug (TSI-2018).  When metadata says a piece
+    // exists but the file is empty or truncated, the assembly loop in
+    // read_file_range reads empty/short data and silently skips the piece.
+
+    #[test]
+    fn test_has_piece_true_but_disk_file_empty() -> TorrentResult<()> {
+        // Regression: metadata registered via add_piece() but the disk
+        // file was never actually written (or was truncated to 0 bytes).
+        // has_piece() should still return true (metadata exists), but the
+        // disk file size does not match — caller must validate size.
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "hash_empty:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+
+        // Register metadata with non-zero size…
+        cache.add_piece(piece_key, 4096)?;
+        // …but write only 0 bytes to disk (simulates partial write /
+        // crash before fsync).
+        std::fs::write(&piece_path, &[])?;
+
+        // Metadata exists — has_piece is true.
+        assert!(cache.has_piece(piece_key));
+
+        // But the file on disk is empty, so reading it would yield
+        // empty data.  This is the inconsistency that causes the
+        // assembly loop to skip this piece.
+        let disk_data = std::fs::read(&piece_path)?;
+        assert!(
+            disk_data.is_empty(),
+            "disk file is empty despite metadata claiming 4096 bytes"
+        );
+        assert!(
+            cache.has_piece_on_disk(piece_key),
+            "has_piece_on_disk detects the file existence, not its size"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_has_piece_on_disk_partial_file() -> TorrentResult<()> {
+        // has_piece_on_disk returns true purely based on file existence;
+        // it does not validate the file content size.  A partially written
+        // file (e.g. libtorrent wrote 32 KiB of a 256 KiB piece before
+        // a crash) would pass the check but yield short data.
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "hash_partial:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+
+        // Write 32 KiB of a "256 KiB" piece — partial write scenario.
+        let partial_data = vec![0xABu8; 32768];
+        std::fs::write(&piece_path, &partial_data)?;
+
+        // has_piece_on_disk returns true — file exists.
+        assert!(cache.has_piece_on_disk(piece_key));
+        // has_piece returns false — metadata was never registered.
+        assert!(!cache.has_piece(piece_key));
+
+        // When add_piece is called later with the partial file size,
+        // metadata will match the partial file — but the true piece
+        // length might be much larger.
+        cache.add_piece(piece_key, partial_data.len() as u64)?;
+        assert!(cache.has_piece(piece_key));
+        assert_eq!(
+            std::fs::metadata(&piece_path)?.len(),
+            partial_data.len() as u64
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_metadata_size_mismatch_disk_size() -> TorrentResult<()> {
+        // Metadata registered with a large size but file on disk is
+        // smaller — simulates metadata persisted before the write
+        // completed.  The assembly loop trusts piece_data.len(), which
+        // comes from the disk file, so a shorter file means shorter
+        // read results.
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "hash_mismatch:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+
+        let real_data = vec![0xCDu8; 1024]; // 1 KiB
+        let claimed_size: u64 = 262144; // 256 KiB
+        std::fs::write(&piece_path, &real_data)?;
+        cache.add_piece(piece_key, claimed_size)?;
+
+        assert!(cache.has_piece(piece_key));
+        let disk_size = std::fs::metadata(&piece_path)?.len();
+        assert_ne!(
+            disk_size, claimed_size,
+            "disk file size ({}) != metadata claimed size ({})",
+            disk_size, claimed_size
+        );
+
+        // Reading from disk would yield only 1024 bytes, not 262144.
+        let disk_data = std::fs::read(&piece_path)?;
+        assert_eq!(disk_data.len(), 1024);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_piece_file_on_disk_detected_as_existing() -> TorrentResult<()> {
+        // An empty file on disk passes has_piece_on_disk, but the
+        // assembly loop would read 0 bytes and skip the piece entirely.
+        let temp_dir = TempDir::new().unwrap();
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "hash_empty_disk:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+        std::fs::write(&piece_path, &[])?;
+        // Don't register in metadata — simulate pure disk-only scenario.
+        assert!(
+            cache.has_piece_on_disk(piece_key),
+            "empty file on disk is still detected as existing"
+        );
+        assert!(!cache.has_piece(piece_key), "no metadata registered");
+
+        // If read_file_range hits the else-if branch for has_piece_on_disk,
+        // it will read from disk and get empty data → piece skipped.
+        let disk_data = std::fs::read(&piece_path)?;
+        assert!(disk_data.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_orphaned_disk_file_no_metadata() -> TorrentResult<()> {
+        // A piece file exists on disk (possibly left by a previous
+        // session) but cache_metadata.txt has no entry for it.
+        // After rebuild_index, the file should be discovered and added
+        // to metadata automatically.
+        let temp_dir = TempDir::new().unwrap();
+
+        let info_hash = "orphaned_hash";
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        // Create the file manually without going through CacheManager
+        let pieces_dir = temp_dir.path().join("pieces").join(info_hash);
+        std::fs::create_dir_all(&pieces_dir)?;
+        let piece_path = pieces_dir.join(&piece_key);
+        std::fs::write(&piece_path, vec![0xEFu8; 500])?;
+
+        // Now create CacheManager — rebuild_index should discover it
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+        assert!(
+            cache.has_piece(&piece_key),
+            "orphaned disk file should be discovered during rebuild_index"
+        );
+
+        Ok(())
+    }
 }
