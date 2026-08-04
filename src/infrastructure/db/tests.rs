@@ -463,6 +463,43 @@ fn test_get_torrents_by_source_path() {
 }
 
 #[test]
+fn test_get_torrents_by_source_path_prefix() {
+    let mut db = Database::open_in_memory().unwrap();
+
+    // Insert torrents at various source_path hierarchy levels
+    db.insert_torrent("os", "Ubuntu", "ubuntu.iso.torrent", 1024, "hash1", 1)
+        .unwrap();
+    db.insert_torrent("os/linux", "Debian", "debian.iso.torrent", 2048, "hash2", 1)
+        .unwrap();
+    db.insert_torrent("os/bsd", "FreeBSD", "freebsd.iso.torrent", 3072, "hash3", 1)
+        .unwrap();
+    db.insert_torrent("other", "Other", "other.torrent", 4096, "hash4", 1)
+        .unwrap();
+
+    // Prefix "os" should return torrents at "os", "os/linux", "os/bsd" (3 total)
+    let torrents = db.get_torrents_by_source_path_prefix("os").unwrap();
+    assert_eq!(torrents.len(), 3);
+    let names: Vec<&str> = torrents.iter().map(|t| t.name.as_str()).collect();
+    assert!(names.contains(&"Ubuntu"));
+    assert!(names.contains(&"Debian"));
+    assert!(names.contains(&"FreeBSD"));
+
+    // Prefix "os/linux" should return only the exact match and any deeper children
+    let torrents = db.get_torrents_by_source_path_prefix("os/linux").unwrap();
+    assert_eq!(torrents.len(), 1);
+    assert_eq!(torrents[0].name, "Debian");
+
+    // Prefix "other" should return only "other" (no deeper children)
+    let torrents = db.get_torrents_by_source_path_prefix("other").unwrap();
+    assert_eq!(torrents.len(), 1);
+    assert_eq!(torrents[0].name, "Other");
+
+    // Non-existent prefix returns empty
+    let torrents = db.get_torrents_by_source_path_prefix("nonexistent").unwrap();
+    assert_eq!(torrents.len(), 0);
+}
+
+#[test]
 fn test_get_source_path_prefixes() {
     let mut db = Database::open_in_memory().unwrap();
 

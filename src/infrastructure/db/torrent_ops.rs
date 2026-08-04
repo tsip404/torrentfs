@@ -345,6 +345,40 @@ impl Database {
         Ok(torrents)
     }
 
+    /// Get all torrents whose source_path matches exactly or is a child of the given prefix.
+    /// For example, with prefix "os", this returns torrents with source_path "os",
+    /// "os/linux", "os/bsd", etc.
+    pub fn get_torrents_by_source_path_prefix(
+        &self,
+        source_path: &str,
+    ) -> Result<Vec<Torrent>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_path, name, filename, total_size, info_hash, file_count, status, torrent_data, resume_data, created_at
+             FROM torrents WHERE source_path = ?1 OR source_path LIKE ?2 ORDER BY id",
+        )?;
+        let pattern = format!("{}/%", source_path);
+
+        let torrents = stmt
+            .query_map(params![source_path, pattern], |row| {
+                Ok(Torrent {
+                    id: row.get(0)?,
+                    source_path: row.get(1)?,
+                    name: row.get(2)?,
+                    filename: row.get(3)?,
+                    total_size: row.get(4)?,
+                    info_hash: row.get(5)?,
+                    file_count: row.get(6)?,
+                    status: row.get::<_, String>(7)?.into(),
+                    torrent_data: row.get(8)?,
+                    resume_data: row.get(9)?,
+                    created_at: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(torrents)
+    }
+
     /// Get counts of torrents grouped by status.
     /// Returns (pending, downloading, seeding, error, total).
     pub fn get_torrent_counts_by_status(&self) -> Result<(i64, i64, i64, i64, i64), DbError> {
