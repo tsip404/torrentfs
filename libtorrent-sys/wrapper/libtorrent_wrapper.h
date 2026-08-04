@@ -64,9 +64,9 @@ int lt_torrent_info_get_info_hash(lt_torrent_info_t info, uint8_t* hash_out);
 lt_session_t lt_session_create(const char* listen_interface, lt_error_t* error);
 void lt_session_destroy(lt_session_t session);
 lt_torrent_handle_t lt_session_add_torrent(lt_session_t session, lt_torrent_info_t info, const char* save_path, lt_error_t* error);
-lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(lt_session_t session, lt_torrent_info_t info, const char* piece_cache_dir, lt_error_t* error);
+lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(lt_session_t session, lt_torrent_info_t info, const char* piece_cache_dir, const char* settings_json, lt_error_t* error);
 lt_torrent_handle_t lt_session_add_torrent_upload_mode(lt_session_t session, lt_torrent_info_t info, const char* save_path, lt_error_t* error);
-lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(lt_session_t session, lt_torrent_info_t info, const char* piece_cache_dir, lt_error_t* error);
+lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(lt_session_t session, lt_torrent_info_t info, const char* piece_cache_dir, const char* settings_json, lt_error_t* error);
 void lt_session_remove_torrent(lt_session_t session, lt_torrent_handle_t handle, int remove_files);
 void lt_torrent_handle_destroy(lt_torrent_handle_t handle);
 
