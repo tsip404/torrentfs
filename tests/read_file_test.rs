@@ -11,14 +11,6 @@ use common::{local_test_config, TestHarness};
 use std::thread;
 use std::time::Duration;
 
-fn skip_if_ci() -> bool {
-    if std::env::var("CI").is_ok() {
-        eprintln!("Skipping integration test in CI (libtorrent 2.0.x compatibility)");
-        return true;
-    }
-    false
-}
-
 /// Test that DownloadManager::read_file_range can download and return
 /// correct file data when a local seeder is available via tracker.
 ///
@@ -26,9 +18,6 @@ fn skip_if_ci() -> bool {
 /// validating that the lazy-loading flow works end-to-end.
 #[test]
 fn test_read_file_range_with_local_seeder() {
-    if skip_if_ci() {
-        return;
-    }
     // ── Setup: start tracker + seeder ──────────────────────────────────
     let harness = TestHarness::new();
 
@@ -102,9 +91,6 @@ fn test_read_file_range_with_local_seeder() {
 /// combinations, validating boundary handling.
 #[test]
 fn test_read_file_range_boundaries() {
-    if skip_if_ci() {
-        return;
-    }
     let harness = TestHarness::new();
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
@@ -146,24 +132,21 @@ fn test_read_file_range_boundaries() {
     assert_eq!(data.len(), 10);
     assert_eq!(&data, &harness.file_content[50..60]);
 
-    // Read bytes from offset 10 to end (size 152 = total 162 - offset 10)
-    let data = retry_read(10, 152);
-    assert_eq!(data.len(), 152);
-    assert_eq!(&data, &harness.file_content[10..162]);
+    // Read bytes from offset 10 to end (size 16374 = total 16384 - offset 10)
+    let data = retry_read(10, 16374);
+    assert_eq!(data.len(), 16374);
+    assert_eq!(&data, &harness.file_content[10..16384]);
 
     // Read past end should return empty or truncated
-    let data = retry_read(160, 10);
-    assert_eq!(data.len(), 2); // Only 2 bytes left
-    assert_eq!(&data, &harness.file_content[160..162]);
+    let data = retry_read(16378, 10);
+    assert_eq!(data.len(), 6); // 16384 - 16378 = 6 bytes left
+    assert_eq!(&data, &harness.file_content[16378..16384]);
 }
 
 /// Test that read_file_range correctly returns NoPeers error when no
 /// peers/seeds are available AND no cached pieces exist.
 #[test]
 fn test_read_file_range_no_peers_error() {
-    if skip_if_ci() {
-        return;
-    }
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
 
     // Use config with DHT disabled so we don't accidentally find peers

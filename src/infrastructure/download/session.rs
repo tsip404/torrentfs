@@ -9,8 +9,8 @@ use super::types::{FilePieceInfo, SessionStats, TorrentState, TorrentStatus};
 
 pub struct Session {
     pub(crate) inner: libtorrent_sys::lt_session_t,
-    /// Saved settings JSON for re-application after C++ session rebuild
-    /// (e.g. when add_torrent_with_custom_storage replaces the session).
+    /// Settings JSON for applying to the session (via apply_settings or baked
+    /// into session_params during session creation).
     settings_json: CString,
 }
 
@@ -28,14 +28,14 @@ impl Session {
             code: 0,
         };
 
-        // Create session with default settings (alert_mask only, no listen_interface)
+        // Create session with default settings (no listen_interface, no custom storage)
         let inner = unsafe { libtorrent_sys::lt_session_create(ptr::null(), &mut error) };
 
         if inner.is_null() {
             return Err(unsafe { error_from_c(&error) });
         }
 
-        // Preserve settings JSON for re-application after C++ session rebuild.
+        // Save settings JSON for later application
         let settings_json = config.to_settings_json();
         let settings_json_c = CString::new(&settings_json[..]).unwrap_or_default();
 
@@ -47,18 +47,57 @@ impl Session {
         // Apply user configuration via JSON
         if settings_json != "{}" {
             unsafe {
-                libtorrent_sys::lt_session_apply_settings(session.inner, session.settings_json.as_ptr());
+                libtorrent_sys::lt_session_apply_settings(
+                    session.inner,
+                    session.settings_json.as_ptr(),
+                );
             }
         }
 
         Ok(session)
     }
 
+    /// Create a session with custom piece storage (PieceStorageDiskIO) from the start.
+    /// Settings are baked into the session_params on the C++ side, so no post-hoc
+    /// apply_settings is needed.
+    pub fn new_with_custom_storage(
+        config: &TorrentfsConfig,
+        piece_cache_dir: &Path,
+    ) -> TorrentResult<Self> {
+        let settings_json = config.to_settings_json();
+        let settings_json_c = CString::new(&settings_json[..]).unwrap_or_default();
+
+        let piece_cache_dir_c = CString::new(piece_cache_dir.to_string_lossy().into_owned())
+            .map_err(|_| TorrentError::InvalidFile("Cache dir contains null byte".to_string()))?;
+
+        let mut error = libtorrent_sys::lt_error_t {
+            message: ptr::null(),
+            code: 0,
+        };
+
+        let inner = unsafe {
+            libtorrent_sys::lt_session_create_with_custom_storage(
+                piece_cache_dir_c.as_ptr(),
+                if settings_json != "{}" {
+                    settings_json_c.as_ptr()
+                } else {
+                    ptr::null()
+                },
+                &mut error,
+            )
+        };
+
+        if inner.is_null() {
+            return Err(unsafe { error_from_c(&error) });
+        }
+
+        Ok(Session {
+            inner,
+            settings_json: settings_json_c,
+        })
+    }
+
     /// Read a boolean setting from the live libtorrent session.
-    /// Key names match libtorrent settings_pack (e.g. "allow_multiple_connections_per_ip",
-    /// "enable_dht", "enable_lsd").
-    /// Returns `Ok(true)` / `Ok(false)` on success, or an error if the key is unknown
-    /// or the session does not have that setting.
     pub fn get_bool_setting(&self, key: &str) -> TorrentResult<bool> {
         let key_c = CString::new(key).map_err(|_| TorrentError::Unknown {
             code: -1,
@@ -75,6 +114,18 @@ impl Session {
                 code: result,
                 message: format!("Setting '{}' not found or session unavailable", key),
             })
+        }
+    }
+
+    /// Re-apply saved settings JSON to the libtorrent session.
+    /// No longer needed in normal flow: settings are now baked into session_params
+    /// on the C++ side during session rebuild. Kept for testing / manual recovery.
+    #[allow(dead_code)]
+    fn reapply_settings(&self) {
+        if self.settings_json.as_bytes() != b"{}" {
+            unsafe {
+                libtorrent_sys::lt_session_apply_settings(self.inner, self.settings_json.as_ptr());
+            }
         }
     }
 
@@ -112,43 +163,6 @@ impl Session {
         }
     }
 
-    pub fn add_torrent_with_custom_storage(
-        &mut self,
-        info: &crate::TorrentInfo,
-        piece_cache_dir: &Path,
-    ) -> TorrentResult<TorrentHandle> {
-        let piece_cache_dir_c = CString::new(piece_cache_dir.to_string_lossy().into_owned())
-            .map_err(|_| {
-                TorrentError::InvalidFile("Piece cache dir contains null byte".to_string())
-            })?;
-
-        let mut error = libtorrent_sys::lt_error_t {
-            message: ptr::null(),
-            code: 0,
-        };
-
-        let handle = unsafe {
-            libtorrent_sys::lt_session_add_torrent_with_custom_storage(
-                self.inner,
-                info.inner,
-                piece_cache_dir_c.as_ptr(),
-                self.settings_json.as_ptr(),
-                &mut error,
-            )
-        };
-
-        if handle.is_null() {
-            Err(unsafe { error_from_c(&error) })
-        } else {
-            let info_hash = hex::encode(info.info_hash()?);
-            Ok(TorrentHandle {
-                inner: handle,
-                info_hash,
-                session: self.inner,
-            })
-        }
-    }
-
     /// Add a torrent in upload_mode: connects to trackers and peers
     /// but never requests pieces. Use for lightweight status-only handles.
     pub fn add_torrent_upload_mode(
@@ -169,45 +183,6 @@ impl Session {
                 self.inner,
                 info.inner,
                 save_path_c.as_ptr(),
-                &mut error,
-            )
-        };
-
-        if handle.is_null() {
-            Err(unsafe { error_from_c(&error) })
-        } else {
-            let info_hash = hex::encode(info.info_hash()?);
-            Ok(TorrentHandle {
-                inner: handle,
-                info_hash,
-                session: self.inner,
-            })
-        }
-    }
-
-    /// Add a torrent with custom storage in upload_mode: replaces the session
-    /// with custom PieceStorageDiskIO and adds the torrent without downloading.
-    pub fn add_torrent_with_custom_storage_upload_mode(
-        &mut self,
-        info: &crate::TorrentInfo,
-        piece_cache_dir: &Path,
-    ) -> TorrentResult<TorrentHandle> {
-        let piece_cache_dir_c = CString::new(piece_cache_dir.to_string_lossy().into_owned())
-            .map_err(|_| {
-                TorrentError::InvalidFile("Piece cache dir contains null byte".to_string())
-            })?;
-
-        let mut error = libtorrent_sys::lt_error_t {
-            message: ptr::null(),
-            code: 0,
-        };
-
-        let handle = unsafe {
-            libtorrent_sys::lt_session_add_torrent_with_custom_storage_upload_mode(
-                self.inner,
-                info.inner,
-                piece_cache_dir_c.as_ptr(),
-                self.settings_json.as_ptr(),
                 &mut error,
             )
         };
@@ -361,12 +336,7 @@ impl TorrentHandle {
         if result != 0 {
             Err(unsafe { error_from_c(&error) })
         } else if data_out.is_null() || size_out == 0 {
-            Err(TorrentError::PieceNotReady(format!(
-                "Piece {} not yet available (data_out.is_null={}, size_out={})",
-                piece_index,
-                data_out.is_null(),
-                size_out
-            )))
+            Ok(Vec::new())
         } else {
             let slice = unsafe { std::slice::from_raw_parts(data_out, size_out) };
             let data = slice.to_vec();

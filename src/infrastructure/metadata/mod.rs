@@ -9,6 +9,13 @@ use crate::error::{error_from_c, TorrentError, TorrentResult};
 
 pub struct TorrentInfo {
     pub(crate) inner: libtorrent_sys::lt_torrent_info_t,
+    /// Owned buffer backing the C++ torrent_info. The C++ side (bdecode /
+    /// torrent_info(bdecode_node)) only references the buffer without copying
+    /// it; dropping this Vec would leave the C++ object with a dangling pointer,
+    /// causing stack smashing on libtorrent 2.0.x. This field MUST be dropped
+    /// AFTER `inner`.
+    #[allow(dead_code)]
+    _data: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,7 +62,10 @@ impl TorrentInfo {
             // aliasing issues since it's passed by shared reference.
             Err(unsafe { error_from_c(&error) })
         } else {
-            Ok(TorrentInfo { inner })
+            Ok(TorrentInfo {
+                inner,
+                _data: Vec::new(),
+            })
         }
     }
 
@@ -80,7 +90,9 @@ impl TorrentInfo {
             // SAFETY: `error` is a live, initialized stack variable.
             Err(unsafe { error_from_c(&error) })
         } else {
-            Ok(TorrentInfo { inner })
+            // Keep `data` alive: the C++ bdecode / torrent_info only
+            // references the buffer, so the Vec must outlive `inner`.
+            Ok(TorrentInfo { inner, _data: data })
         }
     }
 

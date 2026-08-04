@@ -2,17 +2,19 @@ use std::thread;
 use std::time::Duration;
 use torrentfs::TorrentInfo;
 
+mod common;
+
 fn create_test_torrent() -> (Vec<u8>, Vec<u8>) {
     let mut test_content = b"Hello, this is a test file for torrentfs verification.\n".to_vec();
-    while test_content.len() < 162 {
+    while test_content.len() < 16384 {
         test_content.push(b'X');
     }
-    test_content.truncate(162);
+    test_content.truncate(16384);
 
     let mut torrent = Vec::new();
     torrent.extend_from_slice(b"d8:announce30:http://localhost:6969/announce4:infod");
     torrent.extend_from_slice(
-        b"6:lengthi162e4:name22:final_verification.txt12:piece lengthi16384e6:pieces20:",
+        b"6:lengthi16384e4:name22:final_verification.txt12:piece lengthi16384e6:pieces20:",
     );
     torrent.extend_from_slice(&hashlib_sha1(&test_content));
     torrent.extend_from_slice(b"ee");
@@ -39,7 +41,7 @@ fn test_torrent_info_from_bytes() {
             println!("Num pieces: {}", info.num_pieces());
             println!("Num files: {}", info.num_files());
             assert_eq!(info.name(), "final_verification.txt");
-            assert_eq!(info.total_size(), 162);
+            assert_eq!(info.total_size(), 16384);
             assert_eq!(info.num_files(), 1);
         }
         Err(e) => {
@@ -50,12 +52,6 @@ fn test_torrent_info_from_bytes() {
 
 #[test]
 fn test_read_file_range_with_local_seed() {
-    // This test requires a working libtorrent session with custom storage,
-    // which is unstable on libtorrent 2.0.x in CI environments.
-    if std::env::var("CI").is_ok() {
-        eprintln!("Skipping test_read_file_range_with_local_seed in CI");
-        return;
-    }
     use std::fs;
     use torrentfs::download::DownloadManager;
 
@@ -100,9 +96,13 @@ fn test_read_file_range_with_local_seed() {
             assert_eq!(data.as_slice(), &file_content[0..50], "Data mismatch");
         }
         Err(e) => {
-            println!("Error reading file range: {:?}", e);
-            println!("\nNote: This test requires a functioning BitTorrent session.");
-            println!("The error is expected if no peers are available.");
+            // No external peers available — expected in CI/test environments.
+            // Only NoPeers is expected — piece timeout (InvalidFile) is a real defect.
+            assert!(
+                matches!(e, torrentfs::TorrentError::NoPeers(_)),
+                "Unexpected error: {:?}",
+                e
+            );
         }
     }
 }
@@ -112,16 +112,6 @@ fn test_read_file_range_with_local_seed() {
 /// peer-discovery-and-download flow required by acceptance scenario 4.
 #[test]
 fn test_read_file_range_with_test_harness() {
-    // This test requires a running local tracker + seeder,
-    // which is not available in CI environments.
-    if std::env::var("CI").is_ok() {
-        eprintln!("Skipping test_read_file_range_with_test_harness in CI");
-        return;
-    }
-    // Use the test infrastructure module
-    #[path = "common/mod.rs"]
-    mod common;
-
     let harness = common::TestHarness::new();
 
     println!(
@@ -146,17 +136,12 @@ fn test_read_file_range_with_test_harness() {
 
     println!("Downloader: attempting read_file_range...");
 
-    // read_file_range triggers the full flow: get_or_create_handle →
-    // wait for state → peer discovery → download → serve data.
-    // Retry with timeout (TSI-1977): peer discovery on localhost can be
-    // flaky due to port sharing and tracker timing; retry gives the
-    // seeder + tracker time to stabilise.
     let dl_timeout = Duration::from_secs(60);
     let read_start = std::time::Instant::now();
     let mut last_error: Option<torrentfs::TorrentError> = None;
 
     let result = loop {
-        match dm.read_file_range(&dl_info, 0, 0, 162) {
+        match dm.read_file_range(&dl_info, 0, 0, 16384) {
             Ok(data) => break Ok(data),
             Err(e) => {
                 last_error = Some(e);
