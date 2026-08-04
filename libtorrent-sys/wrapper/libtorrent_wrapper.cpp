@@ -1395,8 +1395,9 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(
         // Replace the existing session with our custom-disk-io session
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         wrapper->session->abort();
+        auto new_session = std::make_unique<lt::session>(std::move(params));
         delete wrapper->session;
-        wrapper->session = new lt::session(std::move(params));
+        wrapper->session = new_session.release();
         // Add the torrent
         lt::add_torrent_params atp;
         atp.ti = std::make_shared<lt::torrent_info>(*ti);
@@ -1443,8 +1444,9 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
         // Replace the existing session with our custom-disk-io session
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         wrapper->session->abort();
+        auto new_session = std::make_unique<lt::session>(std::move(params));
         delete wrapper->session;
-        wrapper->session = new lt::session(std::move(params));
+        wrapper->session = new_session.release();
         // Add the torrent with upload_mode: connect to trackers/peers but never request pieces
         lt::add_torrent_params atp;
         atp.ti = std::make_shared<lt::torrent_info>(*ti);
