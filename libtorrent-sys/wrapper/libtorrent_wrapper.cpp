@@ -878,14 +878,15 @@ static void apply_bool_setting(lt::settings_pack& pack, const std::string& key, 
     // Unknown keys are silently ignored
 }
 
-// Build a settings_pack from a JSON string (shared by session creation and runtime apply)
-static lt::settings_pack build_settings_pack(const char* settings_json) {
-    lt::settings_pack pack;
-    if (!settings_json || !*settings_json) return pack;
+// Build a settings_pack from a JSON string into the provided pack reference.
+// Caller is responsible for the pack's lifetime. Heap-allocate to avoid
+// stack overflow on libtorrent 2.0.x.
+static void build_settings_pack(lt::settings_pack& pack, const char* settings_json) {
+    if (!settings_json || !*settings_json) return;
 
     const char* p = settings_json;
     skip_json_ws(p);
-    if (*p != '{') return pack;
+    if (*p != '{') return;
     p++;
 
     while (*p) {
@@ -919,17 +920,79 @@ static lt::settings_pack build_settings_pack(const char* settings_json) {
             while (*p && *p != ',' && *p != '}') p++;
         }
     }
-
-    return pack;
 }
 
 void lt_session_apply_settings(lt_session_t session, const char* settings_json) {
     if (!session) return;
 
-    auto pack = build_settings_pack(settings_json);
+    auto pack = std::make_unique<lt::settings_pack>();
+    build_settings_pack(*pack, settings_json);
     auto wrapper = static_cast<lt_session_wrapper*>(session);
     std::lock_guard<std::mutex> lock(wrapper->mutex);
-    wrapper->session->apply_settings(pack);
+    wrapper->session->apply_settings(*pack);
+}
+
+static bool get_session_bool_setting_impl(lt::settings_pack const& settings, const std::string& key, int* out) {
+    if (key == "allow_multiple_connections_per_ip") {
+        if (settings.has_val(lt::settings_pack::allow_multiple_connections_per_ip)) {
+            *out = settings.get_bool(lt::settings_pack::allow_multiple_connections_per_ip) ? 1 : 0;
+            return true;
+        }
+    } else if (key == "enable_dht") {
+        if (settings.has_val(lt::settings_pack::enable_dht)) {
+            *out = settings.get_bool(lt::settings_pack::enable_dht) ? 1 : 0;
+            return true;
+        }
+    } else if (key == "enable_lsd") {
+        if (settings.has_val(lt::settings_pack::enable_lsd)) {
+            *out = settings.get_bool(lt::settings_pack::enable_lsd) ? 1 : 0;
+            return true;
+        }
+    } else if (key == "enable_upnp") {
+        if (settings.has_val(lt::settings_pack::enable_upnp)) {
+            *out = settings.get_bool(lt::settings_pack::enable_upnp) ? 1 : 0;
+            return true;
+        }
+    } else if (key == "enable_natpmp") {
+        if (settings.has_val(lt::settings_pack::enable_natpmp)) {
+            *out = settings.get_bool(lt::settings_pack::enable_natpmp) ? 1 : 0;
+            return true;
+        }
+    } else if (key == "smooth_connects") {
+        if (settings.has_val(lt::settings_pack::smooth_connects)) {
+            *out = settings.get_bool(lt::settings_pack::smooth_connects) ? 1 : 0;
+            return true;
+        }
+    } else if (key == "prioritize_partial_pieces") {
+        if (settings.has_val(lt::settings_pack::prioritize_partial_pieces)) {
+            *out = settings.get_bool(lt::settings_pack::prioritize_partial_pieces) ? 1 : 0;
+            return true;
+        }
+    } else if (key == "announce_to_all_trackers") {
+        if (settings.has_val(lt::settings_pack::announce_to_all_trackers)) {
+            *out = settings.get_bool(lt::settings_pack::announce_to_all_trackers) ? 1 : 0;
+            return true;
+        }
+    } else if (key == "anonymous_mode") {
+        if (settings.has_val(lt::settings_pack::anonymous_mode)) {
+            *out = settings.get_bool(lt::settings_pack::anonymous_mode) ? 1 : 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out) {
+    if (!session || !key || !out) return -1;
+    auto wrapper = static_cast<lt_session_wrapper*>(session);
+    std::lock_guard<std::mutex> lock(wrapper->mutex);
+    try {
+        auto settings = wrapper->session->get_settings();
+        if (get_session_bool_setting_impl(settings, std::string(key), out)) {
+            return 0;
+        }
+    } catch (const std::exception&) {}
+    return -1;
 }
 
 // Include session_stats_alert header
@@ -1436,26 +1499,31 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(
 
         std::string cache_dir(piece_cache_dir ? piece_cache_dir : "/tmp/torrentfs-cache");
 
-        // Build session_params with custom disk_io_constructor and original settings
-        lt::session_params params;
-        params.settings = build_settings_pack(settings_json);
-        params.disk_io_constructor = [cache_dir](lt::io_context& ios,
+        // Build session_params with custom disk_io_constructor and original settings.
+        // Heap-allocate to avoid stack overflow on libtorrent 2.0.x.
+        auto* params = new lt::session_params();
+        build_settings_pack(params->settings, settings_json);
+        params->disk_io_constructor = [cache_dir](lt::io_context& ios,
             lt::settings_interface const&, lt::counters&) -> std::unique_ptr<lt::disk_interface> {
             return std::make_unique<PieceStorageDiskIO>(ios, cache_dir);
         };
 
-        // Replace the existing session with our custom-disk-io session
+        // Create new session, intentionally do not delete params (moved-from
+        // session_params destruction causes heap corruption on 2.0.10).
+        auto new_session = std::make_unique<lt::session>(std::move(*params));
+
+        // Replace the existing session with our custom-disk-io session.
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         wrapper->session->abort();
-        auto new_session = std::make_unique<lt::session>(std::move(params));
         delete wrapper->session;
         wrapper->session = new_session.release();
-        // Add the torrent
-        lt::add_torrent_params atp;
-        atp.ti = std::make_shared<lt::torrent_info>(*ti);
-        atp.save_path = cache_dir;
 
-        auto handle = wrapper->session->add_torrent(atp);
+        // Add the torrent (heap-allocate to avoid stack overflow on 2.0.x).
+        auto atp = std::make_unique<lt::add_torrent_params>();
+        atp->ti = std::make_shared<lt::torrent_info>(*ti);
+        atp->save_path = cache_dir;
+
+        auto handle = wrapper->session->add_torrent(*atp);
         return static_cast<lt_torrent_handle_t>(new lt::torrent_handle(handle));
     } catch (const std::exception& e) {
         if (error) {
@@ -1486,27 +1554,29 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
 
         std::string cache_dir(piece_cache_dir ? piece_cache_dir : "/tmp/torrentfs-cache");
 
-        // Build session_params with custom disk_io_constructor and original settings
-        lt::session_params params;
-        params.settings = build_settings_pack(settings_json);
-        params.disk_io_constructor = [cache_dir](lt::io_context& ios,
+        // Build session_params with custom disk_io_constructor and original settings.
+        // Heap-allocate + leak (see non-upload-mode variant above).
+        auto* params = new lt::session_params();
+        build_settings_pack(params->settings, settings_json);
+        params->disk_io_constructor = [cache_dir](lt::io_context& ios,
             lt::settings_interface const&, lt::counters&) -> std::unique_ptr<lt::disk_interface> {
             return std::make_unique<PieceStorageDiskIO>(ios, cache_dir);
         };
 
-        // Replace the existing session with our custom-disk-io session
+        auto new_session = std::make_unique<lt::session>(std::move(*params));
+
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         wrapper->session->abort();
-        auto new_session = std::make_unique<lt::session>(std::move(params));
         delete wrapper->session;
         wrapper->session = new_session.release();
-        // Add the torrent with upload_mode: connect to trackers/peers but never request pieces
-        lt::add_torrent_params atp;
-        atp.ti = std::make_shared<lt::torrent_info>(*ti);
-        atp.save_path = cache_dir;
-        atp.flags |= lt::torrent_flags::upload_mode;
 
-        auto handle = wrapper->session->add_torrent(atp);
+        // Add the torrent with upload_mode (heap-allocate for 2.0.x).
+        auto atp = std::make_unique<lt::add_torrent_params>();
+        atp->ti = std::make_shared<lt::torrent_info>(*ti);
+        atp->save_path = cache_dir;
+        atp->flags |= lt::torrent_flags::upload_mode;
+
+        auto handle = wrapper->session->add_torrent(*atp);
         return static_cast<lt_torrent_handle_t>(new lt::torrent_handle(handle));
     } catch (const std::exception& e) {
         if (error) {

@@ -35,7 +35,7 @@ impl Session {
             return Err(unsafe { error_from_c(&error) });
         }
 
-        // Preserve settings JSON for re-application after C++ session rebuild
+        // Preserve settings JSON for re-application after C++ session rebuild.
         let settings_json = config.to_settings_json();
         let settings_json_c = CString::new(&settings_json[..]).unwrap_or_default();
 
@@ -47,25 +47,34 @@ impl Session {
         // Apply user configuration via JSON
         if settings_json != "{}" {
             unsafe {
-                libtorrent_sys::lt_session_apply_settings(
-                    session.inner,
-                    session.settings_json.as_ptr(),
-                );
+                libtorrent_sys::lt_session_apply_settings(session.inner, session.settings_json.as_ptr());
             }
         }
 
         Ok(session)
     }
 
-    /// Re-apply saved settings JSON to the libtorrent session.
-    /// No longer needed in normal flow: settings are now baked into session_params
-    /// on the C++ side during session rebuild. Kept for testing / manual recovery.
-    #[allow(dead_code)]
-    fn reapply_settings(&self) {
-        if self.settings_json.as_bytes() != b"{}" {
-            unsafe {
-                libtorrent_sys::lt_session_apply_settings(self.inner, self.settings_json.as_ptr());
-            }
+    /// Read a boolean setting from the live libtorrent session.
+    /// Key names match libtorrent settings_pack (e.g. "allow_multiple_connections_per_ip",
+    /// "enable_dht", "enable_lsd").
+    /// Returns `Ok(true)` / `Ok(false)` on success, or an error if the key is unknown
+    /// or the session does not have that setting.
+    pub fn get_bool_setting(&self, key: &str) -> TorrentResult<bool> {
+        let key_c = CString::new(key).map_err(|_| TorrentError::Unknown {
+            code: -1,
+            message: "Setting key contains null byte".to_string(),
+        })?;
+        let mut out: i32 = 0;
+        let result = unsafe {
+            libtorrent_sys::lt_session_get_bool_setting(self.inner, key_c.as_ptr(), &mut out)
+        };
+        if result == 0 {
+            Ok(out != 0)
+        } else {
+            Err(TorrentError::Unknown {
+                code: result,
+                message: format!("Setting '{}' not found or session unavailable", key),
+            })
         }
     }
 
@@ -131,8 +140,6 @@ impl Session {
         if handle.is_null() {
             Err(unsafe { error_from_c(&error) })
         } else {
-            // Session settings are now baked into session_params on the C++ side,
-            // so no need for post-hoc reapply_settings().
             let info_hash = hex::encode(info.info_hash()?);
             Ok(TorrentHandle {
                 inner: handle,
@@ -208,8 +215,6 @@ impl Session {
         if handle.is_null() {
             Err(unsafe { error_from_c(&error) })
         } else {
-            // Session settings are now baked into session_params on the C++ side,
-            // so no need for post-hoc reapply_settings().
             let info_hash = hex::encode(info.info_hash()?);
             Ok(TorrentHandle {
                 inner: handle,

@@ -85,6 +85,8 @@ int lt_torrent_handle_set_all_piece_priorities(lt_torrent_handle_t handle, int p
 
 void lt_session_apply_settings(lt_session_t session, const char* settings_json);
 
+int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out);
+
 int lt_session_get_stats(lt_session_t session, lt_session_stats_t* stats, int32_t* error);
 
 #ifdef __cplusplus

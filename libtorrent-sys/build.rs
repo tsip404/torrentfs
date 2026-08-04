@@ -22,6 +22,7 @@ fn main() {
         .include("wrapper")
         .flag("-std=c++17")
         .flag("-fexceptions")
+        .flag("-O1")
         .define("TORRENT_USE_OPENSSL", None)
         .define("TORRENT_USE_LIBCRYPTO", None)
         .define("TORRENT_SSL_PEERS", None)
