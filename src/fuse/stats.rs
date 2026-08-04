@@ -301,8 +301,6 @@ pub fn generate_torrent_stats(
 ) -> Vec<u8> {
     let mut output = String::new();
 
-    write_banner(&mut output, Some("Torrent Stats"));
-
     let torrent = if let Some(db) = db.as_ref() {
         if let Ok(db_guard) = db.lock() {
             db_guard.get_torrent_by_id(torrent_id).ok().flatten()
@@ -446,9 +444,7 @@ pub fn generate_directory_stats(
 ) -> Vec<u8> {
     let mut output = String::new();
 
-    write_banner(&mut output, Some("Directory Stats"));
-
-    output.push_str(&format!("directory: {}\n\n", source_path));
+    output.push_str(&format!("===== directory: {} =====\n\n", source_path));
 
     let torrents = if let Some(db) = db.as_ref() {
         if let Ok(db_guard) = db.lock() {
@@ -875,16 +871,39 @@ mod tests {
         // by checking the const patterns that would appear in any torrent stats output.
         let stats = generate_torrent_stats(999, "deadbeef", &None, &None, || None);
         let text = String::from_utf8_lossy(&stats);
-        // torrent not found case still has the banner with "Torrent Stats"
-        assert!(text.contains("Torrent Stats"));
+        // torrent not found case; version banner must NOT appear (root-only)
+        assert!(!text.contains("torrentfs v"));
+    }
+
+    #[test]
+    fn test_torrent_stats_no_version_banner() {
+        // Leaf .stats must not include the version banner.
+        let stats = generate_torrent_stats(999, "deadbeef", &None, &None, || None);
+        let text = String::from_utf8_lossy(&stats);
+        assert!(!text.contains("torrentfs v0"));
+    }
+
+    #[test]
+    fn test_directory_stats_header_format() {
+        let stats = generate_directory_stats("/test/path", &None, &None, || None);
+        let text = String::from_utf8_lossy(&stats);
+        assert!(text.contains("===== directory: /test/path ====="));
+    }
+
+    #[test]
+    fn test_directory_stats_no_version_banner() {
+        // Intermediate directory .stats must not include the version banner.
+        let stats = generate_directory_stats("/test/path", &None, &None, || None);
+        let text = String::from_utf8_lossy(&stats);
+        assert!(!text.contains("torrentfs v0"));
     }
 
     #[test]
     fn test_directory_stats_has_path_title() {
         let stats = generate_directory_stats("/nonexistent", &None, &None, || None);
         let text = String::from_utf8_lossy(&stats);
-        // Empty path case still uses "directory:" format
-        assert!(text.contains("directory:"));
+        // Path title uses spec format: ===== directory: {path} =====
+        assert!(text.contains("===== directory: /nonexistent ====="));
     }
 
     #[test]
