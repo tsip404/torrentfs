@@ -356,7 +356,12 @@ impl TorrentHandle {
         if result != 0 {
             Err(unsafe { error_from_c(&error) })
         } else if data_out.is_null() || size_out == 0 {
-            Ok(Vec::new())
+            Err(TorrentError::PieceNotReady(format!(
+                "Piece {} not yet available (data_out.is_null={}, size_out={})",
+                piece_index,
+                data_out.is_null(),
+                size_out
+            )))
         } else {
             let slice = unsafe { std::slice::from_raw_parts(data_out, size_out) };
             let data = slice.to_vec();
