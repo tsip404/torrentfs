@@ -9,6 +9,9 @@ use super::types::{FilePieceInfo, SessionStats, TorrentState, TorrentStatus};
 
 pub struct Session {
     pub(crate) inner: libtorrent_sys::lt_session_t,
+    /// Saved settings JSON for re-application after C++ session rebuild
+    /// (e.g. when add_torrent_with_custom_storage replaces the session).
+    settings_json: CString,
 }
 
 pub struct TorrentHandle {
@@ -32,18 +35,37 @@ impl Session {
             return Err(unsafe { error_from_c(&error) });
         }
 
-        let session = Session { inner };
+        // Preserve settings JSON for re-application after C++ session rebuild
+        let settings_json = config.to_settings_json();
+        let settings_json_c = CString::new(&settings_json[..]).unwrap_or_default();
+
+        let session = Session {
+            inner,
+            settings_json: settings_json_c,
+        };
 
         // Apply user configuration via JSON
-        let settings_json = config.to_settings_json();
         if settings_json != "{}" {
-            let json_c = CString::new(settings_json).unwrap_or_default();
             unsafe {
-                libtorrent_sys::lt_session_apply_settings(session.inner, json_c.as_ptr());
+                libtorrent_sys::lt_session_apply_settings(
+                    session.inner,
+                    session.settings_json.as_ptr(),
+                );
             }
         }
 
         Ok(session)
+    }
+
+    /// Re-apply saved settings JSON to the libtorrent session.
+    /// Called after C++ session rebuild (add_torrent_with_custom_storage) to
+    /// restore settings like allow_multiple_connections_per_ip that are lost.
+    fn reapply_settings(&self) {
+        if self.settings_json.as_bytes() != b"{}" {
+            unsafe {
+                libtorrent_sys::lt_session_apply_settings(self.inner, self.settings_json.as_ptr());
+            }
+        }
     }
 
     pub fn add_torrent(
@@ -107,6 +129,9 @@ impl Session {
         if handle.is_null() {
             Err(unsafe { error_from_c(&error) })
         } else {
+            // C++ side destroyed and recreated the session with only disk_io_constructor.
+            // Re-apply all user settings (allow_multiple_connections_per_ip, etc.).
+            self.reapply_settings();
             let info_hash = hex::encode(info.info_hash()?);
             Ok(TorrentHandle {
                 inner: handle,
@@ -181,6 +206,9 @@ impl Session {
         if handle.is_null() {
             Err(unsafe { error_from_c(&error) })
         } else {
+            // C++ side destroyed and recreated the session with only disk_io_constructor.
+            // Re-apply all user settings (allow_multiple_connections_per_ip, etc.).
+            self.reapply_settings();
             let info_hash = hex::encode(info.info_hash()?);
             Ok(TorrentHandle {
                 inner: handle,
