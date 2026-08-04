@@ -389,15 +389,28 @@ mod tests {
 
     #[test]
     fn test_make_stats_ino_derives_from_dir_ino() {
-        assert_eq!(InodeManager::make_stats_ino(DATA_INO), DATA_INO + STATS_INO_OFFSET);
-        assert_eq!(InodeManager::make_stats_ino(ROOT_INO), ROOT_INO + STATS_INO_OFFSET);
-        assert_eq!(InodeManager::make_stats_ino(METADATA_INO), METADATA_INO + STATS_INO_OFFSET);
+        assert_eq!(
+            InodeManager::make_stats_ino(DATA_INO),
+            DATA_INO + STATS_INO_OFFSET
+        );
+        assert_eq!(
+            InodeManager::make_stats_ino(ROOT_INO),
+            ROOT_INO + STATS_INO_OFFSET
+        );
+        assert_eq!(
+            InodeManager::make_stats_ino(METADATA_INO),
+            METADATA_INO + STATS_INO_OFFSET
+        );
     }
 
     #[test]
     fn test_is_stats_ino_true_for_derived_inos() {
-        assert!(InodeManager::is_stats_ino(InodeManager::make_stats_ino(DATA_INO)));
-        assert!(InodeManager::is_stats_ino(InodeManager::make_stats_ino(ROOT_INO)));
+        assert!(InodeManager::is_stats_ino(InodeManager::make_stats_ino(
+            DATA_INO
+        )));
+        assert!(InodeManager::is_stats_ino(InodeManager::make_stats_ino(
+            ROOT_INO
+        )));
     }
 
     #[test]
@@ -412,7 +425,9 @@ mod tests {
     fn test_is_stats_ino_boundaries() {
         // STATS_INO_OFFSET (10_000_000) is included, STATS_INO_OFFSET + 10_000_000 is excluded
         assert!(InodeManager::is_stats_ino(STATS_INO_OFFSET));
-        assert!(InodeManager::is_stats_ino(STATS_INO_OFFSET + 10_000_000 - 1));
+        assert!(InodeManager::is_stats_ino(
+            STATS_INO_OFFSET + 10_000_000 - 1
+        ));
         assert!(!InodeManager::is_stats_ino(STATS_INO_OFFSET + 10_000_000));
         assert!(!InodeManager::is_stats_ino(STATS_INO_OFFSET - 1));
     }
