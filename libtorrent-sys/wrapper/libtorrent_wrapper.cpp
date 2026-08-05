@@ -293,6 +293,10 @@ lt_torrent_handle_t lt_session_add_torrent(lt_session_t session, lt_torrent_info
         } else {
             params.save_path = "/tmp/torrentfs-cache";
         }
+        // Clear paused flag: default_flags includes paused, which prevents
+        // tracker announces and peer connections. Torrent download is
+        // triggered on-demand via set_piece_deadline.
+        params.flags &= ~lt::torrent_flags::paused;
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(params);
@@ -329,6 +333,8 @@ lt_torrent_handle_t lt_session_add_torrent_upload_mode(lt_session_t session, lt_
             params.save_path = "/tmp/torrentfs-cache";
         }
         // upload_mode: torrent will connect to trackers/peers but never request pieces
+        // Clear paused flag so tracker announces work.
+        params.flags &= ~lt::torrent_flags::paused;
         params.flags |= lt::torrent_flags::upload_mode;
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
@@ -1199,6 +1205,23 @@ public:
         return result;
     }
 
+    // Read the full raw piece data into a vector. Returns empty vector if the
+    // piece file does not exist or is empty. Needed so that async_hash can
+    // compute SHA256 sub-range hashes for v2 blocks in hybrid torrents.
+    std::vector<char> read_piece_data(int piece_index) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::string path = piece_path(piece_index);
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) return {};
+        std::streamsize sz = file.tellg();
+        if (sz <= 0) return {};
+        file.seekg(0);
+        std::vector<char> data(sz);
+        file.read(data.data(), sz);
+        if (!file) return {};
+        return data;
+    }
+
     void delete_piece_files() {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::string dir = m_base_path + "/" + m_info_hash_hex;
@@ -1256,6 +1279,8 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::string info_hash_hex = sha1_to_hex(p.info_hash);
+        fprintf(stderr, "[DIAG] new_torrent info_hash=%s\n",
+                info_hash_hex.c_str());
         auto storage = std::make_unique<PieceStorage>(m_piece_cache_dir, info_hash_hex);
         lt::storage_index_t idx = m_next_index;
         ++m_next_index;
@@ -1343,16 +1368,18 @@ public:
 
     // disk_interface: async_hash
     void async_hash(lt::storage_index_t storage, lt::piece_index_t piece,
-        lt::span<lt::sha256_hash> /*v2*/,
+        lt::span<lt::sha256_hash> v2,
         lt::disk_job_flags_t flags,
         std::function<void(lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const&)> handler) override
     {
         (void)flags;
-        fprintf(stderr, "[DIAG] async_hash CALLED piece=%d\n",
-                static_cast<int>(piece));
+        fprintf(stderr, "[DIAG] async_hash CALLED piece=%d v2_size=%zu\n",
+                static_cast<int>(piece), v2.size());
         auto* ps = get_storage(storage);
         if (!ps) {
             fprintf(stderr, "[DIAG] async_hash piece=%d => no storage\n", static_cast<int>(piece));
+            // Zero out v2 hashes for hybrid torrents — no data available
+            for (auto& h : v2) h = lt::sha256_hash();
             boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
                 h(p, lt::sha1_hash(), lt::storage_error(lt::error_code(
                     boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
@@ -1365,6 +1392,8 @@ public:
         fprintf(stderr, "[DIAG] async_hash piece=%d file_size=%ld\n", piece_idx, (long)sz);
         if (sz <= 0) {
             fprintf(stderr, "[DIAG] async_hash piece=%d => file_size<=0, empty hash\n", piece_idx);
+            // Zero out v2 hashes for hybrid torrents — no piece data yet
+            for (auto& h : v2) h = lt::sha256_hash();
             boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
                 h(p, lt::sha1_hash(), lt::storage_error(lt::error_code(
                     boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
@@ -1372,9 +1401,44 @@ public:
             return;
         }
 
-        lt::sha1_hash hash = ps->hash_piece(piece_idx, static_cast<int>(sz));
+        // Read full piece data so we can compute v2 sub-range hashes
+        auto data = ps->read_piece_data(piece_idx);
+        if (data.empty()) {
+            fprintf(stderr, "[DIAG] async_hash piece=%d => read_piece_data empty\n", piece_idx);
+            for (auto& h : v2) h = lt::sha256_hash();
+            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
+                h(p, lt::sha1_hash(), lt::storage_error(lt::error_code(
+                    boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+            });
+            return;
+        }
+
+        // Compute SHA1 over the full piece
+        lt::hasher hasher;
+        hasher.update(data.data(), static_cast<int>(data.size()));
+        lt::sha1_hash hash = hasher.final();
+
+        // Compute SHA256 for each v2 block in hybrid torrents.
+        // Each v2 block is a contiguous sub-range of the piece data.
+        // The v2 span has one entry per v2 block that overlaps this v1 piece.
+        if (!v2.empty()) {
+            size_t total = data.size();
+            size_t n = v2.size();
+            size_t block_sz = total / n;   // regular block size
+            for (size_t j = 0; j < n; ++j) {
+                size_t start = j * block_sz;
+                size_t end = (j == n - 1) ? total : (j + 1) * block_sz;
+                SHA256_CTX ctx;
+                SHA256_Init(&ctx);
+                SHA256_Update(&ctx, data.data() + start, end - start);
+                SHA256_Final(reinterpret_cast<unsigned char*>(v2[j].data()), &ctx);
+            }
+            fprintf(stderr, "[DIAG] async_hash piece=%d v2_blocks=%zu block_sz=%zu => populated\n",
+                    piece_idx, n, block_sz);
+        }
+
         fprintf(stderr, "[DIAG] async_hash piece=%d size=%d hash=%02x%02x%02x%02x... => posted\n",
-                piece_idx, static_cast<int>(sz),
+                piece_idx, static_cast<int>(data.size()),
                 (unsigned char)hash[0], (unsigned char)hash[1],
                 (unsigned char)hash[2], (unsigned char)hash[3]);
         boost::asio::post(m_ios, [h = std::move(handler), p = piece, hash] {
@@ -1646,6 +1710,9 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(
         lt::add_torrent_params atp;
         atp.ti = std::make_shared<lt::torrent_info>(*ti);
         atp.save_path = cache_dir;
+        // Clear paused: default_flags includes paused, preventing tracker
+        // announces. Download is triggered on-demand via set_piece_deadline.
+        atp.flags &= ~lt::torrent_flags::paused;
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(atp);
@@ -1684,6 +1751,8 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
         lt::add_torrent_params atp;
         atp.ti = std::make_shared<lt::torrent_info>(*ti);
         atp.save_path = cache_dir;
+        // Clear paused so tracker announces and peer connections work.
+        atp.flags &= ~lt::torrent_flags::paused;
         atp.flags |= lt::torrent_flags::upload_mode;
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
