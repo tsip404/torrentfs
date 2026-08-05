@@ -385,6 +385,42 @@ impl CacheManager {
         Ok(pieces_dir.join(piece_key))
     }
 
+    /// Read a byte range from a cached piece file without loading the
+    /// entire piece into memory.  Uses seek + read to fetch only the
+    /// requested range, which avoids the ~256 KiB full-piece fs::read
+    /// when the caller only needs a subset (e.g. a 128 KiB FUSE read).
+    pub fn read_piece_range(
+        &self,
+        piece_key: &str,
+        offset: u64,
+        size: usize,
+    ) -> TorrentResult<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let piece_path = self.piece_path(piece_key);
+        let mut file = File::open(&piece_path).map_err(|e| {
+            TorrentError::IoError(format!(
+                "Failed to open cached piece {} for range read: {}",
+                piece_key, e
+            ))
+        })?;
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset)).map_err(|e| {
+                TorrentError::IoError(format!(
+                    "Failed to seek in cached piece {}: {}",
+                    piece_key, e
+                ))
+            })?;
+        }
+        let mut buf = vec![0u8; size];
+        file.read_exact(&mut buf).map_err(|e| {
+            TorrentError::IoError(format!(
+                "Failed to read cached piece {} (wanted {} bytes at offset {}): {}",
+                piece_key, size, offset, e
+            ))
+        })?;
+        Ok(buf)
+    }
+
     pub fn has_piece(&self, piece_key: &str) -> bool {
         self.metadata.contains_key(piece_key)
     }

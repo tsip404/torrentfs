@@ -251,8 +251,6 @@ impl DownloadManager {
             status.num_seeds
         );
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
         let info_hash = handle_guard.info_hash().to_string();
         let piece_info = handle_guard.get_file_piece_info(file_index)?;
         let (handle_piece_length, handle_num_pieces) = handle_guard.get_torrent_info()?;
@@ -334,6 +332,130 @@ impl DownloadManager {
             }
             all_available
         };
+
+        // ── Fast path: all needed pieces are available locally ──────────
+        // When every piece is already on disk (have_piece or disk cache),
+        // skip the health-check, piece-deadline, and piece-wait phases.
+        // Lock the cache only long enough to collect piece paths, then
+        // release and do I/O outside the lock to avoid blocking eviction.
+        // On any I/O error (eviction race), fall through to slow path.
+        let fast_result: Option<TorrentResult<Vec<u8>>> = 'fast: {
+            if !all_pieces_local {
+                break 'fast None;
+            }
+
+            // Collect piece paths while holding the lock (cheap).
+            let pieces: Vec<(i32, String, u64, usize)> = {
+                let cache = self.cache_manager.lock().map_err(|_| TorrentError::Unknown {
+                    code: -1,
+                    message: "Cache lock poisoned".to_string(),
+                })?;
+                (start_piece..=end_piece)
+                    .map(|idx| {
+                        let piece_key = Self::make_piece_key(&info_hash, idx);
+                        let path = cache.piece_path(&piece_key);
+                        let piece_start = (idx as u64) * piece_length;
+                        let local_start = absolute_offset.saturating_sub(piece_start);
+                        let local_end =
+                            std::cmp::min(end_offset - piece_start, piece_length as u64);
+                        let chunk_size = if local_start < local_end {
+                            (local_end - local_start) as usize
+                        } else {
+                            0
+                        };
+                        (idx, path.to_string_lossy().into_owned(), local_start, chunk_size)
+                    })
+                    .collect()
+            }; // cache lock released here
+
+            let mut result = Vec::with_capacity(size as usize);
+            let mut bytes_read = 0usize;
+            let mut accessed_keys: Vec<String> = Vec::new();
+
+            for (idx, ref path_str, local_start, chunk_size) in &pieces {
+                if *chunk_size == 0 {
+                    continue;
+                }
+
+                // Read directly from the piece file — no cache lock held.
+                let piece_path = std::path::Path::new(path_str);
+                let mut file = match std::fs::File::open(piece_path) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        tracing::debug!(
+                            "Fast-path: piece {} file missing (eviction race), falling back to slow path",
+                            idx
+                        );
+                        break 'fast None;
+                    }
+                };
+                let chunk = match Self::read_file_offset(&mut file, *local_start, *chunk_size) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        tracing::debug!(
+                            "Fast-path: piece {} I/O error, falling back to slow path",
+                            idx
+                        );
+                        break 'fast None;
+                    }
+                };
+
+                if !chunk.is_empty() {
+                    let piece_key = Self::make_piece_key(&info_hash, *idx);
+                    accessed_keys.push(piece_key);
+
+                    // Notify SeedingManager that this piece is available
+                    if let Some(ref seeding) = self.seeding_manager {
+                        if let Err(e) = seeding.mark_piece_available(&info_hash, *idx) {
+                            tracing::warn!(
+                                "Fast-path: failed to mark piece {} available: {:?}",
+                                idx, e
+                            );
+                        }
+                    }
+
+                    result.extend_from_slice(&chunk);
+                    bytes_read += chunk.len();
+
+                    if bytes_read >= size as usize {
+                        break;
+                    }
+                }
+            }
+
+            // Post-loop guard: never return short data for a real request
+            if size > 0 && bytes_read < size as usize {
+                tracing::debug!(
+                    "Fast-path short read ({} < {}), falling back to slow path",
+                    bytes_read, size
+                );
+                break 'fast None;
+            }
+
+            // Record cache accesses in one short lock
+            if !accessed_keys.is_empty() {
+                if let Ok(mut cache) = self.cache_manager.lock() {
+                    for key in &accessed_keys {
+                        if let Err(e) = cache.record_access(key) {
+                            tracing::warn!(
+                                "Fast-path: failed to record cache access for {}: {:?}",
+                                key, e
+                            );
+                        }
+                    }
+                }
+            }
+
+            Some(Ok(result))
+        };
+
+        if let Some(result) = fast_result {
+            return result;
+        }
+
+        // Settle sleep for libtorrent state transitions — only needed
+        // when reading through the full path (not in fast path above).
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Peer discovery wait — only when pieces are NOT all available locally
         if status.num_peers == 0 && status.num_seeds == 0 && !all_pieces_local {
@@ -656,63 +778,82 @@ impl DownloadManager {
         piece_key: &str,
         piece_idx: i32,
     ) -> TorrentResult<Vec<u8>> {
-        // ── Try cache first ─────────────────────────────────────────
+        // ── Try cache first (minimize lock hold time) ────────────────
         {
-            let mut cache = cache_manager.lock().map_err(|_| TorrentError::Unknown {
-                code: -1,
-                message: "Cache lock poisoned".to_string(),
-            })?;
+            let piece_path = {
+                let cache = cache_manager.lock().map_err(|_| TorrentError::Unknown {
+                    code: -1,
+                    message: "Cache lock poisoned".to_string(),
+                })?;
+                let in_metadata = cache.has_piece(piece_key);
+                let on_disk =
+                    in_metadata || cache.has_piece_on_disk(piece_key);
 
-            if cache.has_piece(piece_key) {
-                let piece_path = cache.piece_path(piece_key);
-                if let Ok(data) = std::fs::read(&piece_path) {
-                    if !data.is_empty() {
-                        // Valid cache hit — record access and return.
-                        if let Err(e) = cache.record_access(piece_key) {
-                            tracing::warn!(
-                                "Failed to record cache access for {}: {:?}",
-                                piece_key,
-                                e
-                            );
+                if !on_disk {
+                    // Not in cache at all — release lock and fall through.
+                    None
+                } else {
+                    // Compute path while holding the lock (cheap).
+                    let path = cache.piece_path(piece_key);
+                    drop(cache); // release lock before disk I/O
+                    if in_metadata {
+                        Some((path, true))
+                    } else {
+                        Some((path, false))
+                    }
+                }
+            };
+
+            if let Some((piece_path, in_metadata)) = piece_path {
+                match std::fs::read(&piece_path) {
+                    Ok(data) if !data.is_empty() => {
+                        if !in_metadata {
+                            // Register on-disk piece in metadata.
+                            let mut cache =
+                                cache_manager.lock().map_err(|_| TorrentError::Unknown {
+                                    code: -1,
+                                    message: "Cache lock poisoned".to_string(),
+                                })?;
+                            if let Err(e) = cache.add_piece(piece_key, data.len() as u64) {
+                                tracing::warn!(
+                                    "Failed to register on-disk piece {} in cache metadata: {:?}",
+                                    piece_key, e
+                                );
+                            }
+                        } else {
+                            // Record access for LRU.
+                            let mut cache =
+                                cache_manager.lock().map_err(|_| TorrentError::Unknown {
+                                    code: -1,
+                                    message: "Cache lock poisoned".to_string(),
+                                })?;
+                            if let Err(e) = cache.record_access(piece_key) {
+                                tracing::warn!(
+                                    "Failed to record cache access for {}: {:?}",
+                                    piece_key, e
+                                );
+                            }
                         }
+                        tracing::debug!(
+                            "read_file_range: piece {} read from disk cache, size={}",
+                            piece_idx, data.len()
+                        );
                         return Ok(data);
                     }
-                    // Empty file on disk — invalidate and fall through.
-                    tracing::warn!(
-                        "Cached piece {} has empty file on disk; invalidating cache",
-                        piece_key
-                    );
-                }
-                // Either file read failed or data was empty:
-                // fall through to read_piece from libtorrent.
-            } else if cache.has_piece_on_disk(piece_key) {
-                let piece_path = cache.piece_path(piece_key);
-                let data = std::fs::read(&piece_path).map_err(|e| {
-                    TorrentError::IoError(format!(
-                        "Failed to read cached piece {} from disk: {}",
-                        piece_key, e
-                    ))
-                })?;
-                if !data.is_empty() {
-                    tracing::debug!(
-                        "read_file_range: piece {} read from disk (not in metadata), size={}",
-                        piece_idx,
-                        data.len()
-                    );
-                    if let Err(e) = cache.add_piece(piece_key, data.len() as u64) {
+                    Ok(_) => {
+                        // Empty file on disk — fall through to read_piece.
                         tracing::warn!(
-                            "Failed to register on-disk piece {} in cache metadata: {:?}",
-                            piece_key,
-                            e
+                            "Cached piece {} has empty file on disk; falling through to read_piece",
+                            piece_key
                         );
                     }
-                    return Ok(data);
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to read cached piece {} from disk ({}): {}; falling through to read_piece",
+                            piece_key, piece_path.display(), e
+                        );
+                    }
                 }
-                // Empty file — fall through to read_piece.
-                tracing::warn!(
-                    "On-disk piece {} is empty; falling through to read_piece",
-                    piece_key
-                );
             }
         } // cache lock released here
 
@@ -782,6 +923,22 @@ impl DownloadManager {
             "Piece {} unavailable after {} retries",
             piece_idx, max_retries
         )))
+    }
+
+    /// Read a byte range from an already-open piece file.  Used by the
+    /// fast path to avoid holding the cache lock during disk I/O.
+    fn read_file_offset(file: &mut std::fs::File, offset: u64, size: usize) -> TorrentResult<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset)).map_err(|e| {
+                TorrentError::IoError(format!("Fast-path seek error: {}", e))
+            })?;
+        }
+        let mut buf = vec![0u8; size];
+        file.read_exact(&mut buf).map_err(|e| {
+            TorrentError::IoError(format!("Fast-path read error: {}", e))
+        })?;
+        Ok(buf)
     }
 }
 
