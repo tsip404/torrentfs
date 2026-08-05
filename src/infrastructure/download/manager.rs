@@ -338,15 +338,18 @@ impl DownloadManager {
         // Peer discovery wait — only when pieces are NOT all available locally
         if status.num_peers == 0 && status.num_seeds == 0 && !all_pieces_local {
             let peer_wait_start = std::time::Instant::now();
+            // Cap peer discovery wait at 9s (was 10s).  After this timeout we
+            // proceed to the piece-wait loop which sets piece deadlines and
+            // waits up to read_timeout_secs.  Keeping this slightly under the
+            // piece-wait inner grace period (also min(read_timeout_secs, 10))
+            // avoids an additive worst-case where both phases stack.
             let peer_wait_timeout =
-                std::time::Duration::from_secs(std::cmp::min(self.read_timeout_secs, 10));
-            let mut poll_count: u32 = 0;
+                std::time::Duration::from_secs(std::cmp::min(self.read_timeout_secs, 9));
             loop {
                 if peer_wait_start.elapsed() >= peer_wait_timeout {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                poll_count += 1;
                 match handle_guard.status() {
                     Ok(s) => {
                         status = s;
@@ -359,43 +362,10 @@ impl DownloadManager {
                             );
                             break;
                         }
-                        if poll_count >= 3 {
-                            let all_cached = {
-                                let cache = self.cache_manager.lock().map_err(|_| {
-                                    TorrentError::Unknown {
-                                        code: -1,
-                                        message: "Cache lock poisoned".to_string(),
-                                    }
-                                })?;
-                                let mut all_found = true;
-                                for piece_idx in start_piece..=end_piece {
-                                    let piece_key = Self::make_piece_key(&info_hash, piece_idx);
-                                    if !handle_guard.have_piece(piece_idx)
-                                        && !cache.has_piece(&piece_key)
-                                        && !cache.has_piece_on_disk(&piece_key)
-                                    {
-                                        all_found = false;
-                                        break;
-                                    }
-                                }
-                                all_found
-                            };
-                            if !all_cached {
-                                tracing::debug!(
-                                    "read_file_range: still 0 peers after {} polls ({:.1}s), pieces not cached, failing fast",
-                                    poll_count,
-                                    peer_wait_start.elapsed().as_secs_f64()
-                                );
-                                break;
-                            }
-                            // All needed pieces are available locally — no need to wait for peers
-                            tracing::debug!(
-                                "read_file_range: all needed pieces available locally after {} polls ({:.1}s), proceeding without peers",
-                                poll_count,
-                                peer_wait_start.elapsed().as_secs_f64()
-                            );
-                            break;
-                        }
+                        // Continue waiting — the peer_wait_timeout bounds this loop.
+                        // Failing fast at 3 polls (1.5s) prevents read-triggered
+                        // downloads from ever reaching the piece-wait path where
+                        // piece deadlines trigger active peer discovery (TSI-2032).
                     }
                     Err(_) => break,
                 }
@@ -434,14 +404,19 @@ impl DownloadManager {
                 all_found
             };
             if !all_cached {
-                return Err(TorrentError::NoPeers(format!(
-                    "Torrent has {} peers and {} seeds (progress: {:.2}%, state: {:?}). \
-                     The tracker may be unreachable or the torrent has no active peers.",
+                // Instead of returning NoPeers immediately, proceed to the
+                // piece-wait loop below.  Setting piece deadlines tells
+                // libtorrent to actively seek these pieces, which can trigger
+                // peer connections that hadn't been established yet when the
+                // torrent was just added (TSI-2032).
+                tracing::warn!(
+                    "read_file_range: {} peers, {} seeds (progress: {:.2}%, state: {:?}) — \
+                     proceeding to piece-wait with deadline prioritization",
                     status.num_peers,
                     status.num_seeds,
                     status.progress * 100.0,
                     status.state
-                )));
+                );
             }
             tracing::debug!(
                 "read_file_range: no peers but all needed pieces are cached on disk, proceeding"
