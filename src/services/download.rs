@@ -6,6 +6,8 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use tracing::warn;
+
 use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::cache::CacheManager;
 use crate::infrastructure::config::TorrentfsConfig;
@@ -90,7 +92,10 @@ impl DownloadService {
         self.download_manager
             .lock()
             .map(|dm| dm.get_all_handles())
-            .unwrap_or_default()
+            .unwrap_or_else(|_| {
+                warn!("DownloadManager lock poisoned in get_all_handles; returning empty list");
+                Vec::new()
+            })
     }
 
     /// Get the CacheManager shared with the download session.

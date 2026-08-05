@@ -1110,10 +1110,24 @@ public:
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open()) return false;
         file.seekg(offset);
-        file.read(buf, size);
-        bool ok = file.good() || (file.eof() && file.gcount() > 0);
-        fprintf(stderr, "[DIAG] read_piece piece=%d offset=%d size=%d ok=%d first4=%02x%02x%02x%02x\n",
-                piece_index, offset, size, ok,
+        if (!file.good()) return false;
+
+        // Read in a loop to guard against short reads from ifstream::read.
+        // A single read() may return fewer bytes than requested even when
+        // EOF has not been reached, especially on network or FUSE-backed
+        // filesystems.  Reading until all requested bytes are obtained or
+        // a genuine EOF / error occurs avoids silent data truncation.
+        int bytes_read = 0;
+        while (bytes_read < size && file.good()) {
+            file.read(buf + bytes_read, size - bytes_read);
+            int count = static_cast<int>(file.gcount());
+            if (count == 0) break;
+            bytes_read += count;
+        }
+
+        bool ok = (bytes_read == size) || (file.eof() && bytes_read > 0);
+        fprintf(stderr, "[DIAG] read_piece piece=%d offset=%d size=%d ok=%d bytes_read=%d first4=%02x%02x%02x%02x\n",
+                piece_index, offset, size, ok, bytes_read,
                 (unsigned char)(size>0?buf[0]:0), (unsigned char)(size>1?buf[1]:0),
                 (unsigned char)(size>2?buf[2]:0), (unsigned char)(size>3?buf[3]:0));
         return ok;
