@@ -1,0 +1,55 @@
+# Base image for torrentfs: Debian stable + latest libtorrent (source build) + Rust toolchain
+# Image: ghcr.io/tsip404/torrentfs-base:latest
+
+FROM debian:stable-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    git \
+    g++ \
+    make \
+    ca-certificates \
+    curl \
+    libssl-dev \
+    pkg-config \
+    libboost-system-dev \
+    libboost-random-dev \
+    libboost-chrono-dev \
+    libboost-date-time-dev \
+    libboost-thread-dev \
+    libboost-iostreams-dev \
+    libboost-json-dev \
+    libfuse-dev \
+    clang \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build libtorrent from the latest release source
+# Use git ls-remote to find the latest v2.* tag (no API rate limits)
+WORKDIR /tmp/build-libtorrent
+RUN LATEST_TAG=$(git ls-remote --tags --sort=-version:refname \
+    https://github.com/arvidn/libtorrent.git 'v2.*' \
+    | grep -oP 'refs/tags/\Kv[0-9.]+$' | head -n1) && \
+    echo "Latest libtorrent release: $LATEST_TAG" && \
+    git clone --depth 1 --branch "$LATEST_TAG" --recurse-submodules \
+    https://github.com/arvidn/libtorrent.git . && \
+    echo "Building libtorrent $LATEST_TAG" && \
+    mkdir build && cd build && \
+    cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=ON \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -Dpython-bindings=OFF \
+    && make -j$(nproc) && make install && ldconfig && \
+    echo "$LATEST_TAG" > /libtorrent-version && \
+    cd / && rm -rf /tmp/build-libtorrent
+
+# Install Rust toolchain
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --default-toolchain stable --profile minimal
+
+WORKDIR /workspace
