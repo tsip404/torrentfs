@@ -309,8 +309,34 @@ impl DownloadManager {
             file_index, offset, size, start_piece, end_piece, num_pieces, piece_length
         );
 
-        // Peer discovery wait
-        if status.num_peers == 0 && status.num_seeds == 0 {
+        // Fast-path pre-check: if all needed pieces are already available
+        // locally (have_piece or disk cache), skip the peer-wait entirely.
+        // This avoids the unnecessary wait when data is already complete
+        // but peers have disconnected (common after finishing a download).
+        let all_pieces_local = {
+            let cache = self
+                .cache_manager
+                .lock()
+                .map_err(|_| TorrentError::Unknown {
+                    code: -1,
+                    message: "Cache lock poisoned".to_string(),
+                })?;
+            let mut all_available = true;
+            for piece_idx in start_piece..=end_piece {
+                let piece_key = Self::make_piece_key(&info_hash, piece_idx);
+                if !handle_guard.have_piece(piece_idx)
+                    && !cache.has_piece(&piece_key)
+                    && !cache.has_piece_on_disk(&piece_key)
+                {
+                    all_available = false;
+                    break;
+                }
+            }
+            all_available
+        };
+
+        // Peer discovery wait — only when pieces are NOT all available locally
+        if status.num_peers == 0 && status.num_seeds == 0 && !all_pieces_local {
             let peer_wait_start = std::time::Instant::now();
             let peer_wait_timeout =
                 std::time::Duration::from_secs(std::cmp::min(self.read_timeout_secs, 10));
@@ -344,7 +370,8 @@ impl DownloadManager {
                                 let mut all_found = true;
                                 for piece_idx in start_piece..=end_piece {
                                     let piece_key = Self::make_piece_key(&info_hash, piece_idx);
-                                    if !cache.has_piece(&piece_key)
+                                    if !handle_guard.have_piece(piece_idx)
+                                        && !cache.has_piece(&piece_key)
                                         && !cache.has_piece_on_disk(&piece_key)
                                     {
                                         all_found = false;
@@ -361,9 +388,9 @@ impl DownloadManager {
                                 );
                                 break;
                             }
-                            // All needed pieces are cached locally — no need to wait for peers
+                            // All needed pieces are available locally — no need to wait for peers
                             tracing::debug!(
-                                "read_file_range: all needed pieces cached locally after {} polls ({:.1}s), proceeding without peers",
+                                "read_file_range: all needed pieces available locally after {} polls ({:.1}s), proceeding without peers",
                                 poll_count,
                                 peer_wait_start.elapsed().as_secs_f64()
                             );
