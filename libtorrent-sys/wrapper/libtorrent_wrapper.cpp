@@ -1060,7 +1060,8 @@ int lt_session_get_stats(lt_session_t session, lt_session_stats_t* stats, int32_
 
 // ============================================================================
 // PieceStorage: per-torrent piece file storage backend
-// Stores piece data in cache/pieces/<info_hash>/piece:N format
+// Stores piece data in cache/pieces/<info_hash>/<info_hash>:piece:N format
+// m_base_path already includes "pieces/", so paths are relative to it.
 // ============================================================================
 
 namespace {
@@ -1090,17 +1091,17 @@ public:
     PieceStorage(const std::string& base_path, const std::string& info_hash_hex)
         : m_base_path(base_path), m_info_hash_hex(info_hash_hex)
     {
-        ensure_dir_recursive(m_base_path + "/pieces/" + m_info_hash_hex);
+        ensure_dir_recursive(m_base_path + "/" + m_info_hash_hex);
     }
 
     std::string get_info_hash_hex() const { return m_info_hash_hex; }
 
     std::string pieces_dir() const {
-        return m_base_path + "/pieces/" + m_info_hash_hex;
+        return m_base_path + "/" + m_info_hash_hex;
     }
 
     std::string piece_path(int piece_index) const {
-        return m_base_path + "/pieces/" + m_info_hash_hex + "/" + m_info_hash_hex + ":piece:" + std::to_string(piece_index);
+        return pieces_dir() + "/" + m_info_hash_hex + ":piece:" + std::to_string(piece_index);
     }
 
     bool read_piece(int piece_index, int offset, char* buf, int size) {
@@ -1120,7 +1121,7 @@ public:
 
     bool write_piece(int piece_index, int offset, const char* buf, int size) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        ensure_dir_recursive(m_base_path + "/pieces/" + m_info_hash_hex);
+        ensure_dir_recursive(m_base_path + "/" + m_info_hash_hex);
         std::string path = piece_path(piece_index);
         fprintf(stderr, "[DIAG] write_piece piece=%d offset=%d size=%d first4=%02x%02x%02x%02x path=%s\n",
                 piece_index, offset, size,
@@ -1200,7 +1201,7 @@ public:
 
     void delete_piece_files() {
         std::lock_guard<std::mutex> lock(m_mutex);
-        std::string dir = m_base_path + "/pieces/" + m_info_hash_hex;
+        std::string dir = m_base_path + "/" + m_info_hash_hex;
         rmdir(dir.c_str());
     }
 

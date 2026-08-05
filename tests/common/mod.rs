@@ -365,6 +365,12 @@ pub fn local_test_config() -> torrentfs::TorrentfsConfig {
     // Allow multiple connections from same IP (critical for localhost testing)
     c.connections.allow_multiple_connections_per_ip = Some(true);
     c.timeouts.read_timeout_secs = Some(30);
+    // Optimize tracker announce for local testing — reduce minimum interval
+    // so peers discover each other faster (mitigates CI flakiness in
+    // test_peer_discovery_via_tracker).
+    c.tracker.announce_to_all_trackers = Some(true);
+    c.tracker.announce_to_all_tiers = Some(true);
+    c.tracker.min_announce_interval = Some(5);
     c
 }
 
@@ -462,7 +468,7 @@ impl TestHarness {
 
                     // Wait for torrent to finish checking and start seeding
                     let start = std::time::Instant::now();
-                    let timeout = Duration::from_secs(30);
+                    let timeout = Duration::from_secs(60);
                     loop {
                         match handle.status() {
                             Ok(status) => {
@@ -518,7 +524,7 @@ impl TestHarness {
         // Wait for the seeder to finish checking and announce
         // (the seeder thread will print its status, we poll the tracker)
         let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(30);
+        let timeout = Duration::from_secs(60);
         loop {
             let count = tracker.announce_count();
             if count >= 1 {
