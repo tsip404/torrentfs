@@ -251,8 +251,6 @@ impl DownloadManager {
             status.num_seeds
         );
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
         let info_hash = handle_guard.info_hash().to_string();
         let piece_info = handle_guard.get_file_piece_info(file_index)?;
         let (handle_piece_length, handle_num_pieces) = handle_guard.get_torrent_info()?;
