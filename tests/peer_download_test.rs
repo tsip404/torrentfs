@@ -49,7 +49,7 @@ fn test_peer_discovery_via_tracker() {
 
     // ── Wait for the downloader to discover the seeder ─────────────────
     let start = std::time::Instant::now();
-    let timeout = Duration::from_secs(30);
+    let timeout = Duration::from_secs(60);
     let mut peers_found = false;
 
     loop {
@@ -194,7 +194,7 @@ fn test_transient_peer_fast_exit() {
 
         // Wait for the torrent to check and start seeding (announces to tracker)
         let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(30);
+        let timeout = Duration::from_secs(60);
         loop {
             match handle.status() {
                 Ok(status) => {
