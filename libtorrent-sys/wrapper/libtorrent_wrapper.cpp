@@ -34,6 +34,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
+#include <openssl/sha.h>
 
 struct lt_error {
     std::string message;
@@ -1174,6 +1175,29 @@ public:
         return h.final();
     }
 
+    lt::sha256_hash hash_piece_sha256(int piece_index, int piece_size) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        std::string path = piece_path(piece_index);
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) return lt::sha256_hash();
+
+        SHA256_CTX ctx;
+        SHA256_Init(&ctx);
+        std::vector<char> buf(16 * 1024);
+        int remaining = piece_size;
+        while (remaining > 0) {
+            int to_read = std::min(remaining, static_cast<int>(buf.size()));
+            file.read(buf.data(), to_read);
+            int actual = static_cast<int>(file.gcount());
+            if (actual == 0) break;
+            SHA256_Update(&ctx, buf.data(), actual);
+            remaining -= actual;
+        }
+        lt::sha256_hash result;
+        SHA256_Final(reinterpret_cast<unsigned char*>(result.data()), &ctx);
+        return result;
+    }
+
     void delete_piece_files() {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::string dir = m_base_path + "/pieces/" + m_info_hash_hex;
@@ -1358,14 +1382,41 @@ public:
     }
 
     // disk_interface: async_hash2
-    void async_hash2(lt::storage_index_t /*storage*/, lt::piece_index_t piece,
+    void async_hash2(lt::storage_index_t storage, lt::piece_index_t piece,
         int /*offset*/, lt::disk_job_flags_t /*flags*/,
         std::function<void(lt::piece_index_t, lt::sha256_hash const&, lt::storage_error const&)> handler) override
     {
-        fprintf(stderr, "[DIAG] async_hash2 CALLED piece=%d (posted)\n",
+        fprintf(stderr, "[DIAG] async_hash2 CALLED piece=%d\n",
                 static_cast<int>(piece));
-        boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
-            h(p, lt::sha256_hash(), lt::storage_error());
+        auto* ps = get_storage(storage);
+        if (!ps) {
+            fprintf(stderr, "[DIAG] async_hash2 piece=%d => no storage\n", static_cast<int>(piece));
+            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
+                h(p, lt::sha256_hash(), lt::storage_error(lt::error_code(
+                    boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+            });
+            return;
+        }
+
+        int piece_idx = static_cast<int>(piece);
+        int64_t sz = ps->piece_size(piece_idx);
+        fprintf(stderr, "[DIAG] async_hash2 piece=%d file_size=%ld\n", piece_idx, (long)sz);
+        if (sz <= 0) {
+            fprintf(stderr, "[DIAG] async_hash2 piece=%d => file_size<=0, empty hash\n", piece_idx);
+            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
+                h(p, lt::sha256_hash(), lt::storage_error(lt::error_code(
+                    boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+            });
+            return;
+        }
+
+        lt::sha256_hash hash = ps->hash_piece_sha256(piece_idx, static_cast<int>(sz));
+        fprintf(stderr, "[DIAG] async_hash2 piece=%d size=%d hash=%02x%02x%02x%02x... => posted\n",
+                piece_idx, static_cast<int>(sz),
+                (unsigned char)hash[0], (unsigned char)hash[1],
+                (unsigned char)hash[2], (unsigned char)hash[3]);
+        boost::asio::post(m_ios, [h = std::move(handler), p = piece, hash] {
+            h(p, hash, lt::storage_error());
         });
     }
 
