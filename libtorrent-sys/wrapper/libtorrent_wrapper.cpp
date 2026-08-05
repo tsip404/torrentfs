@@ -86,7 +86,22 @@ lt_torrent_info_t lt_torrent_info_create(const char* filepath, lt_error_t* error
 lt_torrent_info_t lt_torrent_info_create_from_buffer(const uint8_t* data, size_t size, lt_error_t* error) {
     try {
         lt::error_code ec;
-        lt::torrent_info ti(lt::span<char const>(reinterpret_cast<const char*>(data), size), ec, lt::from_span);
+        // Use bdecode + torrent_info(bdecode_node) instead of the deprecated
+        // torrent_info(span, ec, from_span) which may not properly copy data
+        // on libtorrent 2.0.x, causing stack smashing on later session use.
+        lt::bdecode_node node;
+        lt::bdecode(reinterpret_cast<const char*>(data),
+                    reinterpret_cast<const char*>(data) + size, node, ec);
+        if (ec) {
+            if (error) {
+                error->code = ec.value();
+                static thread_local std::string err_msg;
+                err_msg = ec.message();
+                error->message = err_msg.c_str();
+            }
+            return nullptr;
+        }
+        lt::torrent_info ti(node, ec);
         if (ec) {
             if (error) {
                 error->code = ec.value();
@@ -226,14 +241,17 @@ void lt_torrent_metadata_destroy(lt_torrent_metadata_t* metadata) {
 
 lt_session_t lt_session_create(const char* listen_interface, lt_error_t* error) {
     try {
+        auto wrapper = new lt_session_wrapper();
+        wrapper->session = new lt::session();
+
         lt::settings_pack settings;
         if (listen_interface && strlen(listen_interface) > 0) {
             settings.set_str(lt::settings_pack::listen_interfaces, listen_interface);
         }
-        settings.set_int(lt::settings_pack::alert_mask, 
+        settings.set_int(lt::settings_pack::alert_mask,
             lt::alert_category::error | lt::alert_category::status);
-        auto wrapper = new lt_session_wrapper();
-        wrapper->session = new lt::session(settings);
+        wrapper->session->apply_settings(settings);
+
         return static_cast<lt_session_t>(wrapper);
     } catch (const std::exception& e) {
         if (error) {
@@ -878,15 +896,14 @@ static void apply_bool_setting(lt::settings_pack& pack, const std::string& key, 
     // Unknown keys are silently ignored
 }
 
-// Build a settings_pack from a JSON string into the provided pack reference.
-// Caller is responsible for the pack's lifetime. Heap-allocate to avoid
-// stack overflow on libtorrent 2.0.x.
-static void build_settings_pack(lt::settings_pack& pack, const char* settings_json) {
-    if (!settings_json || !*settings_json) return;
+// Build a settings_pack from a JSON string (shared by session creation and runtime apply)
+static lt::settings_pack build_settings_pack(const char* settings_json) {
+    lt::settings_pack pack;
+    if (!settings_json || !*settings_json) return pack;
 
     const char* p = settings_json;
     skip_json_ws(p);
-    if (*p != '{') return;
+    if (*p != '{') return pack;
     p++;
 
     while (*p) {
@@ -920,16 +937,17 @@ static void build_settings_pack(lt::settings_pack& pack, const char* settings_js
             while (*p && *p != ',' && *p != '}') p++;
         }
     }
+
+    return pack;
 }
 
 void lt_session_apply_settings(lt_session_t session, const char* settings_json) {
     if (!session) return;
 
-    auto pack = std::make_unique<lt::settings_pack>();
-    build_settings_pack(*pack, settings_json);
+    auto pack = build_settings_pack(settings_json);
     auto wrapper = static_cast<lt_session_wrapper*>(session);
     std::lock_guard<std::mutex> lock(wrapper->mutex);
-    wrapper->session->apply_settings(*pack);
+    wrapper->session->apply_settings(pack);
 }
 
 static bool get_session_bool_setting_impl(lt::settings_pack const& settings, const std::string& key, int* out) {
@@ -961,21 +979,6 @@ static bool get_session_bool_setting_impl(lt::settings_pack const& settings, con
     } else if (key == "smooth_connects") {
         if (settings.has_val(lt::settings_pack::smooth_connects)) {
             *out = settings.get_bool(lt::settings_pack::smooth_connects) ? 1 : 0;
-            return true;
-        }
-    } else if (key == "prioritize_partial_pieces") {
-        if (settings.has_val(lt::settings_pack::prioritize_partial_pieces)) {
-            *out = settings.get_bool(lt::settings_pack::prioritize_partial_pieces) ? 1 : 0;
-            return true;
-        }
-    } else if (key == "announce_to_all_trackers") {
-        if (settings.has_val(lt::settings_pack::announce_to_all_trackers)) {
-            *out = settings.get_bool(lt::settings_pack::announce_to_all_trackers) ? 1 : 0;
-            return true;
-        }
-    } else if (key == "anonymous_mode") {
-        if (settings.has_val(lt::settings_pack::anonymous_mode)) {
-            *out = settings.get_bool(lt::settings_pack::anonymous_mode) ? 1 : 0;
             return true;
         }
     }
@@ -1106,13 +1109,23 @@ public:
         if (!file.is_open()) return false;
         file.seekg(offset);
         file.read(buf, size);
-        return file.good() || (file.eof() && file.gcount() > 0);
+        bool ok = file.good() || (file.eof() && file.gcount() > 0);
+        fprintf(stderr, "[DIAG] read_piece piece=%d offset=%d size=%d ok=%d first4=%02x%02x%02x%02x\n",
+                piece_index, offset, size, ok,
+                (unsigned char)(size>0?buf[0]:0), (unsigned char)(size>1?buf[1]:0),
+                (unsigned char)(size>2?buf[2]:0), (unsigned char)(size>3?buf[3]:0));
+        return ok;
     }
 
     bool write_piece(int piece_index, int offset, const char* buf, int size) {
         std::lock_guard<std::mutex> lock(m_mutex);
         ensure_dir_recursive(m_base_path + "/pieces/" + m_info_hash_hex);
         std::string path = piece_path(piece_index);
+        fprintf(stderr, "[DIAG] write_piece piece=%d offset=%d size=%d first4=%02x%02x%02x%02x path=%s\n",
+                piece_index, offset, size,
+                (unsigned char)(size>0?buf[0]:0), (unsigned char)(size>1?buf[1]:0),
+                (unsigned char)(size>2?buf[2]:0), (unsigned char)(size>3?buf[3]:0),
+                path.c_str());
         std::fstream file;
         file.open(path, std::ios::binary | std::ios::in | std::ios::out);
         if (!file.is_open()) {
@@ -1256,9 +1269,13 @@ public:
 
         if (ps->read_piece(static_cast<int>(r.piece), r.start, buf, r.length)) {
 #if LIBTORRENT_VERSION_NUM >= 20100
-            handler(lt::disk_buffer_holder(*this, buf), lt::storage_error());
+            boost::asio::post(m_ios, [h = std::move(handler), this, buf]() mutable {
+                h(lt::disk_buffer_holder(*this, buf), lt::storage_error());
+            });
 #else
-            handler(lt::disk_buffer_holder(*this, buf, r.length), lt::storage_error());
+            boost::asio::post(m_ios, [h = std::move(handler), this, buf, len = r.length]() mutable {
+                h(lt::disk_buffer_holder(*this, buf, len), lt::storage_error());
+            });
 #endif
         } else {
             {
@@ -1266,8 +1283,10 @@ public:
                 m_allocated.erase(buf);
             }
             std::free(buf);
-            handler(lt::disk_buffer_holder(),
-                lt::storage_error(lt::error_code(boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+            boost::asio::post(m_ios, [h = std::move(handler)] {
+                h(lt::disk_buffer_holder(),
+                    lt::storage_error(lt::error_code(boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+            });
         }
     }
 
@@ -1284,9 +1303,15 @@ public:
         }
 
         if (ps->write_piece(static_cast<int>(r.piece), r.start, buf, r.length)) {
-            handler(lt::storage_error());
+            fprintf(stderr, "[DIAG] async_write piece=%d offset=%d len=%d => OK (posted)\n",
+                    static_cast<int>(r.piece), r.start, r.length);
+            boost::asio::post(m_ios, [h = std::move(handler)] { h(lt::storage_error()); });
         } else {
-            handler(lt::storage_error(lt::error_code(boost::system::errc::io_error, boost::system::generic_category())));
+            fprintf(stderr, "[DIAG] async_write piece=%d offset=%d len=%d => FAIL\n",
+                    static_cast<int>(r.piece), r.start, r.length);
+            boost::asio::post(m_ios, [h = std::move(handler)] {
+                h(lt::storage_error(lt::error_code(boost::system::errc::io_error, boost::system::generic_category())));
+            });
         }
         return false;
     }
@@ -1294,26 +1319,42 @@ public:
     // disk_interface: async_hash
     void async_hash(lt::storage_index_t storage, lt::piece_index_t piece,
         lt::span<lt::sha256_hash> /*v2*/,
-        lt::disk_job_flags_t /*flags*/,
+        lt::disk_job_flags_t flags,
         std::function<void(lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const&)> handler) override
     {
+        (void)flags;
+        fprintf(stderr, "[DIAG] async_hash CALLED piece=%d\n",
+                static_cast<int>(piece));
         auto* ps = get_storage(storage);
         if (!ps) {
-            handler(piece, lt::sha1_hash(),
-                lt::storage_error(lt::error_code(boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+            fprintf(stderr, "[DIAG] async_hash piece=%d => no storage\n", static_cast<int>(piece));
+            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
+                h(p, lt::sha1_hash(), lt::storage_error(lt::error_code(
+                    boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+            });
             return;
         }
 
         int piece_idx = static_cast<int>(piece);
         int64_t sz = ps->piece_size(piece_idx);
+        fprintf(stderr, "[DIAG] async_hash piece=%d file_size=%ld\n", piece_idx, (long)sz);
         if (sz <= 0) {
-            handler(piece, lt::sha1_hash(),
-                lt::storage_error(lt::error_code(boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+            fprintf(stderr, "[DIAG] async_hash piece=%d => file_size<=0, empty hash\n", piece_idx);
+            boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
+                h(p, lt::sha1_hash(), lt::storage_error(lt::error_code(
+                    boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
+            });
             return;
         }
 
         lt::sha1_hash hash = ps->hash_piece(piece_idx, static_cast<int>(sz));
-        handler(piece, hash, lt::storage_error());
+        fprintf(stderr, "[DIAG] async_hash piece=%d size=%d hash=%02x%02x%02x%02x... => posted\n",
+                piece_idx, static_cast<int>(sz),
+                (unsigned char)hash[0], (unsigned char)hash[1],
+                (unsigned char)hash[2], (unsigned char)hash[3]);
+        boost::asio::post(m_ios, [h = std::move(handler), p = piece, hash] {
+            h(p, hash, lt::storage_error());
+        });
     }
 
     // disk_interface: async_hash2
@@ -1321,7 +1362,11 @@ public:
         int /*offset*/, lt::disk_job_flags_t /*flags*/,
         std::function<void(lt::piece_index_t, lt::sha256_hash const&, lt::storage_error const&)> handler) override
     {
-        handler(piece, lt::sha256_hash(), lt::storage_error());
+        fprintf(stderr, "[DIAG] async_hash2 CALLED piece=%d (posted)\n",
+                static_cast<int>(piece));
+        boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
+            h(p, lt::sha256_hash(), lt::storage_error());
+        });
     }
 
     // disk_interface: async_move_storage
@@ -1477,8 +1522,53 @@ private:
 } // anonymous namespace
 
 // ============================================================================
+// C API: lt_session_create_with_custom_storage
+// Creates a session with PieceStorageDiskIO from the start, avoiding the
+// session_params crash on libtorrent 2.0.x that occurs during session
+// recreation in add_torrent_with_custom_storage.
+// ============================================================================
+
+lt_session_t lt_session_create_with_custom_storage(
+    const char* piece_cache_dir, const char* settings_json, lt_error_t* error)
+{
+    if (!piece_cache_dir || !*piece_cache_dir) {
+        if (error) {
+            error->code = -1;
+            error->message = "piece_cache_dir is required";
+        }
+        return nullptr;
+    }
+
+    try {
+        auto wrapper = new lt_session_wrapper();
+
+        lt::session_params params;
+        if (settings_json && strlen(settings_json) > 0) {
+            params.settings = build_settings_pack(settings_json);
+        }
+        std::string cache_dir(piece_cache_dir);
+        params.disk_io_constructor = [cache_dir](lt::io_context& ios,
+            lt::settings_interface const&, lt::counters&) -> std::unique_ptr<lt::disk_interface> {
+            return std::make_unique<PieceStorageDiskIO>(ios, cache_dir);
+        };
+        wrapper->session = new lt::session(std::move(params));
+
+        return static_cast<lt_session_t>(wrapper);
+    } catch (const std::exception& e) {
+        if (error) {
+            error->code = -1;
+            static thread_local std::string err_msg;
+            err_msg = e.what();
+            error->message = err_msg.c_str();
+        }
+        return nullptr;
+    }
+}
+
+// ============================================================================
 // C API: lt_session_add_torrent_with_custom_storage
-// Creates a session with PieceStorageDiskIO and adds the torrent
+// Adds a torrent to an existing custom-storage session (created via
+// lt_session_create_with_custom_storage). No longer recreates the session.
 // ============================================================================
 
 lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(
@@ -1497,33 +1587,16 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage(
         auto wrapper = static_cast<lt_session_wrapper*>(session);
         auto ti = static_cast<lt::torrent_info*>(info);
 
+        (void)settings_json; // Settings are now baked into session at creation time
         std::string cache_dir(piece_cache_dir ? piece_cache_dir : "/tmp/torrentfs-cache");
 
-        // Build session_params with custom disk_io_constructor and original settings.
-        // Heap-allocate to avoid stack overflow on libtorrent 2.0.x.
-        auto* params = new lt::session_params();
-        build_settings_pack(params->settings, settings_json);
-        params->disk_io_constructor = [cache_dir](lt::io_context& ios,
-            lt::settings_interface const&, lt::counters&) -> std::unique_ptr<lt::disk_interface> {
-            return std::make_unique<PieceStorageDiskIO>(ios, cache_dir);
-        };
+        // Add the torrent to the existing session (custom storage already set up)
+        lt::add_torrent_params atp;
+        atp.ti = std::make_shared<lt::torrent_info>(*ti);
+        atp.save_path = cache_dir;
 
-        // Create new session, intentionally do not delete params (moved-from
-        // session_params destruction causes heap corruption on 2.0.10).
-        auto new_session = std::make_unique<lt::session>(std::move(*params));
-
-        // Replace the existing session with our custom-disk-io session.
         std::lock_guard<std::mutex> lock(wrapper->mutex);
-        wrapper->session->abort();
-        delete wrapper->session;
-        wrapper->session = new_session.release();
-
-        // Add the torrent (heap-allocate to avoid stack overflow on 2.0.x).
-        auto atp = std::make_unique<lt::add_torrent_params>();
-        atp->ti = std::make_shared<lt::torrent_info>(*ti);
-        atp->save_path = cache_dir;
-
-        auto handle = wrapper->session->add_torrent(*atp);
+        auto handle = wrapper->session->add_torrent(atp);
         return static_cast<lt_torrent_handle_t>(new lt::torrent_handle(handle));
     } catch (const std::exception& e) {
         if (error) {
@@ -1552,31 +1625,17 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
         auto wrapper = static_cast<lt_session_wrapper*>(session);
         auto ti = static_cast<lt::torrent_info*>(info);
 
+        (void)settings_json; // Settings are now baked into session at creation time
         std::string cache_dir(piece_cache_dir ? piece_cache_dir : "/tmp/torrentfs-cache");
 
-        // Build session_params with custom disk_io_constructor and original settings.
-        // Heap-allocate + leak (see non-upload-mode variant above).
-        auto* params = new lt::session_params();
-        build_settings_pack(params->settings, settings_json);
-        params->disk_io_constructor = [cache_dir](lt::io_context& ios,
-            lt::settings_interface const&, lt::counters&) -> std::unique_ptr<lt::disk_interface> {
-            return std::make_unique<PieceStorageDiskIO>(ios, cache_dir);
-        };
-
-        auto new_session = std::make_unique<lt::session>(std::move(*params));
+        // Add the torrent in upload_mode to the existing session
+        lt::add_torrent_params atp;
+        atp.ti = std::make_shared<lt::torrent_info>(*ti);
+        atp.save_path = cache_dir;
+        atp.flags |= lt::torrent_flags::upload_mode;
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
-        wrapper->session->abort();
-        delete wrapper->session;
-        wrapper->session = new_session.release();
-
-        // Add the torrent with upload_mode (heap-allocate for 2.0.x).
-        auto atp = std::make_unique<lt::add_torrent_params>();
-        atp->ti = std::make_shared<lt::torrent_info>(*ti);
-        atp->save_path = cache_dir;
-        atp->flags |= lt::torrent_flags::upload_mode;
-
-        auto handle = wrapper->session->add_torrent(*atp);
+        auto handle = wrapper->session->add_torrent(atp);
         return static_cast<lt_torrent_handle_t>(new lt::torrent_handle(handle));
     } catch (const std::exception& e) {
         if (error) {

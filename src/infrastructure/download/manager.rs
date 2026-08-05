@@ -15,15 +15,20 @@ pub struct DownloadManager {
     pub(crate) handles: HashMap<String, Arc<Mutex<TorrentHandle>>>,
     pub(crate) cache_dir: String,
     pub(crate) cache_manager: Arc<Mutex<CacheManager>>,
-    pub(crate) custom_storage_active: bool,
     pub(crate) read_timeout_secs: u64,
     pub(crate) seeding_manager: Option<Arc<SeedingManager>>,
 }
 
 impl DownloadManager {
     pub fn new(cache_dir: &Path, config: &TorrentfsConfig) -> TorrentResult<Self> {
-        let session = Session::new(config)?;
         let cache_dir_str = cache_dir.to_string_lossy().into_owned();
+
+        // Create pieces directory for custom piece storage
+        let pieces_dir = cache_dir.join("pieces");
+        std::fs::create_dir_all(&pieces_dir).map_err(|e| TorrentError::IoError(e.to_string()))?;
+
+        // Create session with custom piece storage from the start
+        let session = Session::new_with_custom_storage(config, &pieces_dir)?;
 
         let cache_manager = CacheManager::new(cache_dir, 1024 * 1024 * 1024)?;
 
@@ -38,7 +43,6 @@ impl DownloadManager {
             handles: HashMap::new(),
             cache_dir: cache_dir_str,
             cache_manager: Arc::new(Mutex::new(cache_manager)),
-            custom_storage_active: false,
             read_timeout_secs,
             seeding_manager: None,
         })
@@ -99,13 +103,7 @@ impl DownloadManager {
             message: "Session lock poisoned".to_string(),
         })?;
 
-        let handle = if !self.custom_storage_active {
-            let h = session.add_torrent_with_custom_storage_upload_mode(info, cache_base)?;
-            self.custom_storage_active = true;
-            h
-        } else {
-            session.add_torrent_upload_mode(info, &pieces_dir)?
-        };
+        let handle = session.add_torrent_upload_mode(info, &pieces_dir)?;
 
         // Set all pieces to priority 0 to prevent automatic downloading.
         let (_piece_length, num_pieces) = handle.get_torrent_info()?;
@@ -148,19 +146,10 @@ impl DownloadManager {
             message: "Session lock poisoned".to_string(),
         })?;
 
-        let handle = if !self.custom_storage_active {
-            // First torrent: replace session with custom-storage session
-            let h = session.add_torrent_with_custom_storage(info, cache_base)?;
-            self.custom_storage_active = true;
-            h
-        } else {
-            // Custom storage already active: use regular add_torrent with a
-            // per-torrent save path to prevent cross-torrent interference.
-            let torrent_save_dir = pieces_dir.join(&info_hash);
-            std::fs::create_dir_all(&torrent_save_dir)
-                .map_err(|e| TorrentError::IoError(e.to_string()))?;
-            session.add_torrent(info, &torrent_save_dir)?
-        };
+        let torrent_save_dir = pieces_dir.join(&info_hash);
+        std::fs::create_dir_all(&torrent_save_dir)
+            .map_err(|e| TorrentError::IoError(e.to_string()))?;
+        let handle = session.add_torrent(info, &torrent_save_dir)?;
 
         let handle = Arc::new(Mutex::new(handle));
         self.handles.insert(info_hash.clone(), handle.clone());
@@ -392,7 +381,9 @@ impl DownloadManager {
             Err(_) => {}
         }
 
-        // Health check: if still no real peers
+        // Health check: if still no real peers — but also check libtorrent's
+        // have_piece() in case the torrent already finished downloading
+        // (progress=100%, state=Seeding) and peers have since disconnected.
         if status.num_peers <= 1 && status.num_seeds == 0 {
             let all_cached = {
                 let cache = self
@@ -405,7 +396,10 @@ impl DownloadManager {
                 let mut all_found = true;
                 for piece_idx in start_piece..=end_piece {
                     let piece_key = Self::make_piece_key(&info_hash, piece_idx);
-                    if !cache.has_piece(&piece_key) && !cache.has_piece_on_disk(&piece_key) {
+                    if !cache.has_piece(&piece_key)
+                        && !cache.has_piece_on_disk(&piece_key)
+                        && !handle_guard.have_piece(piece_idx)
+                    {
                         all_found = false;
                         break;
                     }
@@ -463,9 +457,18 @@ impl DownloadManager {
                     }
                 }
 
-                // Check peers availability
+                // Check peers availability — but only if the piece isn't already complete.
+                // After a successful download, the torrent may be in Seeding/Finished state
+                // with 0 peers while the piece IS available locally.
                 if let Ok(s) = handle_guard.status() {
                     status = s;
+                }
+                if handle_guard.have_piece(piece_idx) {
+                    tracing::debug!(
+                        "read_file_range: piece {} is already complete (have_piece=true), skipping peer check",
+                        piece_idx
+                    );
+                    break;
                 }
                 if status.num_peers <= 1 && status.num_seeds == 0 {
                     return Err(TorrentError::NoPeers(format!(

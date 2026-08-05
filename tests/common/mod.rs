@@ -322,10 +322,10 @@ fn bencode_tracker_response(interval: i64, compact_peers: &[u8]) -> Vec<u8> {
 /// so the entire file fits in one piece.
 pub fn create_test_torrent_with_tracker(announce_url: &str) -> (Vec<u8>, Vec<u8>) {
     let mut test_content = b"Hello, this is a test file for torrentfs verification.\n".to_vec();
-    while test_content.len() < 162 {
+    while test_content.len() < 16384 {
         test_content.push(b'X');
     }
-    test_content.truncate(162);
+    test_content.truncate(16384);
 
     let sha1_hash = {
         use sha1_smol::Sha1;
@@ -343,7 +343,7 @@ pub fn create_test_torrent_with_tracker(announce_url: &str) -> (Vec<u8>, Vec<u8>
     torrent.extend_from_slice(announce_url.as_bytes());
 
     torrent.extend_from_slice(b"4:infod");
-    torrent.extend_from_slice(b"6:lengthi162e");
+    torrent.extend_from_slice(b"6:lengthi16384e");
     torrent.extend_from_slice(b"4:name22:final_verification.txt");
     torrent.extend_from_slice(b"12:piece lengthi16384e");
     torrent.extend_from_slice(b"6:pieces20:");

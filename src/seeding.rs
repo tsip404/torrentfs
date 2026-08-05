@@ -12,7 +12,6 @@ pub struct SeedingManager {
     handles: Arc<Mutex<HashMap<String, TorrentHandle>>>,
     seeding_info: Arc<Mutex<HashMap<String, SeedingInfo>>>,
     cache_dir: PathBuf,
-    custom_storage_active: Arc<Mutex<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,14 +34,18 @@ pub enum SeedingState {
 
 impl SeedingManager {
     pub fn new(cache_dir: &Path, config: &TorrentfsConfig) -> TorrentResult<Self> {
-        let session = Session::new(config)?;
+        // Create pieces directory for custom piece storage
+        let pieces_dir = cache_dir.join("pieces");
+        std::fs::create_dir_all(&pieces_dir).map_err(|e| TorrentError::IoError(e.to_string()))?;
+
+        // Create session with custom piece storage from the start
+        let session = Session::new_with_custom_storage(config, &pieces_dir)?;
 
         Ok(Self {
             session: Arc::new(Mutex::new(session)),
             handles: Arc::new(Mutex::new(HashMap::new())),
             seeding_info: Arc::new(Mutex::new(HashMap::new())),
             cache_dir: cache_dir.to_path_buf(),
-            custom_storage_active: Arc::new(Mutex::new(false)),
         })
     }
 
@@ -75,33 +78,8 @@ impl SeedingManager {
                 message: "Session lock poisoned".to_string(),
             })?;
 
-            let custom_active = {
-                let flag =
-                    self.custom_storage_active
-                        .lock()
-                        .map_err(|_| TorrentError::Unknown {
-                            code: -1,
-                            message: "Custom storage flag lock poisoned".to_string(),
-                        })?;
-                *flag
-            };
-
-            if !custom_active {
-                // First seed: replace session with custom-storage session
-                let h = session.add_torrent_with_custom_storage(info, &self.cache_dir)?;
-                let mut flag =
-                    self.custom_storage_active
-                        .lock()
-                        .map_err(|_| TorrentError::Unknown {
-                            code: -1,
-                            message: "Custom storage flag lock poisoned".to_string(),
-                        })?;
-                *flag = true;
-                h
-            } else {
-                // Custom storage already active: use regular add_torrent
-                session.add_torrent(info, &pieces_dir)?
-            }
+            // Custom storage already active from session creation
+            session.add_torrent(info, &pieces_dir)?
         };
 
         let name = info.name();
