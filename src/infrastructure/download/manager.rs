@@ -595,13 +595,20 @@ impl DownloadManager {
                     break;
                 }
                 if status.num_peers <= 1 && status.num_seeds == 0 {
-                    return Err(TorrentError::NoPeers(format!(
-                        "No peers available and piece {} is not in cache. \
-                         Torrent progress: {:.2}%, state: {:?}",
-                        piece_idx,
+                    // Instead of returning NoPeers immediately, proceed to the
+                    // piece-wait loop below.  Piece deadlines have already been
+                    // set, and the wait loop gives libtorrent time to establish
+                    // peer connections that may not be up yet for a newly-added
+                    // torrent (TSI-2039, same pattern as TSI-2032 outer check).
+                    tracing::warn!(
+                        "read_file_range: {} peers, {} seeds (progress: {:.2}%, state: {:?}) — \
+                         proceeding to piece-wait loop for piece {} with deadline prioritization",
+                        status.num_peers,
+                        status.num_seeds,
                         status.progress * 100.0,
-                        status.state
-                    )));
+                        status.state,
+                        piece_idx
+                    );
                 }
 
                 tracing::debug!(
