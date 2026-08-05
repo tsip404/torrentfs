@@ -435,6 +435,10 @@ impl TestHarness {
         let stop_signal = Arc::new(Mutex::new(false));
         let stop_clone = Arc::clone(&stop_signal);
 
+        // Signal when the seeder reaches Seeding/Finished state
+        let seeder_ready = Arc::new(Mutex::new(false));
+        let seeder_ready_clone = Arc::clone(&seeder_ready);
+
         let seeder_thread = thread::spawn(move || {
             // Use local test config (DHT disabled) for clean tracker-only path
             let config = local_test_config();
@@ -484,6 +488,7 @@ impl TestHarness {
                                         | torrentfs::download::TorrentState::Finished
                                 ) {
                                     eprintln!("TestHarness seeder: now seeding!");
+                                    *seeder_ready_clone.lock().unwrap() = true;
                                     break;
                                 }
 
@@ -539,6 +544,24 @@ impl TestHarness {
                     "TestHarness: timeout waiting for seeder announce (got {} announces)",
                     count
                 );
+                break;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        // Wait for the seeder to reach Seeding/Finished state (not just announce).
+        // On slow CI hardware, the announce may arrive during CheckingFiles before
+        // the seeder can actually serve pieces.  Without this wait, the downloader
+        // may start too early and time out waiting for a peer that isn't ready yet.
+        let start = std::time::Instant::now();
+        let ready_timeout = Duration::from_secs(30);
+        loop {
+            if *seeder_ready.lock().unwrap() {
+                eprintln!("TestHarness: seeder is ready (Seeding/Finished)");
+                break;
+            }
+            if start.elapsed() > ready_timeout {
+                eprintln!("TestHarness: timeout waiting for seeder to reach Seeding state");
                 break;
             }
             thread::sleep(Duration::from_millis(200));
