@@ -649,6 +649,17 @@ impl DownloadManager {
     ///
     /// On `PieceNotReady` from `read_piece`, retries up to 3 times with
     /// a 200 ms sleep between attempts.
+    ///
+    /// Lock discipline: the cache lock is held only long enough to extract
+    /// the piece path and membership flag.  All disk I/O (`std::fs::read`)
+    /// happens outside the lock so that concurrent eviction or other cache
+    /// operations are not blocked on disk latency.
+    ///
+    /// Eviction race tolerance: between the lock-internal pre-check and
+    /// the lock-external `fs::read`, a concurrent eviction may delete the
+    /// file.  When `fs::read` fails (or returns empty data) the function
+    /// falls through to the libtorrent slow path instead of propagating a
+    /// hard `IoError` — this matches the advisory from TSI-2038.
     fn fetch_piece_data(
         cache_manager: &Arc<Mutex<CacheManager>>,
         handle_guard: &TorrentHandle,
@@ -656,65 +667,92 @@ impl DownloadManager {
         piece_key: &str,
         piece_idx: i32,
     ) -> TorrentResult<Vec<u8>> {
-        // ── Try cache first ─────────────────────────────────────────
+        // ── Fast path: extract path inside lock, do I/O outside ─────
         {
-            let mut cache = cache_manager.lock().map_err(|_| TorrentError::Unknown {
-                code: -1,
-                message: "Cache lock poisoned".to_string(),
-            })?;
+            // Scope 1 — capture path + metadata flag under the lock,
+            // then release immediately.
+            let (piece_path, in_metadata) = {
+                let cache =
+                    cache_manager
+                        .lock()
+                        .map_err(|_| TorrentError::Unknown {
+                            code: -1,
+                            message: "Cache lock poisoned".to_string(),
+                        })?;
 
-            if cache.has_piece(piece_key) {
-                let piece_path = cache.piece_path(piece_key);
-                if let Ok(data) = std::fs::read(&piece_path) {
-                    if !data.is_empty() {
-                        // Valid cache hit — record access and return.
-                        if let Err(e) = cache.record_access(piece_key) {
-                            tracing::warn!(
-                                "Failed to record cache access for {}: {:?}",
-                                piece_key,
-                                e
-                            );
+                if cache.has_piece(piece_key) {
+                    (Some(cache.piece_path(piece_key)), true)
+                } else if cache.has_piece_on_disk(piece_key) {
+                    (Some(cache.piece_path(piece_key)), false)
+                } else {
+                    (None, false)
+                }
+            }; // cache lock released — I/O happens below
+
+            if let Some(piece_path) = piece_path {
+                // Scope 2 — disk I/O outside any lock so that long reads /
+                // slow filesystems don't stall concurrent cache operations.
+                match std::fs::read(&piece_path) {
+                    Ok(data) if !data.is_empty() => {
+                        // Re-acquire the lock for a metadata-only update
+                        // (cheap, no nested I/O beyond the metadata file).
+                        if let Ok(mut cache) = cache_manager.lock() {
+                            if in_metadata {
+                                if let Err(e) = cache.record_access(piece_key) {
+                                    tracing::warn!(
+                                        "Failed to record cache access for {}: {:?}",
+                                        piece_key,
+                                        e
+                                    );
+                                }
+                            } else {
+                                tracing::debug!(
+                                    "read_file_range: piece {} read from disk \
+                                     (not in metadata), size={}",
+                                    piece_idx,
+                                    data.len()
+                                );
+                                if let Err(e) =
+                                    cache.add_piece(piece_key, data.len() as u64)
+                                {
+                                    tracing::warn!(
+                                        "Failed to register on-disk piece {} \
+                                         in cache metadata: {:?}",
+                                        piece_key,
+                                        e
+                                    );
+                                }
+                            }
                         }
                         return Ok(data);
                     }
-                    // Empty file on disk — invalidate and fall through.
-                    tracing::warn!(
-                        "Cached piece {} has empty file on disk; invalidating cache",
-                        piece_key
-                    );
-                }
-                // Either file read failed or data was empty:
-                // fall through to read_piece from libtorrent.
-            } else if cache.has_piece_on_disk(piece_key) {
-                let piece_path = cache.piece_path(piece_key);
-                let data = std::fs::read(&piece_path).map_err(|e| {
-                    TorrentError::IoError(format!(
-                        "Failed to read cached piece {} from disk: {}",
-                        piece_key, e
-                    ))
-                })?;
-                if !data.is_empty() {
-                    tracing::debug!(
-                        "read_file_range: piece {} read from disk (not in metadata), size={}",
-                        piece_idx,
-                        data.len()
-                    );
-                    if let Err(e) = cache.add_piece(piece_key, data.len() as u64) {
+                    Ok(_) => {
+                        // Empty file on disk — eviction may have raced with
+                        // a concurrent write, or the cached data is corrupt.
+                        // Fall through to libtorrent slow path.
                         tracing::warn!(
-                            "Failed to register on-disk piece {} in cache metadata: {:?}",
+                            "Cached piece {} has empty file on disk; \
+                             falling through to read_piece",
+                            piece_key
+                        );
+                    }
+                    Err(e) => {
+                        // File read failed — the most likely cause is a
+                        // concurrent eviction removing the file between
+                        // has_piece{_on_disk} and fs::read.  Instead of
+                        // hard-failing with IoError (which used to happen
+                        // on the has_piece_on_disk branch), fall through
+                        // to libtorrent slow path.
+                        tracing::warn!(
+                            "Failed to read cached piece {} from disk: {}; \
+                             falling through to read_piece (likely eviction race)",
                             piece_key,
                             e
                         );
                     }
-                    return Ok(data);
                 }
-                // Empty file — fall through to read_piece.
-                tracing::warn!(
-                    "On-disk piece {} is empty; falling through to read_piece",
-                    piece_key
-                );
             }
-        } // cache lock released here
+        }
 
         // ── Fallback to libtorrent read_piece with PieceNotReady retry ──
         let max_retries = 3u32;
