@@ -64,3 +64,32 @@ fn settings_work_with_custom_storage_session() {
         assert_setting(&session, "enable_dht", false);
     });
 }
+
+/// Regression test for TSI-2042: verify that an unwritable cache directory
+/// causes session creation to fail gracefully instead of SIGSEGV.
+///
+/// Uses a file-as-directory-blocker: create a regular file at a path
+/// component inside the cache dir so that ensure_dir_recursive() fails
+/// with ENOTDIR.  This works under root (CAP_DAC_OVERRIDE doesn't help
+/// against ENOTDIR) and unprivileged users alike.
+#[test]
+fn custom_storage_readonly_dir_rejected() {
+    let dir = tempfile::TempDir::new().unwrap();
+
+    // Place a regular file where a directory component of the cache path
+    // would be.  ensure_dir_recursive will fail because mkdir(2) on a
+    // path whose prefix is a regular file returns ENOTDIR.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"").unwrap();
+
+    let cache_dir = blocker.join("pieces");
+
+    with_large_stack(move || {
+        let config = TorrentfsConfig::default_config();
+        let result = Session::new_with_custom_storage(&config, &cache_dir);
+        assert!(
+            result.is_err(),
+            "Expected Session::new_with_custom_storage to fail when a path component is a regular file"
+        );
+    });
+}

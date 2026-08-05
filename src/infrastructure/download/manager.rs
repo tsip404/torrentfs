@@ -346,10 +346,13 @@ impl DownloadManager {
 
             // Collect piece paths while holding the lock (cheap).
             let pieces: Vec<(i32, String, u64, usize)> = {
-                let cache = self.cache_manager.lock().map_err(|_| TorrentError::Unknown {
-                    code: -1,
-                    message: "Cache lock poisoned".to_string(),
-                })?;
+                let cache = self
+                    .cache_manager
+                    .lock()
+                    .map_err(|_| TorrentError::Unknown {
+                        code: -1,
+                        message: "Cache lock poisoned".to_string(),
+                    })?;
                 (start_piece..=end_piece)
                     .map(|idx| {
                         let piece_key = Self::make_piece_key(&info_hash, idx);
@@ -363,7 +366,12 @@ impl DownloadManager {
                         } else {
                             0
                         };
-                        (idx, path.to_string_lossy().into_owned(), local_start, chunk_size)
+                        (
+                            idx,
+                            path.to_string_lossy().into_owned(),
+                            local_start,
+                            chunk_size,
+                        )
                     })
                     .collect()
             }; // cache lock released here
@@ -409,7 +417,8 @@ impl DownloadManager {
                         if let Err(e) = seeding.mark_piece_available(&info_hash, *idx) {
                             tracing::warn!(
                                 "Fast-path: failed to mark piece {} available: {:?}",
-                                idx, e
+                                idx,
+                                e
                             );
                         }
                     }
@@ -427,7 +436,8 @@ impl DownloadManager {
             if size > 0 && bytes_read < size as usize {
                 tracing::debug!(
                     "Fast-path short read ({} < {}), falling back to slow path",
-                    bytes_read, size
+                    bytes_read,
+                    size
                 );
                 break 'fast None;
             }
@@ -439,7 +449,8 @@ impl DownloadManager {
                         if let Err(e) = cache.record_access(key) {
                             tracing::warn!(
                                 "Fast-path: failed to record cache access for {}: {:?}",
-                                key, e
+                                key,
+                                e
                             );
                         }
                     }
@@ -793,8 +804,7 @@ impl DownloadManager {
                     message: "Cache lock poisoned".to_string(),
                 })?;
                 let in_metadata = cache.has_piece(piece_key);
-                let on_disk =
-                    in_metadata || cache.has_piece_on_disk(piece_key);
+                let on_disk = in_metadata || cache.has_piece_on_disk(piece_key);
 
                 if !on_disk {
                     // Not in cache at all — release lock and fall through.
@@ -824,7 +834,8 @@ impl DownloadManager {
                             if let Err(e) = cache.add_piece(piece_key, data.len() as u64) {
                                 tracing::warn!(
                                     "Failed to register on-disk piece {} in cache metadata: {:?}",
-                                    piece_key, e
+                                    piece_key,
+                                    e
                                 );
                             }
                         } else {
@@ -837,13 +848,15 @@ impl DownloadManager {
                             if let Err(e) = cache.record_access(piece_key) {
                                 tracing::warn!(
                                     "Failed to record cache access for {}: {:?}",
-                                    piece_key, e
+                                    piece_key,
+                                    e
                                 );
                             }
                         }
                         tracing::debug!(
                             "read_file_range: piece {} read from disk cache, size={}",
-                            piece_idx, data.len()
+                            piece_idx,
+                            data.len()
                         );
                         return Ok(data);
                     }
@@ -934,17 +947,19 @@ impl DownloadManager {
 
     /// Read a byte range from an already-open piece file.  Used by the
     /// fast path to avoid holding the cache lock during disk I/O.
-    fn read_file_offset(file: &mut std::fs::File, offset: u64, size: usize) -> TorrentResult<Vec<u8>> {
+    fn read_file_offset(
+        file: &mut std::fs::File,
+        offset: u64,
+        size: usize,
+    ) -> TorrentResult<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
         if offset > 0 {
-            file.seek(SeekFrom::Start(offset)).map_err(|e| {
-                TorrentError::IoError(format!("Fast-path seek error: {}", e))
-            })?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| TorrentError::IoError(format!("Fast-path seek error: {}", e)))?;
         }
         let mut buf = vec![0u8; size];
-        file.read_exact(&mut buf).map_err(|e| {
-            TorrentError::IoError(format!("Fast-path read error: {}", e))
-        })?;
+        file.read_exact(&mut buf)
+            .map_err(|e| TorrentError::IoError(format!("Fast-path read error: {}", e)))?;
         Ok(buf)
     }
 }
