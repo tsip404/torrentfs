@@ -255,7 +255,11 @@ fn test_transient_peer_fast_exit() {
     let mut config = local_test_config();
     // Short timeout to test fast exit — the downloader should fail
     // much sooner than this via the transient-peer detection.
-    config.timeouts.read_timeout_secs = Some(15);
+    // With TSI-2039, the inner piece-wait pre-check enters the wait loop
+    // instead of returning NoPeers immediately. Combined with the peer
+    // discovery wait (capped at min(timeout, 9)), the total worst-case is
+    // ~peer_wait + piece_wait_grace. Use a short timeout to keep total <10s.
+    config.timeouts.read_timeout_secs = Some(3);
 
     let mut dm = torrentfs::download::DownloadManager::new(cache_dir.path(), &config)
         .expect("Failed to create DownloadManager");
