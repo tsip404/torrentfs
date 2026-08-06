@@ -567,6 +567,38 @@ impl TestHarness {
             thread::sleep(Duration::from_millis(200));
         }
 
+        // After the seeder is ready, wait for it to complete at least one
+        // more announce cycle.  On slow CI hardware the tracker may still
+        // be returning stale peer lists from the CheckingFiles phase;
+        // forcing one extra announce ensures the downloader will see the
+        // seeder as a peer when it queries the tracker.
+        {
+            let start = std::time::Instant::now();
+            let announce_timeout = Duration::from_secs(15);
+            let target = tracker.announce_count() + 1;
+            loop {
+                if tracker.announce_count() >= target {
+                    eprintln!(
+                        "TestHarness: seeder re-announced ({} total announces)",
+                        tracker.announce_count()
+                    );
+                    break;
+                }
+                if start.elapsed() > announce_timeout {
+                    eprintln!(
+                        "TestHarness: timeout waiting for seeder re-announce (got {}, wanted {})",
+                        tracker.announce_count(),
+                        target
+                    );
+                    break;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+
+        // Extra grace period for network stack to stabilize on slow CI.
+        thread::sleep(Duration::from_secs(2));
+
         TestHarness {
             tracker,
             seed_dir,

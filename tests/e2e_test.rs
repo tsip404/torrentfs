@@ -134,6 +134,10 @@ fn test_read_file_range_with_test_harness() {
     let dl_info = torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
         .expect("Failed to parse torrent for downloader");
 
+    // Brief settle — the TestHarness seeder has announced,
+    // but on slow CI the tracker's peer list may still be stale.
+    thread::sleep(Duration::from_secs(1));
+
     println!("Downloader: attempting read_file_range...");
 
     let dl_timeout = Duration::from_secs(60);
