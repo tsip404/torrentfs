@@ -192,6 +192,47 @@ impl DownloadManager {
         }
     }
 
+    /// TSI-2048: validate that a piece in cache metadata is genuinely
+    /// complete.  Two conditions must both be true:
+    /// 1. The piece was registered via `add_piece` (called after a
+    ///    successful libtorrent `read_piece`), NOT merely discovered by
+    ///    `scan_pieces_subdirectory` at startup.
+    /// 2. The registered size meets the expected piece length.
+    ///
+    /// A sparse file with the correct logical size but zero-filled
+    /// holes (from out-of-order writes + crash) would pass condition 2
+    /// alone but fail condition 1 — `scan_pieces_subdirectory` never
+    /// marks pieces as verified.
+    fn is_piece_complete_in_cache(
+        cache: &crate::cache::CacheManager,
+        piece_key: &str,
+        piece_idx: i32,
+        piece_length: u64,
+        num_pieces: i32,
+        total_size: u64,
+    ) -> bool {
+        // Condition 1: must be verified (from add_piece, not scan).
+        if !cache.is_piece_verified(piece_key) {
+            return false;
+        }
+        // Condition 2: registered size must meet expected length.
+        if let Some(size) = cache.piece_metadata_size(piece_key) {
+            let expected = if piece_idx == num_pieces - 1 {
+                let remainder = total_size.saturating_sub(((num_pieces - 1) as u64) * piece_length);
+                if remainder > 0 {
+                    remainder
+                } else {
+                    piece_length
+                }
+            } else {
+                piece_length
+            };
+            size >= expected
+        } else {
+            false
+        }
+    }
+
     pub fn read_file_range(
         &mut self,
         info: &crate::TorrentInfo,
@@ -256,6 +297,7 @@ impl DownloadManager {
         let (handle_piece_length, handle_num_pieces) = handle_guard.get_torrent_info()?;
         let piece_length = handle_piece_length as u64;
         let num_pieces = handle_num_pieces as i32;
+        let total_size = info.total_size();
 
         let file_start_offset = piece_info.file_offset as u64;
         let absolute_offset = file_start_offset + offset;
@@ -322,9 +364,21 @@ impl DownloadManager {
             let mut all_available = true;
             for piece_idx in start_piece..=end_piece {
                 let piece_key = Self::make_piece_key(&info_hash, piece_idx);
+                // TSI-2048: only trust have_piece (libtorrent authoritative)
+                // or cache metadata where the registered piece size matches
+                // the expected piece length.  scan_pieces_subdirectory
+                // registers every on-disk file at startup without size
+                // validation; a crash-restart leaves partial files with
+                // wrong sizes that would pass has_piece() alone.
                 if !handle_guard.have_piece(piece_idx)
-                    && !cache.has_piece(&piece_key)
-                    && !cache.has_piece_on_disk(&piece_key)
+                    && !Self::is_piece_complete_in_cache(
+                        &cache,
+                        &piece_key,
+                        piece_idx,
+                        piece_length,
+                        num_pieces,
+                        total_size,
+                    )
                 {
                     all_available = false;
                     break;
@@ -526,9 +580,17 @@ impl DownloadManager {
                 let mut all_found = true;
                 for piece_idx in start_piece..=end_piece {
                     let piece_key = Self::make_piece_key(&info_hash, piece_idx);
-                    if !cache.has_piece(&piece_key)
-                        && !cache.has_piece_on_disk(&piece_key)
-                        && !handle_guard.have_piece(piece_idx)
+                    // TSI-2048: validate cache metadata size matches expected
+                    // piece length; scan_pieces_subdirectory may have
+                    // registered incomplete files from a crash.
+                    if !Self::is_piece_complete_in_cache(
+                        &cache,
+                        &piece_key,
+                        piece_idx,
+                        piece_length,
+                        num_pieces,
+                        total_size,
+                    ) && !handle_guard.have_piece(piece_idx)
                     {
                         all_found = false;
                         break;
@@ -581,11 +643,22 @@ impl DownloadManager {
                             code: -1,
                             message: "Cache lock poisoned".to_string(),
                         })?;
-                    if cache.has_piece(&piece_key) || cache.has_piece_on_disk(&piece_key) {
+                    // TSI-2048: only trust cache metadata when the registered
+                    // size matches the expected piece length.  A partially-
+                    // written sparse file has holes that read as zeros, and
+                    // scan_pieces_subdirectory may have registered incomplete
+                    // files from a crash restart.
+                    if Self::is_piece_complete_in_cache(
+                        &cache,
+                        &piece_key,
+                        piece_idx,
+                        piece_length,
+                        num_pieces,
+                        total_size,
+                    ) {
                         tracing::debug!(
-                            "read_file_range: piece {} found in local disk cache (metadata={}, on_disk={}), skipping download wait",
+                            "read_file_range: piece {} found in cache metadata (size valid, on_disk={} for info), skipping download wait",
                             piece_idx,
-                            cache.has_piece(&piece_key),
                             cache.has_piece_on_disk(&piece_key)
                         );
                         continue;
@@ -689,11 +762,19 @@ impl DownloadManager {
                                     code: -1,
                                     message: "Cache lock poisoned".to_string(),
                                 })?;
-                        if cache.has_piece(&piece_key) || cache.has_piece_on_disk(&piece_key) {
+                        // TSI-2048: validate metadata size matches expected
+                        // piece length before trusting the cache hit.
+                        if Self::is_piece_complete_in_cache(
+                            &cache,
+                            &piece_key,
+                            piece_idx,
+                            piece_length,
+                            num_pieces,
+                            total_size,
+                        ) {
                             tracing::debug!(
-                                "read_file_range: piece {} found in cache during wait (metadata={}, on_disk={}) after {:.1}s",
+                                "read_file_range: piece {} validated in cache during wait (size ok, on_disk={} for info) after {:.1}s",
                                 piece_idx,
-                                cache.has_piece(&piece_key),
                                 cache.has_piece_on_disk(&piece_key),
                                 piece_wait_start.elapsed().as_secs_f64()
                             );
@@ -803,48 +884,24 @@ impl DownloadManager {
                     code: -1,
                     message: "Cache lock poisoned".to_string(),
                 })?;
-                let in_metadata = cache.has_piece(piece_key);
-                let on_disk = in_metadata || cache.has_piece_on_disk(piece_key);
-
-                if !on_disk {
-                    // Not in cache at all — release lock and fall through.
+                // TSI-2048: only read from cache when the piece is
+                // registered in metadata.  Metadata registration is only
+                // done after a verified successful download (add_piece via
+                // read_piece fallback) — never from bare file existence.
+                if !cache.has_piece(piece_key) {
                     None
                 } else {
-                    // Compute path while holding the lock (cheap).
                     let path = cache.piece_path(piece_key);
                     drop(cache); // release lock before disk I/O
-                    if in_metadata {
-                        Some((path, true))
-                    } else {
-                        Some((path, false))
-                    }
+                    Some(path)
                 }
             };
 
-            if let Some((piece_path, in_metadata)) = piece_path {
+            if let Some(piece_path) = piece_path {
                 match std::fs::read(&piece_path) {
                     Ok(data) if !data.is_empty() => {
-                        if !in_metadata {
-                            // Register on-disk piece in metadata.
-                            let mut cache =
-                                cache_manager.lock().map_err(|_| TorrentError::Unknown {
-                                    code: -1,
-                                    message: "Cache lock poisoned".to_string(),
-                                })?;
-                            if let Err(e) = cache.add_piece(piece_key, data.len() as u64) {
-                                tracing::warn!(
-                                    "Failed to register on-disk piece {} in cache metadata: {:?}",
-                                    piece_key,
-                                    e
-                                );
-                            }
-                        } else {
-                            // Record access for LRU.
-                            let mut cache =
-                                cache_manager.lock().map_err(|_| TorrentError::Unknown {
-                                    code: -1,
-                                    message: "Cache lock poisoned".to_string(),
-                                })?;
+                        // Record access for LRU.
+                        if let Ok(mut cache) = cache_manager.lock() {
                             if let Err(e) = cache.record_access(piece_key) {
                                 tracing::warn!(
                                     "Failed to record cache access for {}: {:?}",
