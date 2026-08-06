@@ -54,6 +54,35 @@ impl From<std::io::Error> for TorrentError {
 
 pub type TorrentResult<T> = Result<T, TorrentError>;
 
+/// Classifies a read error as transient (should retry) or permanent.
+///
+/// Returns `true` for errors that are likely to resolve on retry:
+/// - `PieceNotReady` — piece data not yet available
+/// - `NoPeers` — no peers connected, may connect later
+/// - `Timeout` — operation timed out, may succeed on retry
+/// - `IoError` — transient I/O issues (disk busy, network flake)
+/// - `Unknown` — unknown errors from libtorrent, may be temporary
+///
+/// Returns `false` for permanent errors that retrying won't fix:
+/// - `InvalidFile` — path/format issues
+/// - `ParseError` — bdecode / data corruption
+/// - `NullPointer` — internal unrecoverable null
+///
+/// This is intentionally broader than `TorrentError::is_transient()`:
+/// `IoError` and `Unknown` are treated as transient here because the
+/// read retry loop runs under a budget and I/O flakes / unknown libtorrent
+/// errors often resolve on a subsequent attempt.
+pub fn is_transient_read_error(err: &TorrentError) -> bool {
+    matches!(
+        err,
+        TorrentError::PieceNotReady(_)
+            | TorrentError::NoPeers(_)
+            | TorrentError::Timeout(_)
+            | TorrentError::IoError(_)
+            | TorrentError::Unknown { .. }
+    )
+}
+
 /// Convert a C `lt_error_t` pointer into a `TorrentError`.
 ///
 /// # Safety
@@ -217,5 +246,187 @@ mod tests {
         let err = unsafe { make_lt_error("some random error text") };
         let result = unsafe { error_from_c(&err) };
         assert!(matches!(result, TorrentError::Unknown { .. }));
+    }
+
+    // ── is_transient_read_error — transient (should return true) ──
+
+    #[test]
+    fn test_piece_not_ready_is_transient() {
+        let err = TorrentError::PieceNotReady("piece 42 not available".into());
+        assert!(
+            is_transient_read_error(&err),
+            "PieceNotReady should be transient"
+        );
+    }
+
+    #[test]
+    fn test_no_peers_is_transient() {
+        let err = TorrentError::NoPeers("tracker returned 0 peers".into());
+        assert!(is_transient_read_error(&err), "NoPeers should be transient");
+    }
+
+    #[test]
+    fn test_timeout_is_transient() {
+        let err = TorrentError::Timeout("timed out".into());
+        assert!(is_transient_read_error(&err), "Timeout should be transient");
+    }
+
+    #[test]
+    fn test_io_error_is_transient() {
+        let err = TorrentError::IoError("disk busy".into());
+        assert!(is_transient_read_error(&err), "IoError should be transient");
+    }
+
+    #[test]
+    fn test_unknown_is_transient() {
+        let err = TorrentError::Unknown {
+            code: 42,
+            message: "something went wrong".into(),
+        };
+        assert!(is_transient_read_error(&err), "Unknown should be transient");
+    }
+
+    #[test]
+    fn test_unknown_zero_code_is_transient() {
+        let err = TorrentError::Unknown {
+            code: 0,
+            message: String::new(),
+        };
+        assert!(
+            is_transient_read_error(&err),
+            "Unknown with code 0 should be transient"
+        );
+    }
+
+    // ── is_transient_read_error — non-transient (should return false) ──
+
+    #[test]
+    fn test_invalid_file_is_not_transient() {
+        let err = TorrentError::InvalidFile("path not found".into());
+        assert!(
+            !is_transient_read_error(&err),
+            "InvalidFile should NOT be transient"
+        );
+    }
+
+    #[test]
+    fn test_parse_error_is_not_transient() {
+        let err = TorrentError::ParseError("bdecode failed".into());
+        assert!(
+            !is_transient_read_error(&err),
+            "ParseError should NOT be transient"
+        );
+    }
+
+    #[test]
+    fn test_null_pointer_is_not_transient() {
+        let err = TorrentError::NullPointer;
+        assert!(
+            !is_transient_read_error(&err),
+            "NullPointer should NOT be transient"
+        );
+    }
+
+    // ── is_transient_read_error — edge cases ──
+
+    #[test]
+    fn test_empty_piece_not_ready() {
+        let err = TorrentError::PieceNotReady(String::new());
+        assert!(
+            is_transient_read_error(&err),
+            "PieceNotReady with empty message should be transient"
+        );
+    }
+
+    #[test]
+    fn test_empty_no_peers() {
+        let err = TorrentError::NoPeers(String::new());
+        assert!(
+            is_transient_read_error(&err),
+            "NoPeers with empty message should be transient"
+        );
+    }
+
+    #[test]
+    fn test_empty_io_error() {
+        let err = TorrentError::IoError(String::new());
+        assert!(
+            is_transient_read_error(&err),
+            "IoError with empty message should be transient"
+        );
+    }
+
+    #[test]
+    fn test_empty_invalid_file() {
+        let err = TorrentError::InvalidFile(String::new());
+        assert!(
+            !is_transient_read_error(&err),
+            "InvalidFile with empty message should NOT be transient"
+        );
+    }
+
+    #[test]
+    fn test_empty_parse_error() {
+        let err = TorrentError::ParseError(String::new());
+        assert!(
+            !is_transient_read_error(&err),
+            "ParseError with empty message should NOT be transient"
+        );
+    }
+
+    #[test]
+    fn test_negative_unknown_code() {
+        let err = TorrentError::Unknown {
+            code: -1,
+            message: "error".into(),
+        };
+        assert!(
+            is_transient_read_error(&err),
+            "Unknown with negative code should be transient"
+        );
+    }
+
+    // ── Classification completeness contract ──
+    // Helper with exhaustive match — adding a new TorrentError variant
+    // causes a compile-time error here, forcing the author to classify it.
+    fn classify_via_match(err: &TorrentError) -> bool {
+        match err {
+            TorrentError::PieceNotReady(_)
+            | TorrentError::NoPeers(_)
+            | TorrentError::Timeout(_)
+            | TorrentError::IoError(_)
+            | TorrentError::Unknown { .. } => true,
+            TorrentError::InvalidFile(_)
+            | TorrentError::ParseError(_)
+            | TorrentError::NullPointer => false,
+        }
+    }
+
+    #[test]
+    fn test_all_variants_covered_explicitly() {
+        // Every variant must be reachable in the exhaustive match above,
+        // and is_transient_read_error must agree with it on every variant.
+        let variants: &[TorrentError] = &[
+            TorrentError::PieceNotReady("p".into()),
+            TorrentError::NoPeers("n".into()),
+            TorrentError::Timeout("t".into()),
+            TorrentError::IoError("i".into()),
+            TorrentError::Unknown {
+                code: 1,
+                message: "u".into(),
+            },
+            TorrentError::InvalidFile("f".into()),
+            TorrentError::ParseError("p".into()),
+            TorrentError::NullPointer,
+        ];
+
+        for err in variants {
+            assert_eq!(
+                is_transient_read_error(err),
+                classify_via_match(err),
+                "mismatch for variant: {:?}",
+                err
+            );
+        }
     }
 }

@@ -25,7 +25,7 @@ pub use domain::{
 };
 
 // other re-exports
-pub use error::{TorrentError, TorrentResult};
+pub use error::{is_transient_read_error, TorrentError, TorrentResult};
 pub use fuse::TorrentFs;
 pub use seeding::{SeedingInfo, SeedingManager, SeedingState};
 pub use services::download::DownloadService;

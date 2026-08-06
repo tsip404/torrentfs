@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::cache::CacheManager;
 use crate::config::TorrentfsConfig;
-use crate::error::{TorrentError, TorrentResult};
+use crate::error::{is_transient_read_error, TorrentError, TorrentResult};
 use crate::seeding::SeedingManager;
 
 use super::session::{Session, TorrentHandle};
@@ -934,7 +934,7 @@ impl DownloadManager {
             }
         } // cache lock released here
 
-        // ── Fallback to libtorrent read_piece with PieceNotReady retry ──
+        // ── Fallback to libtorrent read_piece with transient-error retry ──
         let max_retries = 3u32;
         for retry in 0..=max_retries {
             match handle_guard.read_piece(session, piece_idx) {
@@ -957,13 +957,14 @@ impl DownloadManager {
                     }
                     return Ok(data);
                 }
-                Err(TorrentError::PieceNotReady(_)) => {
+                Err(ref e) if is_transient_read_error(e) => {
                     if retry < max_retries {
                         tracing::debug!(
-                            "Piece {} not ready (retry {}/{}), waiting 200ms",
+                            "Piece {} read error (retry {}/{}): {:?}, waiting 200ms",
                             piece_idx,
                             retry + 1,
-                            max_retries
+                            max_retries,
+                            e
                         );
                         std::thread::sleep(std::time::Duration::from_millis(200));
                         continue;
