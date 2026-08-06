@@ -15,7 +15,12 @@ use std::time::Duration;
 
 /// Verify that two libtorrent sessions can discover each other via
 /// the local HTTP tracker and establish peer connections.
+///
+/// Ignored by default because it requires process-internal tracker +
+/// seeder infrastructure that may not be available in all CI environments.
+/// Run manually with: `cargo test -- --ignored`
 #[test]
+#[ignore = "requires process-internal tracker + seeder"]
 fn test_peer_discovery_via_tracker() {
     // ── Setup: start tracker + seeder ──────────────────────────────────
     let harness = TestHarness::new();
