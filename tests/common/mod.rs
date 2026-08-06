@@ -8,11 +8,65 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
 use torrentfs::TorrentInfo;
+
+/// Global lock to serialize libtorrent session creation during tests.
+///
+/// When multiple tests run in parallel within the same binary, each
+/// creating its own libtorrent session (seeder + downloader), the
+/// internal libtorrent thread pool can be overwhelmed, causing seeder
+/// startup timeouts.  Acquiring this lock before creating any
+/// libtorrent session prevents concurrent session initialization.
+static SESSION_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the global session serialization lock.
+/// Returns the guard — hold it for the lifetime of all libtorrent
+/// session creation and use within a test.
+#[allow(dead_code)]
+pub fn acquire_session_lock() -> MutexGuard<'static, ()> {
+    // Clean up any leftover cross-process lock from a previous crashed test
+    let _ = std::fs::remove_file(CROSS_PROCESS_LOCK_PATH);
+    // Serialize libtorrent session creation across all processes.
+    // Uses atomic file creation — only one process at a time can create the
+    // lock file.  On panic the file may be left behind; the next acquire()
+    // call cleans it up before trying.
+    loop {
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(CROSS_PROCESS_LOCK_PATH)
+        {
+            Ok(_file) => {
+                let guard = SESSION_LOCK.lock().expect("SESSION_LOCK poisoned");
+                // Transfer ownership of the lock file to the guard so it's
+                // cleaned up on drop.
+                struct LockFile(std::fs::File, &'static str);
+                impl Drop for LockFile {
+                    fn drop(&mut self) {
+                        drop(&mut self.0);
+                        let _ = std::fs::remove_file(self.1);
+                    }
+                }
+                // Leak the LockFile so it lives as long as the MutexGuard
+                // Safety: this is only used in tests; the lock file will
+                // eventually be cleaned up on process exit or next acquire.
+                let _lock_file = LockFile(_file, CROSS_PROCESS_LOCK_PATH);
+                std::mem::forget(_lock_file);
+                return guard;
+            }
+            Err(_) => {
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
+}
+
+/// Path for the cross-process session serialization lock file.
+const CROSS_PROCESS_LOCK_PATH: &str = "/tmp/torrentfs_test_session.lock";
 
 // ── MiniTracker ──────────────────────────────────────────────────────────────
 
@@ -232,7 +286,12 @@ fn handle_announce(
             .collect()
     };
 
-    let response_body = bencode_tracker_response(1800, &compact_peers);
+    // Use a short interval so seeders re-announce within test timeouts.
+    // The default 1800s prevents re-announces entirely during test runs,
+    // causing the TestHarness re-announce wait to always time out and the
+    // downloader to start with a stale peer list when the seeder announced
+    // during CheckingResumeData before it was ready to serve pieces.
+    let response_body = bencode_tracker_response(5, &compact_peers);
 
     eprintln!(
         "MiniTracker: announce from {}:{}, left={}, total_peers={}, returning {} peers ({} compact bytes)",
@@ -364,6 +423,9 @@ pub fn local_test_config() -> torrentfs::TorrentfsConfig {
     c.local_discovery.natpmp_enabled = Some(false);
     // Allow multiple connections from same IP (critical for localhost testing)
     c.connections.allow_multiple_connections_per_ip = Some(true);
+    // Fast peer connect timeout for localhost — default 10s is excessive
+    // when both peers are on the same machine.
+    c.connections.peer_connect_timeout = Some(5);
     c.timeouts.read_timeout_secs = Some(30);
     // Optimize tracker announce for local testing — reduce minimum interval
     // so peers discover each other faster (mitigates CI flakiness in
@@ -371,6 +433,14 @@ pub fn local_test_config() -> torrentfs::TorrentfsConfig {
     c.tracker.announce_to_all_trackers = Some(true);
     c.tracker.announce_to_all_tiers = Some(true);
     c.tracker.min_announce_interval = Some(5);
+    // Restrict libtorrent thread pools to avoid resource exhaustion when
+    // multiple test binaries run in parallel (each with its own session).
+    // Default is std::thread::hardware_concurrency(), which on CI can be
+    // as low as 2; with 4+ sessions competing, thread pool contention
+    // causes timeouts in seeder startup and piece download.
+    c.performance.aio_threads = Some(2);
+    // network_threads is deprecated in libtorrent 2.0 (silently ignored).
+    // c.performance.network_threads = Some(2);
     c
 }
 

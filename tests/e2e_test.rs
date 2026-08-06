@@ -52,6 +52,10 @@ fn test_torrent_info_from_bytes() {
 
 #[test]
 fn test_read_file_range_with_local_seed() {
+    // Serialize libtorrent session creation to avoid resource contention
+    // when multiple tests run in parallel within the same binary.
+    let _session_guard = common::acquire_session_lock();
+
     use std::fs;
     use torrentfs::download::DownloadManager;
 
@@ -72,8 +76,10 @@ fn test_read_file_range_with_local_seed() {
     println!("  Piece length: {}", info.piece_length());
     println!("  Num pieces: {}", info.num_pieces());
 
-    let mut dm = DownloadManager::new(&cache_dir, &torrentfs::TorrentfsConfig::default_config())
-        .expect("Failed to create download manager");
+    // Use test config with thread limits to avoid resource contention
+    let config = common::local_test_config();
+    let mut dm =
+        DownloadManager::new(&cache_dir, &config).expect("Failed to create download manager");
 
     let info_hash = hex::encode(info.info_hash().expect("Failed to get info hash"));
     let torrent_cache_dir = cache_dir.join(&info_hash);

@@ -18,6 +18,10 @@ use std::time::Duration;
 /// validating that the lazy-loading flow works end-to-end.
 #[test]
 fn test_read_file_range_with_local_seeder() {
+    // Serialize libtorrent session creation to avoid resource contention
+    // when multiple tests run in parallel within the same binary.
+    let _session_guard = common::acquire_session_lock();
+
     // ── Setup: start tracker + seeder ──────────────────────────────────
     let harness = TestHarness::new();
 
@@ -91,6 +95,10 @@ fn test_read_file_range_with_local_seeder() {
 /// combinations, validating boundary handling.
 #[test]
 fn test_read_file_range_boundaries() {
+    // Serialize libtorrent session creation to avoid resource contention
+    // when multiple tests run in parallel within the same binary.
+    let _session_guard = common::acquire_session_lock();
+
     let harness = TestHarness::new();
 
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
