@@ -729,58 +729,18 @@ impl DownloadManager {
                             Ok(s) => {
                                 status = s;
                                 last_status_check = std::time::Instant::now();
-                                if status.num_peers == 0 && status.num_seeds == 0 {
-                                    let grace_period = std::time::Duration::from_secs(
-                                        std::cmp::min(self.read_timeout_secs, 10),
-                                    );
-                                    if piece_wait_start.elapsed() >= grace_period {
-                                        // Before bailing out, check if the piece
-                                        // was already downloaded to disk but
-                                        // libtorrent hasn't finished async_hash
-                                        // verification yet.  In that window
-                                        // have_piece() returns false and peers
-                                        // may have already disconnected after
-                                        // sending the data, creating a false
-                                        // NoPeers signal.
-                                        {
-                                            let cache =
-                                                self.cache_manager.lock().map_err(|_| {
-                                                    TorrentError::Unknown {
-                                                        code: -1,
-                                                        message: "Cache lock poisoned".to_string(),
-                                                    }
-                                                })?;
-                                            if Self::is_piece_complete_in_cache(
-                                                &cache,
-                                                &piece_key,
-                                                piece_idx,
-                                                piece_length,
-                                                num_pieces,
-                                                total_size,
-                                            ) {
-                                                tracing::debug!(
-                                                    "read_file_range: piece {} found in cache \
-                                                     during NoPeers check, breaking wait loop",
-                                                    piece_idx
-                                                );
-                                                break;
-                                            }
-                                        }
-                                        return Err(TorrentError::NoPeers(format!(
-                                            "Peers dropped to 0 while waiting for piece {}. \
-                                             Torrent progress: {:.2}%, state: {:?}",
-                                            piece_idx,
-                                            status.progress * 100.0,
-                                            status.state
-                                        )));
-                                    }
-                                    tracing::debug!(
-                                        "read_file_range: piece {} peers=0 but within grace period ({:.1}s elapsed of {:.1}s), continuing wait",
-                                        piece_idx,
-                                        piece_wait_start.elapsed().as_secs_f64(),
-                                        grace_period.as_secs_f64()
-                                    );
-                                }
+                                // Don't bail out early on zero peers — the piece
+                                // deadline is set and libtorrent is actively
+                                // downloading.  The piece may already be on disk
+                                // (custom storage wrote it) but have_piece() is
+                                // still false because async_hash hasn't
+                                // completed.  Let the full read_timeout_secs
+                                // expire before giving up.
+                                tracing::debug!(
+                                    "read_file_range: piece {} status refresh: peers={}, seeds={}, progress={:.2}%",
+                                    piece_idx, status.num_peers, status.num_seeds,
+                                    status.progress * 100.0
+                                );
                             }
                             Err(_) => {}
                         }

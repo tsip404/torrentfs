@@ -30,7 +30,9 @@ static SESSION_LOCK: Mutex<()> = Mutex::new(());
 /// the `aio_threads=2` limit in `local_test_config()`.
 #[allow(dead_code)]
 pub fn acquire_session_lock() -> MutexGuard<'static, ()> {
-    SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    SESSION_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 // ── MiniTracker ──────────────────────────────────────────────────────────────
@@ -131,6 +133,20 @@ impl MiniTracker {
     pub fn announce_count(&self) -> u64 {
         *self.announce_count.lock().unwrap()
     }
+
+    /// Check whether the tracker has at least one peer registered for
+    /// the given info_hash.  Used by TestHarness to verify that the
+    /// seeder is actually discoverable before letting the downloader
+    /// start — avoids a race where announce_count is incremented before
+    /// the peer is inserted into the HashMap.
+    pub fn peer_count(&self, info_hash: &[u8; 20]) -> usize {
+        self.peers
+            .lock()
+            .unwrap()
+            .get(info_hash)
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
 }
 
 impl Drop for MiniTracker {
@@ -216,15 +232,21 @@ fn handle_announce(
     // Parse the `left` parameter to determine if this is a seeder or leecher
     let left: u64 = params.get("left").and_then(|v| v.parse().ok()).unwrap_or(0);
 
-    // Register this peer
+    // Register this peer — update any existing entry for the same
+    // (ip, port) so that a seeder transitioning from left=16384
+    // (CheckingResumeData) to left=0 (Seeding) doesn't leave behind
+    // a stale leecher entry that can collide with the downloader's
+    // identity and get filtered out.
     let peer_count: usize = {
         let mut map = peers.lock().unwrap();
         let entry = map.entry(info_hash).or_default();
 
-        // Deduplicate by ip:port AND left — two clients on the same IP:port
-        // with different `left` values are distinct (seeder vs downloader).
-        // This fixes TSI-1977 where both seeder and downloader on localhost
-        // may share the same port, causing the tracker to incorrectly merge them.
+        // Remove any old entries for this (ip, port) pair
+        entry.retain(|p| !(p.ip == peer_ip && p.port == port));
+
+        // Deduplicate by ip:port AND left — two distinct clients on the
+        // same IP:port with different `left` values (seeder vs downloader)
+        // must both be kept.  This fixes TSI-1977.
         let already_exists = entry
             .iter()
             .any(|p| p.ip == peer_ip && p.port == port && p.left == left);
@@ -624,6 +646,30 @@ impl TestHarness {
                         "TestHarness: timeout waiting for seeder re-announce (got {}, wanted {})",
                         tracker.announce_count(),
                         target
+                    );
+                    break;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        }
+
+        // Verify the seeder actually appears in the tracker's peer
+        // list.  On slow CI, announce_count may have been incremented
+        // before the peer was inserted into the HashMap — if we proceed
+        // too early the downloader will get an empty peer list.
+        {
+            let info_hash = info.info_hash().expect("Failed to get info hash");
+            let start = std::time::Instant::now();
+            loop {
+                if tracker.peer_count(&info_hash) > 0 {
+                    eprintln!(
+                        "TestHarness: seeder confirmed in tracker peer list"
+                    );
+                    break;
+                }
+                if start.elapsed() > Duration::from_secs(10) {
+                    eprintln!(
+                        "TestHarness: timeout waiting for seeder in peer list"
                     );
                     break;
                 }
