@@ -41,7 +41,13 @@ pub fn acquire_session_lock() -> MutexGuard<'static, ()> {
             .open(CROSS_PROCESS_LOCK_PATH)
         {
             Ok(_file) => {
-                let guard = SESSION_LOCK.lock().expect("SESSION_LOCK poisoned");
+                // Use unwrap_or_else to recover from a poisoned Mutex
+                // (e.g. when a prior test panicked while holding the lock).
+                // The lock state is still consistent — this is a test-only
+                // serialization primitive, not a data-guarding lock.
+                let guard = SESSION_LOCK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 // Transfer ownership of the lock file to the guard so it's
                 // cleaned up on drop.
                 struct LockFile(std::fs::File, &'static str);
