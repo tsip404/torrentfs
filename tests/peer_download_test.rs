@@ -45,6 +45,10 @@ fn test_peer_discovery_via_tracker() {
         .add_torrent(&dl_info, cache_dir.path())
         .expect("Failed to add torrent to downloader session");
 
+    // Brief settle — give the tracker's peer list time to include
+    // the seeder on slow CI hardware.
+    thread::sleep(Duration::from_secs(2));
+
     println!("Downloader: torrent added, waiting for peers...");
 
     // ── Wait for the downloader to discover the seeder ─────────────────

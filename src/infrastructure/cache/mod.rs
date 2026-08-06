@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +23,11 @@ pub struct CacheManager {
     pub miss_count: u64,
     pub hit_count: u64,
     evict_callbacks: Vec<Box<dyn Fn(String, i32) + Send + Sync>>,
+    /// TSI-2048: pieces whose integrity was verified via add_piece
+    /// (called after a successful libtorrent read_piece).  Pieces
+    /// registered solely by scan_pieces_subdirectory at startup are
+    /// NOT in this set — they may be incomplete sparse files.
+    verified_piece_keys: HashSet<String>,
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -49,6 +54,7 @@ impl CacheManager {
             miss_count: 0,
             hit_count: 0,
             evict_callbacks: Vec::new(),
+            verified_piece_keys: HashSet::new(),
         };
 
         manager.rebuild_index()?;
@@ -287,6 +293,11 @@ impl CacheManager {
             self.miss_count += 1;
         }
 
+        // TSI-2048: mark as verified — add_piece is only called after
+        // a successful libtorrent read_piece, which is the authoritative
+        // proof of piece completeness.
+        self.verified_piece_keys.insert(piece_key.to_string());
+
         self.current_size += size;
 
         if self.current_size > self.max_cache_size {
@@ -342,6 +353,7 @@ impl CacheManager {
         }
 
         self.metadata.remove(piece_key);
+        self.verified_piece_keys.remove(piece_key);
 
         self.save_metadata_file()
     }
@@ -423,6 +435,20 @@ impl CacheManager {
 
     pub fn has_piece(&self, piece_key: &str) -> bool {
         self.metadata.contains_key(piece_key)
+    }
+
+    /// Get the registered size for a piece from cache metadata.
+    /// Returns None if the piece is not in metadata.
+    pub fn piece_metadata_size(&self, piece_key: &str) -> Option<u64> {
+        self.metadata.get(piece_key).map(|m| m.size)
+    }
+
+    /// TSI-2048: whether a piece's metadata was registered via add_piece
+    /// (verified by a successful libtorrent read_piece).  Pieces
+    /// registered only by scan_pieces_subdirectory at startup are NOT
+    /// verified — they could be incomplete sparse files from a crash.
+    pub fn is_piece_verified(&self, piece_key: &str) -> bool {
+        self.verified_piece_keys.contains(piece_key)
     }
 
     /// Check if a piece file exists on disk, regardless of whether it is
@@ -834,8 +860,10 @@ mod tests {
         );
         assert!(!cache.has_piece(piece_key), "no metadata registered");
 
-        // If read_file_range hits the else-if branch for has_piece_on_disk,
-        // it will read from disk and get empty data → piece skipped.
+        // TSI-2048: the fast-path no longer consults has_piece_on_disk;
+        // it only trusts metadata (has_piece) with size validation.
+        // An empty file on disk without metadata registration will fall
+        // through to read_piece (the authoritative source).
         let disk_data = std::fs::read(&piece_path)?;
         assert!(disk_data.is_empty());
 
@@ -865,6 +893,130 @@ mod tests {
             cache.has_piece(&piece_key),
             "orphaned disk file should be discovered during rebuild_index"
         );
+
+        Ok(())
+    }
+
+    // ── TSI-2048 regression: restart with partial piece files ─────────
+    //
+    // These tests verify that `scan_pieces_subdirectory`'s blind
+    // registration of every on-disk file does not make incomplete
+    // pieces appear trustworthy.  The fast-path must use
+    // `piece_metadata_size` to validate the registered size against
+    // the expected piece length.
+
+    #[test]
+    fn test_partial_piece_registered_by_scan_has_wrong_size() -> TorrentResult<()> {
+        // Simulates a crash-restart scenario: libtorrent custom storage
+        // wrote only 32 KiB of a 256 KiB piece before the crash.
+        // scan_pieces_subdirectory registers it at the wrong size, which
+        // piece_metadata_size exposes.
+        let temp_dir = TempDir::new().unwrap();
+
+        let info_hash = "tsi2048_partial_hash";
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let pieces_dir = temp_dir.path().join("pieces").join(info_hash);
+        std::fs::create_dir_all(&pieces_dir)?;
+        let piece_path = pieces_dir.join(&piece_key);
+
+        // Write only 32 KiB — partial piece after crash.
+        let partial_data = vec![0xABu8; 32768];
+        std::fs::write(&piece_path, &partial_data)?;
+
+        // Create CacheManager — scan registers the file.
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        // has_piece returns true — the file was blindly registered.
+        assert!(
+            cache.has_piece(&piece_key),
+            "partial piece file is registered in metadata by scan"
+        );
+
+        // But the registered size is only 32 KiB, not 256 KiB.
+        let size = cache
+            .piece_metadata_size(&piece_key)
+            .expect("piece should have metadata");
+        assert_eq!(
+            size, 32768,
+            "registered size should match the partial file, not the expected piece length"
+        );
+
+        // The fast-path's size validation would reject this piece
+        // because 32768 < 262144 (piece_length).
+        assert!(
+            size < 262144,
+            "partial piece size is smaller than expected piece length"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_complete_piece_registered_by_scan_has_correct_size() -> TorrentResult<()> {
+        // A complete piece file (256 KiB) registered by scan has the
+        // right size — BUT it is NOT verified.  The fast-path rejects
+        // unverified pieces even with correct size, because a sparse
+        // file can have the same logical size with zero-filled holes.
+        let temp_dir = TempDir::new().unwrap();
+
+        let info_hash = "tsi2048_complete_hash";
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let pieces_dir = temp_dir.path().join("pieces").join(info_hash);
+        std::fs::create_dir_all(&pieces_dir)?;
+        let piece_path = pieces_dir.join(&piece_key);
+
+        let complete_data = vec![0xCDu8; 262144]; // 256 KiB
+        std::fs::write(&piece_path, &complete_data)?;
+
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        assert!(cache.has_piece(&piece_key));
+
+        let size = cache
+            .piece_metadata_size(&piece_key)
+            .expect("piece should have metadata");
+        assert_eq!(
+            size, 262144,
+            "complete piece registered by scan should have the correct size"
+        );
+
+        // TSI-2048: scanned pieces are NOT verified — only add_piece
+        // (after a successful read_piece) marks them as verified.
+        assert!(
+            !cache.is_piece_verified(&piece_key),
+            "scanned piece should NOT be verified even with correct size"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_piece_verified_after_add_piece() -> TorrentResult<()> {
+        // A piece registered via add_piece (simulating a successful
+        // read_piece) should be marked as verified.  The fast-path
+        // trusts only verified pieces.
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "tsi2048_addpiece:piece:0";
+        let _piece_path = cache.ensure_piece_dir(piece_key)?;
+
+        // Before add_piece: no metadata, not verified.
+        assert!(!cache.has_piece(piece_key));
+        assert!(!cache.is_piece_verified(piece_key));
+
+        // add_piece (called after read_piece succeeds).
+        cache.add_piece(piece_key, 262144)?;
+
+        // After add_piece: has metadata AND verified.
+        assert!(cache.has_piece(piece_key));
+        assert!(
+            cache.is_piece_verified(piece_key),
+            "piece registered via add_piece should be verified"
+        );
+        assert_eq!(cache.piece_metadata_size(piece_key), Some(262144));
 
         Ok(())
     }
