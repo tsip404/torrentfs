@@ -21,6 +21,8 @@
 #include <libtorrent/aux_/vector.hpp>
 #include <cstring>
 #include <cstdlib>
+#include <cerrno>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <memory>
@@ -1080,16 +1082,22 @@ std::string sha1_to_hex(lt::sha1_hash const& h) {
     return std::string(hex, 40);
 }
 
-void ensure_dir_recursive(const std::string& path) {
+static bool ensure_dir_recursive(const std::string& path) {
+    if (path.empty()) return false;
     size_t pos = 0;
     while (pos < path.size()) {
         pos = path.find('/', pos + 1);
         std::string sub = path.substr(0, pos);
         if (!sub.empty()) {
-            mkdir(sub.c_str(), 0755);
+            if (mkdir(sub.c_str(), 0755) != 0 && errno != EEXIST) {
+                fprintf(stderr, "[DIAG] ensure_dir_recursive mkdir(%s) failed: %s\n",
+                        sub.c_str(), strerror(errno));
+                return false;
+            }
         }
         if (pos == std::string::npos) break;
     }
+    return true;
 }
 
 class PieceStorage {
@@ -1097,7 +1105,12 @@ public:
     PieceStorage(const std::string& base_path, const std::string& info_hash_hex)
         : m_base_path(base_path), m_info_hash_hex(info_hash_hex)
     {
-        ensure_dir_recursive(m_base_path + "/" + m_info_hash_hex);
+        std::string full_path = m_base_path + "/" + m_info_hash_hex;
+        if (!ensure_dir_recursive(full_path)) {
+            fprintf(stderr, "[DIAG] PieceStorage: failed to create directory %s\n",
+                    full_path.c_str());
+            throw std::runtime_error("Failed to create piece storage directory: " + full_path);
+        }
     }
 
     std::string get_info_hash_hex() const { return m_info_hash_hex; }
@@ -1127,7 +1140,11 @@ public:
 
     bool write_piece(int piece_index, int offset, const char* buf, int size) {
         std::lock_guard<std::mutex> lock(m_mutex);
-        ensure_dir_recursive(m_base_path + "/" + m_info_hash_hex);
+        if (!ensure_dir_recursive(m_base_path + "/" + m_info_hash_hex)) {
+            fprintf(stderr, "[DIAG] write_piece: ensure_dir_recursive failed for %s/%s\n",
+                    m_base_path.c_str(), m_info_hash_hex.c_str());
+            return false;
+        }
         std::string path = piece_path(piece_index);
         fprintf(stderr, "[DIAG] write_piece piece=%d offset=%d size=%d first4=%02x%02x%02x%02x path=%s\n",
                 piece_index, offset, size,
@@ -1243,7 +1260,14 @@ public:
     PieceStorageDiskIO(lt::io_context& ios, const std::string& piece_cache_dir)
         : m_ios(ios), m_piece_cache_dir(piece_cache_dir)
     {
-        ensure_dir_recursive(piece_cache_dir);
+        if (piece_cache_dir.empty()) {
+            throw std::runtime_error("PieceStorageDiskIO: piece_cache_dir is empty");
+        }
+        if (!ensure_dir_recursive(piece_cache_dir)) {
+            fprintf(stderr, "[DIAG] PieceStorageDiskIO: failed to create cache dir %s\n",
+                    piece_cache_dir.c_str());
+            throw std::runtime_error("Failed to create piece cache directory: " + piece_cache_dir);
+        }
     }
 
     // buffer_allocator_interface
