@@ -178,26 +178,66 @@ impl TorrentFs {
                 EIO
             })?;
 
-            match ds.read_file_range(&info, file_index, offset as u64, size as u32) {
-                Ok(data) => {
-                    info!(
-                        "Successfully read {} bytes from torrent file (torrent_id={}, file_id={})",
-                        data.len(),
-                        torrent_id,
-                        file_id
-                    );
-                    Ok(data)
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to read from BitTorrent network: {}. \
-                         The torrent may have no active peers/seeds. \
-                         Check tracker health with `cat .stats`.",
-                        e
-                    );
-                    Err(EIO)
+            // Retry loop: on cold reads, pieces may not be ready on the first
+            // attempt.  Retry with increasing backoff to give libtorrent time
+            // to download needed pieces — avoids returning EIO prematurely
+            // (TSI-2045).
+            // Only retry on transient errors (PieceNotReady, NoPeers, timeouts,
+            // IoError); permanent errors (InvalidFile, ParseError, NullPointer)
+            // fail immediately.
+            const MAX_READ_RETRIES: u32 = 3;
+            let mut last_err = String::new();
+            for attempt in 0..=MAX_READ_RETRIES {
+                match ds.read_file_range(&info, file_index, offset as u64, size as u32) {
+                    Ok(data) => {
+                        if attempt > 0 {
+                            info!(
+                                "Successfully read {} bytes from torrent file on retry {} \
+                                 (torrent_id={}, file_id={})",
+                                data.len(),
+                                attempt,
+                                torrent_id,
+                                file_id
+                            );
+                        } else {
+                            info!(
+                                "Successfully read {} bytes from torrent file \
+                                 (torrent_id={}, file_id={})",
+                                data.len(),
+                                torrent_id,
+                                file_id
+                            );
+                        }
+                        return Ok(data);
+                    }
+                    Err(e) => {
+                        last_err = e.to_string();
+                        let is_transient = crate::domain::error::is_transient_read_error(&e);
+                        if !is_transient {
+                            warn!("Permanent read error, not retrying: {}", last_err);
+                            return Err(EIO);
+                        }
+                        if attempt < MAX_READ_RETRIES {
+                            let delay = std::time::Duration::from_secs(1u64 << attempt);
+                            warn!(
+                                "Retry {}/{} after {:?}: {}",
+                                attempt + 1,
+                                MAX_READ_RETRIES,
+                                delay,
+                                last_err
+                            );
+                            std::thread::sleep(delay);
+                        }
+                    }
                 }
             }
+            warn!(
+                "Failed to read from BitTorrent network after {} retries: {}. \
+                 The torrent may have no active peers/seeds. \
+                 Check tracker health with `cat .stats`.",
+                MAX_READ_RETRIES, last_err
+            );
+            Err(EIO)
         } else {
             error!("Download manager not available");
             Err(EIO)
