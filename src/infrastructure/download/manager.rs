@@ -229,7 +229,7 @@ impl DownloadManager {
                 | TorrentState::CheckingResumeData
         ) {
             if start.elapsed().as_secs() > max_wait_secs {
-                return Err(TorrentError::InvalidFile(format!(
+                return Err(TorrentError::Timeout(format!(
                     "Torrent stuck in state {:?} for {} seconds",
                     status.state, max_wait_secs
                 )));
@@ -631,7 +631,7 @@ impl DownloadManager {
                 loop {
                     if piece_wait_start.elapsed() >= piece_wait_timeout {
                         status = handle_guard.status()?;
-                        return Err(TorrentError::InvalidFile(format!(
+                        return Err(TorrentError::Timeout(format!(
                             "Timed out waiting for piece {} after {:.0}s. \
                              Torrent progress: {:.2}%, peers: {}, seeds: {}",
                             piece_idx,
