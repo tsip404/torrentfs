@@ -779,6 +779,8 @@ static void apply_int_setting(lt::settings_pack& pack, const std::string& key, i
         // libtorrent 2.0: ssl_listen removed, silently ignored
     } else if (key == "proxy_port") {
         pack.set_int(lt::settings_pack::proxy_port, val);
+    } else if (key == "alert_mask") {
+        pack.set_int(lt::settings_pack::alert_mask, val);
     } else if (key == "alert_queue_size") {
         pack.set_int(lt::settings_pack::alert_queue_size, val);
     } else if (key == "aio_threads") {
@@ -1685,6 +1687,13 @@ lt_session_t lt_session_create_with_custom_storage(
         lt::session_params params;
         if (settings_json && strlen(settings_json) > 0) {
             params.settings = build_settings_pack(settings_json);
+        }
+        // Enable status alerts so session_stats_alert fires and
+        // lt_session_get_stats() does not block, but only if the
+        // user hasn't already configured alert_mask in settings_json.
+        if (!params.settings.has_val(lt::settings_pack::alert_mask)) {
+            params.settings.set_int(lt::settings_pack::alert_mask,
+                lt::alert_category::error | lt::alert_category::status);
         }
         std::string cache_dir(piece_cache_dir);
         params.disk_io_constructor = [cache_dir](lt::io_context& ios,
