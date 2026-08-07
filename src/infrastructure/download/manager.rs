@@ -734,6 +734,39 @@ impl DownloadManager {
                                         std::cmp::min(self.read_timeout_secs, 10),
                                     );
                                     if piece_wait_start.elapsed() >= grace_period {
+                                        // Before bailing out, check if the piece
+                                        // was already downloaded to disk but
+                                        // libtorrent hasn't finished async_hash
+                                        // verification yet.  In that window
+                                        // have_piece() returns false and peers
+                                        // may have already disconnected after
+                                        // sending the data, creating a false
+                                        // NoPeers signal.
+                                        {
+                                            let cache = self.cache_manager.lock().map_err(
+                                                |_| TorrentError::Unknown {
+                                                    code: -1,
+                                                    message:
+                                                        "Cache lock poisoned"
+                                                            .to_string(),
+                                                },
+                                            )?;
+                                            if Self::is_piece_complete_in_cache(
+                                                &cache,
+                                                &piece_key,
+                                                piece_idx,
+                                                piece_length,
+                                                num_pieces,
+                                                total_size,
+                                            ) {
+                                                tracing::debug!(
+                                                    "read_file_range: piece {} found in cache \
+                                                     during NoPeers check, breaking wait loop",
+                                                    piece_idx
+                                                );
+                                                break;
+                                            }
+                                        }
                                         return Err(TorrentError::NoPeers(format!(
                                             "Peers dropped to 0 while waiting for piece {}. \
                                              Torrent progress: {:.2}%, state: {:?}",
