@@ -50,8 +50,9 @@ RUN apt-get update && \
 RUN useradd --create-home --shell /bin/bash torrentfs
 
 COPY --from=builder /torrentfs /usr/local/bin/torrentfs
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
 USER torrentfs
 WORKDIR /home/torrentfs
 
-ENTRYPOINT ["torrentfs"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

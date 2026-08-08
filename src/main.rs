@@ -97,6 +97,17 @@ fn main() {
         None => TorrentfsConfig::default_config(),
     };
 
+    // Early check: /dev/fuse must exist for FUSE mounts to work.
+    // On rootless containers this is the most common failure point.
+    if !std::path::Path::new("/dev/fuse").exists() {
+        error!(
+            "/dev/fuse not found. torrentfs requires the FUSE kernel module.\n\
+             Container users: pass --device /dev/fuse --cap-add SYS_ADMIN to podman/docker.\n\
+             Host users: ensure the fuse kernel module is loaded (modprobe fuse)."
+        );
+        std::process::exit(3);
+    }
+
     if !args.mountpoint.exists() {
         std::fs::create_dir_all(&args.mountpoint).expect("Failed to create mountpoint");
     }
