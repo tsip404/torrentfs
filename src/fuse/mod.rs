@@ -1190,6 +1190,28 @@ impl Filesystem for TorrentFs {
         let name_str = name.to_string_lossy();
         let newname_str = newname.to_string_lossy();
 
+        // Check parent existence — if the source parent inode doesn't exist in the
+        // inode table, the directory it references has been removed.  Return ENOENT
+        // rather than a misleading EACCES from the metadata-child check below.
+        if !self.inode_mgr.inodes.contains_key(&parent) {
+            error!(
+                "Rename source parent inode {} not found in inode table",
+                parent
+            );
+            reply.error(ENOENT);
+            return;
+        }
+
+        // Same check for the target parent.
+        if !self.inode_mgr.inodes.contains_key(&newparent) {
+            error!(
+                "Rename target parent inode {} not found in inode table (directory does not exist)",
+                newparent
+            );
+            reply.error(ENOENT);
+            return;
+        }
+
         if !self.inode_mgr.is_metadata_child(parent) || !self.inode_mgr.is_metadata_child(newparent)
         {
             error!("Rename only allowed within metadata/ directory");

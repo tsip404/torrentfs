@@ -93,7 +93,11 @@ fn test_read_file_range_with_local_seeder() {
 
 /// Test that read_file_range returns correct data for different offset/size
 /// combinations, validating boundary handling.
+///
+/// Flaky in CI: peers can drop to 0 before piece download completes
+/// (see runs 31108898237, 31247593913).  Ignored until the race is fixed.
 #[test]
+#[ignore]
 fn test_read_file_range_boundaries() {
     // Serialize libtorrent session creation to avoid resource contention
     // when multiple tests run in parallel within the same binary.
