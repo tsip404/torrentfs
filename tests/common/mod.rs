@@ -25,54 +25,15 @@ static SESSION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Acquire the global session serialization lock.
 /// Returns the guard — hold it for the lifetime of all libtorrent
-/// session creation and use within a test.
+/// session creation and use within a test.  Serializes within a
+/// single test binary; cross-binary contention is mitigated by
+/// the `aio_threads=2` limit in `local_test_config()`.
 #[allow(dead_code)]
 pub fn acquire_session_lock() -> MutexGuard<'static, ()> {
-    // Clean up any leftover cross-process lock from a previous crashed test
-    let _ = std::fs::remove_file(CROSS_PROCESS_LOCK_PATH);
-    // Serialize libtorrent session creation across all processes.
-    // Uses atomic file creation — only one process at a time can create the
-    // lock file.  On panic the file may be left behind; the next acquire()
-    // call cleans it up before trying.
-    loop {
-        match std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(CROSS_PROCESS_LOCK_PATH)
-        {
-            Ok(_file) => {
-                // Use unwrap_or_else to recover from a poisoned Mutex
-                // (e.g. when a prior test panicked while holding the lock).
-                // The lock state is still consistent — this is a test-only
-                // serialization primitive, not a data-guarding lock.
-                let guard = SESSION_LOCK
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                // Transfer ownership of the lock file to the guard so it's
-                // cleaned up on drop.
-                struct LockFile(std::fs::File, &'static str);
-                impl Drop for LockFile {
-                    fn drop(&mut self) {
-                        drop(&mut self.0);
-                        let _ = std::fs::remove_file(self.1);
-                    }
-                }
-                // Leak the LockFile so it lives as long as the MutexGuard
-                // Safety: this is only used in tests; the lock file will
-                // eventually be cleaned up on process exit or next acquire.
-                let _lock_file = LockFile(_file, CROSS_PROCESS_LOCK_PATH);
-                std::mem::forget(_lock_file);
-                return guard;
-            }
-            Err(_) => {
-                thread::sleep(Duration::from_millis(200));
-            }
-        }
-    }
+    SESSION_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
-
-/// Path for the cross-process session serialization lock file.
-const CROSS_PROCESS_LOCK_PATH: &str = "/tmp/torrentfs_test_session.lock";
 
 // ── MiniTracker ──────────────────────────────────────────────────────────────
 
@@ -701,5 +662,14 @@ impl TestHarness {
 impl Drop for TestHarness {
     fn drop(&mut self) {
         *self._seeder_stop.lock().unwrap() = true;
+        // Join the seeder thread to ensure it's fully stopped
+        // before the next test starts.  Without this join, a
+        // still-running libtorrent session from a previous test
+        // can contend with the next test's session, causing the
+        // NoPeers race when the downloader can't connect to the
+        // new seeder.
+        if let Some(handle) = self._seeder_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
