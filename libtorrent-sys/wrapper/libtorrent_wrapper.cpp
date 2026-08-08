@@ -1689,9 +1689,14 @@ lt_session_t lt_session_create_with_custom_storage(
             params.settings = build_settings_pack(settings_json);
         }
         // Enable status alerts so session_stats_alert fires and
-        // lt_session_get_stats() does not block, but only if the
-        // user hasn't already configured alert_mask in settings_json.
-        if (!params.settings.has_val(lt::settings_pack::alert_mask)) {
+        // lt_session_get_stats() does not block.  Always set
+        // alert_mask when the user hasn't provided one — do NOT
+        // call has_val() on a default-constructed settings_pack:
+        // libtorrent 2.1.x may crash or corrupt settings (TSI-2061).
+        bool user_set_alert_mask = settings_json
+            && strlen(settings_json) > 0
+            && strstr(settings_json, "\"alert_mask\"") != nullptr;
+        if (!user_set_alert_mask) {
             params.settings.set_int(lt::settings_pack::alert_mask,
                 lt::alert_category::error | lt::alert_category::status);
         }
