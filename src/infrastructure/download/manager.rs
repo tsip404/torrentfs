@@ -743,14 +743,13 @@ impl DownloadManager {
                                         // sending the data, creating a false
                                         // NoPeers signal.
                                         {
-                                            let cache = self.cache_manager.lock().map_err(
-                                                |_| TorrentError::Unknown {
-                                                    code: -1,
-                                                    message:
-                                                        "Cache lock poisoned"
-                                                            .to_string(),
-                                                },
-                                            )?;
+                                            let cache =
+                                                self.cache_manager.lock().map_err(|_| {
+                                                    TorrentError::Unknown {
+                                                        code: -1,
+                                                        message: "Cache lock poisoned".to_string(),
+                                                    }
+                                                })?;
                                             if Self::is_piece_complete_in_cache(
                                                 &cache,
                                                 &piece_key,
