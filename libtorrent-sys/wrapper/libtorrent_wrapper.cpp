@@ -1684,21 +1684,37 @@ lt_session_t lt_session_create_with_custom_storage(
     try {
         auto wrapper = new lt_session_wrapper();
 
-        lt::session_params params;
+        // TSI-2068: Always pass a non-empty JSON to build_settings_pack so
+        // the pack is properly initialized via JSON parsing.  Calling
+        // mutating methods (set_int, has_val) on a completely
+        // default-constructed settings_pack corrupts settings / causes
+        // SIGSEGV on libtorrent 2.1.x (TSI-2061).
+        // When settings_json is NULL, construct a minimal JSON with
+        // alert_mask — build_settings_pack will parse it and properly
+        // initialize the pack via apply_int_setting.
+        std::string effective_json;
         if (settings_json && strlen(settings_json) > 0) {
-            params.settings = build_settings_pack(settings_json);
+            effective_json = settings_json;
+        } else {
+            // Minimal JSON so build_settings_pack initializes the
+            // pack through normal parsing (apply_int_setting).
+            // alert_category::error (1) | alert_category::status (64) = 65.
+            effective_json = "{\"alert_mask\":65}";
         }
-        // Enable status alerts so session_stats_alert fires and
-        // lt_session_get_stats() does not block.  Always set
-        // alert_mask when the user hasn't provided one — do NOT
-        // call has_val() on a default-constructed settings_pack:
-        // libtorrent 2.1.x may crash or corrupt settings (TSI-2061).
-        bool user_set_alert_mask = settings_json
-            && strlen(settings_json) > 0
-            && strstr(settings_json, "\"alert_mask\"") != nullptr;
-        if (!user_set_alert_mask) {
-            params.settings.set_int(lt::settings_pack::alert_mask,
-                lt::alert_category::error | lt::alert_category::status);
+        lt::session_params params;
+        params.settings = build_settings_pack(effective_json.c_str());
+
+        // Inject alert_mask into user-provided settings when not already
+        // present.  build_settings_pack has already initialized the pack
+        // via JSON parsing, so set_int is safe here — unlike the
+        // TSI-2061 scenario where it was called on a default pack.
+        if (settings_json && strlen(settings_json) > 0) {
+            bool user_set_alert_mask =
+                strstr(settings_json, "\"alert_mask\"") != nullptr;
+            if (!user_set_alert_mask) {
+                params.settings.set_int(lt::settings_pack::alert_mask,
+                    lt::alert_category::error | lt::alert_category::status);
+            }
         }
         std::string cache_dir(piece_cache_dir);
         params.disk_io_constructor = [cache_dir](lt::io_context& ios,
