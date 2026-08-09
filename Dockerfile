@@ -27,7 +27,6 @@ WORKDIR /build
 COPY . .
 
 RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/build/target \
     cargo build --release && \
     cp target/release/torrentfs /torrentfs
 
