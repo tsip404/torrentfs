@@ -735,23 +735,29 @@ impl Filesystem for TorrentFs {
 
                     let source_path = self.inode_mgr.extract_source_path(parent);
 
-                    {
-                        let mut processing = match self.processing_torrents.lock() {
-                            Ok(guard) => guard,
-                            Err(e) => {
-                                error!("Mutex poisoned in release(): {}", e);
-                                reply.error(EIO);
-                                return;
-                            }
-                        };
-                        if processing.contains_key(&source_path) {
-                            warn!("Torrent {} already being processed, skipping", source_path);
-                            reply.ok();
+                    let mut processing = match self.processing_torrents.lock() {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            error!("Mutex poisoned in release(): {}", e);
+                            reply.error(EIO);
                             return;
                         }
-                        processing.insert(source_path.clone(), ());
-                    }
+                    };
 
+                    if processing.contains_key(&source_path) {
+                        warn!(
+                            "Torrent at source_path '{}' already being processed, skipping",
+                            source_path
+                        );
+                        reply.ok();
+                        return;
+                    }
+                    processing.insert(source_path.clone(), ());
+
+                    // Keep the processing lock held during add_torrent to
+                    // prevent concurrent releases on the same source_path from
+                    // racing on the database insert, which could cause SQLite
+                    // constraint violations or double-inserts (TSI-2072).
                     if let Some(ref ts) = self.torrent_service {
                         match ts.add_torrent(&data, &source_path, &name) {
                             Ok(()) => {
@@ -759,17 +765,6 @@ impl Filesystem for TorrentFs {
                             }
                             Err(e) => {
                                 error!("Failed to process torrent {}: {}", name, e);
-                                let mut processing = match self.processing_torrents.lock() {
-                                    Ok(guard) => guard,
-                                    Err(poison) => {
-                                        error!(
-                                            "Mutex poisoned in release() error path: {}",
-                                            poison
-                                        );
-                                        reply.error(EIO);
-                                        return;
-                                    }
-                                };
                                 processing.remove(&source_path);
                             }
                         }
@@ -779,17 +774,8 @@ impl Filesystem for TorrentFs {
                             "Torrent {} received (no DB configured, skipping insert)",
                             name
                         );
+                        processing.remove(&source_path);
                     }
-
-                    let mut processing = match self.processing_torrents.lock() {
-                        Ok(guard) => guard,
-                        Err(e) => {
-                            error!("Mutex poisoned in release() cleanup: {}", e);
-                            reply.error(EIO);
-                            return;
-                        }
-                    };
-                    processing.remove(&source_path);
                 }
             }
         }
