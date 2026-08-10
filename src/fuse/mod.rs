@@ -762,6 +762,7 @@ impl Filesystem for TorrentFs {
                         match ts.add_torrent(&data, &source_path, &name) {
                             Ok(()) => {
                                 info!("Successfully processed torrent: {}", name);
+                                processing.remove(&source_path);
                             }
                             Err(e) => {
                                 error!("Failed to process torrent {}: {}", name, e);
