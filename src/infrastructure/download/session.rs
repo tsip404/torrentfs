@@ -313,7 +313,11 @@ impl TorrentHandle {
         }
     }
 
-    pub fn read_piece(&self, session: &Session, piece_index: i32) -> TorrentResult<Vec<u8>> {
+    /// Enqueue a read_piece request.  The data will arrive later via
+    /// `read_piece_alert`, consumed by the background AlertConsumer thread.
+    /// This call returns immediately — the C++ side just calls
+    /// `h->read_piece()` without the old inline pop_alerts loop.
+    pub fn enqueue_read_piece(&self, piece_index: i32) -> TorrentResult<()> {
         let mut data_out: *mut u8 = ptr::null_mut();
         let mut size_out: usize = 0;
 
@@ -324,7 +328,7 @@ impl TorrentHandle {
 
         let result = unsafe {
             libtorrent_sys::lt_torrent_handle_read_piece(
-                session.inner(),
+                self.session,
                 self.inner,
                 piece_index,
                 &mut data_out,
@@ -335,18 +339,8 @@ impl TorrentHandle {
 
         if result != 0 {
             Err(unsafe { error_from_c(&error) })
-        } else if data_out.is_null() || size_out == 0 {
-            Err(TorrentError::PieceNotReady(format!(
-                "Piece {} not yet available (data_out.is_null={}, size_out={})",
-                piece_index,
-                data_out.is_null(),
-                size_out
-            )))
         } else {
-            let slice = unsafe { std::slice::from_raw_parts(data_out, size_out) };
-            let data = slice.to_vec();
-            unsafe { libtorrent_sys::lt_piece_data_free(data_out) };
-            Ok(data)
+            Ok(())
         }
     }
 

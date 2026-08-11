@@ -43,6 +43,41 @@ typedef struct {
     int code;
 } lt_error_t;
 
+// ── Alert types for background alert consumption ──
+typedef enum {
+    LT_ALERT_READ_PIECE = 1,
+    LT_ALERT_SESSION_STATS = 2,
+    LT_ALERT_TORRENT_FINISHED = 3,
+    LT_ALERT_TORRENT_REMOVED = 4,
+    LT_ALERT_OTHER = 99,
+} lt_alert_type_t;
+
+typedef struct {
+    int type;                    // lt_alert_type_t
+    char info_hash[41];          // hex-encoded, empty if N/A
+    int piece_index;             // for read_piece_alert
+    int error_code;              // for read_piece_alert (0 = no error), session_stats N/A
+    // read_piece_alert data
+    uint8_t* piece_data;
+    size_t piece_data_size;
+    // session_stats data
+    int64_t download_rate;
+    int64_t upload_rate;
+    int64_t total_downloaded;
+    int64_t total_uploaded;
+    int32_t dht_nodes;
+    int32_t peers_connected;
+    int32_t half_open_connections;
+    // other alert info
+    const char* message;
+    int category;                // libtorrent alert_category bits (for tracing)
+} lt_alert_data_t;
+
+typedef struct {
+    lt_alert_data_t* alerts;
+    int count;
+} lt_alert_list_t;
+
 lt_torrent_info_t lt_torrent_info_create(const char* filepath, lt_error_t* error);
 lt_torrent_info_t lt_torrent_info_create_from_buffer(const uint8_t* data, size_t size, lt_error_t* error);
 void lt_torrent_info_destroy(lt_torrent_info_t info);
@@ -89,6 +124,8 @@ void lt_session_apply_settings(lt_session_t session, const char* settings_json);
 int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out);
 
 int lt_session_get_stats(lt_session_t session, lt_session_stats_t* stats, int32_t* error);
+lt_alert_list_t* lt_session_pop_alerts(lt_session_t session);
+void lt_alert_list_destroy(lt_alert_list_t* list);
 
 #ifdef __cplusplus
 }

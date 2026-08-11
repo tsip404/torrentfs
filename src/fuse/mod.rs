@@ -8,14 +8,15 @@ pub mod stats;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::os::raw::c_int;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fuser::{
-    Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request,
+    Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use libc::{EACCES, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EROFS};
 use tracing::{error, info, warn};
@@ -178,66 +179,31 @@ impl TorrentFs {
                 EIO
             })?;
 
-            // Retry loop: on cold reads, pieces may not be ready on the first
-            // attempt.  Retry with increasing backoff to give libtorrent time
-            // to download needed pieces — avoids returning EIO prematurely
-            // (TSI-2045).
-            // Only retry on transient errors (PieceNotReady, NoPeers, timeouts,
-            // IoError); permanent errors (InvalidFile, ParseError, NullPointer)
-            // fail immediately.
-            const MAX_READ_RETRIES: u32 = 3;
-            let mut last_err = String::new();
-            for attempt in 0..=MAX_READ_RETRIES {
-                match ds.read_file_range(&info, file_index, offset as u64, size as u32) {
-                    Ok(data) => {
-                        if attempt > 0 {
-                            info!(
-                                "Successfully read {} bytes from torrent file on retry {} \
-                                 (torrent_id={}, file_id={})",
-                                data.len(),
-                                attempt,
-                                torrent_id,
-                                file_id
-                            );
-                        } else {
-                            info!(
-                                "Successfully read {} bytes from torrent file \
-                                 (torrent_id={}, file_id={})",
-                                data.len(),
-                                torrent_id,
-                                file_id
-                            );
-                        }
-                        return Ok(data);
-                    }
-                    Err(e) => {
-                        last_err = e.to_string();
-                        let is_transient = crate::domain::error::is_transient_read_error(&e);
-                        if !is_transient {
-                            warn!("Permanent read error, not retrying: {}", last_err);
-                            return Err(EIO);
-                        }
-                        if attempt < MAX_READ_RETRIES {
-                            let delay = std::time::Duration::from_secs(1u64 << attempt);
-                            warn!(
-                                "Retry {}/{} after {:?}: {}",
-                                attempt + 1,
-                                MAX_READ_RETRIES,
-                                delay,
-                                last_err
-                            );
-                            std::thread::sleep(delay);
-                        }
-                    }
+            // Single read attempt — the underlying fetch_piece_data already
+            // blocks on a sync_channel with recv_timeout (read_timeout_secs),
+            // so no outer retry loop is needed. The FUSE kernel can retry at
+            // its level if the read fails.
+            match ds.read_file_range(&info, file_index, offset as u64, size as u32) {
+                Ok(data) => {
+                    info!(
+                        "Successfully read {} bytes from torrent file \
+                         (torrent_id={}, file_id={})",
+                        data.len(),
+                        torrent_id,
+                        file_id
+                    );
+                    return Ok(data);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to read from torrent file (torrent_id={}, file_id={}): {}. \
+                         The torrent may have no active peers/seeds. \
+                         Check tracker health with `cat .stats`.",
+                        torrent_id, file_id, e
+                    );
+                    Err(EIO)
                 }
             }
-            warn!(
-                "Failed to read from BitTorrent network after {} retries: {}. \
-                 The torrent may have no active peers/seeds. \
-                 Check tracker health with `cat .stats`.",
-                MAX_READ_RETRIES, last_err
-            );
-            Err(EIO)
         } else {
             error!("Download manager not available");
             Err(EIO)
@@ -291,7 +257,19 @@ impl TorrentFs {
     }
 }
 
+// NOTE: fuser 0.16 requires `&mut self` on all Filesystem trait methods.
+// Upgrading to a fuser version that accepts `&self` would enable true
+// multi-threaded FUSE dispatch without serializing on a global lock.
+
 impl Filesystem for TorrentFs {
+    fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), c_int> {
+        if let Err(e) = config.add_capabilities(fuser::consts::FUSE_ASYNC_READ) {
+            tracing::warn!("Failed to set FUSE_CAP_ASYNC_READ: {:?}", e);
+        } else {
+            tracing::info!("FUSE_CAP_ASYNC_READ enabled");
+        }
+        Ok(())
+    }
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = name.to_string_lossy();
 
@@ -1555,10 +1533,11 @@ impl TorrentFs {
     /// Generate global stats content for root .stats file.
     fn generate_global_stats_content(&self) -> Vec<u8> {
         let get_cm = || self.get_cache_manager();
+        let session_stats = self.download_service.as_ref().map(|ds| ds.snapshot_stats());
         generate_global_stats(
             self.inode_mgr.creation_time,
             &self.db,
-            &self.download_service,
+            session_stats,
             get_cm,
             &self.listen_addr,
         )

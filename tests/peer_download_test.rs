@@ -119,31 +119,17 @@ fn test_peer_discovery_via_tracker() {
         );
     }
 
-    // ── If peers found, verify we can read a piece ─────────────────────
-    println!("\n--- Testing piece read ---");
-    let session_ref = &dl_session;
-    match handle.read_piece(session_ref, 0) {
-        Ok(data) => {
-            if !data.is_empty() {
-                println!(
-                    "Read piece 0: {} bytes, first 50: {:?}",
-                    data.len(),
-                    String::from_utf8_lossy(&data[..50.min(data.len())])
-                );
-                assert_eq!(
-                    &data[..50.min(data.len())],
-                    &harness.file_content[..50.min(data.len())],
-                    "Downloaded data doesn't match seed content"
-                );
-            } else {
-                println!("Read piece 0: empty (piece not yet downloaded)");
-            }
+    // ── If peers found, verify we can enqueue a piece read ─────────────────────
+    println!("\n--- Testing piece read enqueue ---");
+    match handle.enqueue_read_piece(0) {
+        Ok(()) => {
+            println!("Enqueued read for piece 0 successfully");
         }
         Err(e) => {
-            // Piece read can fail if not downloaded yet - that's OK
-            // as long as we proved peer connectivity
+            // PieceNotReady or other errors are expected in test environments
+            // where the AlertConsumer is not running.
             println!(
-                "Piece read failed (expected if not yet downloaded): {:?}",
+                "Enqueue read piece returned: {:?} (expected without alert consumer)",
                 e
             );
         }

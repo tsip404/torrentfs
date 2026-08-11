@@ -12,6 +12,7 @@ use tracing_subscriber::FmtSubscriber;
 use torrentfs::config::TorrentfsConfig;
 use torrentfs::db::Database;
 use torrentfs::fuse::TorrentFs;
+use torrentfs::infrastructure::alert::AlertConsumer;
 
 #[derive(Parser, Debug)]
 #[command(name = "torrentfs")]
@@ -62,6 +63,19 @@ fn user_in_fuse_group() -> bool {
     }
 
     false
+}
+
+/// Spawn the background alert consumer thread if a session is available.
+fn spawn_alert_consumer(fs: &TorrentFs, config: &TorrentfsConfig) -> Option<AlertConsumer> {
+    let poll_ms = config.alert.alert_poll_interval_ms;
+    if poll_ms == 0 {
+        return None;
+    }
+    let ds = fs.download_service.as_ref()?;
+    let session_ptr = ds.session_ptr()?;
+    let stats = ds.cached_stats();
+    let pending_reads = ds.pending_reads();
+    Some(AlertConsumer::spawn(session_ptr, stats, pending_reads, poll_ms))
 }
 
 fn main() {
@@ -172,9 +186,15 @@ fn main() {
             None => TorrentFs::new_with_cache_path(cache_path.clone(), &config),
         };
 
-        match fuser::mount2(fs, &args.mountpoint, &options) {
-            Ok(()) => {
-                info!("torrentfs unmounted successfully");
+        let alert_consumer = spawn_alert_consumer(&fs, &config);
+
+        match fuser::spawn_mount2(fs, &args.mountpoint, &options) {
+            Ok(bg) => {
+                info!("torrentfs mounted");
+                // Park to keep the process running until interrupted.
+                std::thread::park();
+                alert_consumer.as_ref().map(|a| a.stop());
+                drop(bg);
                 return;
             }
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
@@ -217,25 +237,29 @@ fn main() {
         None => TorrentFs::new_with_cache_path(cache_path.clone(), &config),
     };
 
-    match fuser::mount2(fs, &args.mountpoint, &options) {
-        Ok(()) => info!("torrentfs unmounted successfully"),
+    let alert_consumer = spawn_alert_consumer(&fs, &config);
+
+    match fuser::spawn_mount2(fs, &args.mountpoint, &options) {
+        Ok(bg) => {
+            info!("torrentfs mounted");
+            std::thread::park();
+            alert_consumer.as_ref().map(|a| a.stop());
+            drop(bg);
+            info!("torrentfs unmounted successfully");
+        }
         Err(e) => {
             let error_msg = e.to_string();
             if e.kind() == io::ErrorKind::PermissionDenied {
                 let mut hints = Vec::new();
-
                 if !allow_other_enabled {
                     hints.push("'user_allow_other' is not set in /etc/fuse.conf");
                 }
-
                 if !user_in_fuse_group() {
                     hints.push("user may not be in the 'fuse' group (some systems require this)");
                 }
-
                 hints.push("running in a container or restricted environment");
                 hints.push("SELinux/AppArmor restrictions");
                 hints.push("/dev/fuse device permissions");
-
                 error!(
                     "Mount failed: Operation not permitted. Possible causes:\n  - {}",
                     hints.join("\n  - ")

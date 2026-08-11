@@ -9,6 +9,6 @@ mod manager;
 mod session;
 mod types;
 
-pub use manager::DownloadManager;
+pub use manager::{DownloadManager, PendingReads};
 pub use session::{Session, TorrentHandle};
 pub use types::{FilePieceInfo, SessionStats, TorrentState, TorrentStatus};

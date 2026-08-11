@@ -400,7 +400,8 @@ int lt_torrent_handle_status(lt_torrent_handle_t handle, int* state, float* prog
 }
 
 int lt_torrent_handle_read_piece(lt_session_t session, lt_torrent_handle_t handle, int piece_index, uint8_t** data_out, size_t* size_out, lt_error_t* error) {
-    if (!session || !handle || !data_out || !size_out) {
+    (void)session; // session is no longer used for inline pop_alerts
+    if (!handle || !data_out || !size_out) {
         if (error) {
             error->code = -1;
             error->message = "Invalid arguments";
@@ -408,7 +409,6 @@ int lt_torrent_handle_read_piece(lt_session_t session, lt_torrent_handle_t handl
         return -1;
     }
 
-    auto wrapper = static_cast<lt_session_wrapper*>(session);
     auto h = static_cast<lt::torrent_handle*>(handle);
     if (!h->is_valid()) {
         if (error) {
@@ -419,60 +419,12 @@ int lt_torrent_handle_read_piece(lt_session_t session, lt_torrent_handle_t handl
     }
 
     try {
+        // Enqueue the read request — the actual data will arrive via
+        // read_piece_alert, consumed by the background AlertConsumer thread.
         h->read_piece(lt::piece_index_t(piece_index));
-        
-        auto start = std::chrono::steady_clock::now();
-        auto timeout = std::chrono::seconds(60);
-        
-        while (true) {
-            auto now = std::chrono::steady_clock::now();
-            if (now - start > timeout) {
-                if (error) {
-                    error->code = -1;
-                    error->message = "Timeout waiting for piece data";
-                }
-                return -1;
-            }
-            
-            std::vector<lt::alert*> alerts;
-            {
-                std::lock_guard<std::mutex> lock(wrapper->mutex);
-                wrapper->session->pop_alerts(&alerts);
-            }
-            
-            for (auto* alert : alerts) {
-                if (auto* rp = lt::alert_cast<lt::read_piece_alert>(alert)) {
-                    if (rp->handle == *h && static_cast<int>(rp->piece) == piece_index) {
-                        if (rp->error) {
-                            if (error) {
-                                error->code = rp->error.value();
-                                static thread_local std::string err_msg;
-                                err_msg = rp->error.message();
-                                error->message = err_msg.c_str();
-                            }
-                            return -1;
-                        }
-                        
-                        size_t sz = rp->size;
-                        if (sz == 0) {
-                            *size_out = 0;
-                            *data_out = nullptr;
-                            return 0;
-                        }
-                        
-                        *size_out = sz;
-                        *data_out = static_cast<uint8_t*>(std::malloc(sz));
-                        if (*data_out) {
-                            std::memcpy(*data_out, rp->buffer.get(), sz);
-                            return 0;
-                        }
-                        return -1;
-                    }
-                }
-            }
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
+        *data_out = nullptr;
+        *size_out = 0;
+        return 0;
     } catch (const std::exception& e) {
         if (error) {
             error->code = -1;
@@ -1066,6 +1018,140 @@ int lt_session_get_stats(lt_session_t session, lt_session_stats_t* stats, int32_
     } catch (const std::exception&) {
         return -1;
     }
+}
+// ── Helper: convert sha1_hash to hex string ──
+static std::string alert_info_hash_to_hex(const lt::sha1_hash& h) {
+    char buf[41];
+    for (int i = 0; i < 20; i++) {
+        snprintf(buf + i * 2, 3, "%02x", static_cast<unsigned char>(h[i]));
+    }
+    buf[40] = '\0';
+    return std::string(buf, 40);
+}
+
+// ── Helper: extract info_hash from a torrent_handle ──
+static void alert_fill_info_hash_from_handle(const lt::torrent_handle& h, char* out) {
+    if (!h.is_valid()) {
+        out[0] = '\0';
+        return;
+    }
+    auto ti = h.torrent_file();
+    if (!ti) {
+        out[0] = '\0';
+        return;
+    }
+    auto hashes = ti->info_hashes();
+    auto best = hashes.get_best();
+    std::string hex = alert_info_hash_to_hex(best);
+    std::memcpy(out, hex.c_str(), hex.size() + 1);
+}
+
+lt_alert_list_t* lt_session_pop_alerts(lt_session_t session) {
+    if (!session) return nullptr;
+
+    auto wrapper = static_cast<lt_session_wrapper*>(session);
+
+    std::vector<lt::alert*> alerts;
+    {
+        std::lock_guard<std::mutex> lock(wrapper->mutex);
+        wrapper->session->pop_alerts(&alerts);
+    }
+
+    if (alerts.empty()) return nullptr;
+
+    auto* list = static_cast<lt_alert_list_t*>(std::malloc(sizeof(lt_alert_list_t)));
+    if (!list) return nullptr;
+    list->count = static_cast<int>(alerts.size());
+    list->alerts = static_cast<lt_alert_data_t*>(
+        std::calloc(alerts.size(), sizeof(lt_alert_data_t)));
+    if (!list->alerts) {
+        std::free(list);
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < alerts.size(); i++) {
+        auto& out = list->alerts[i];
+        auto* alert = alerts[i];
+
+        try {
+            // ── read_piece_alert ──
+            if (auto* rp = lt::alert_cast<lt::read_piece_alert>(alert)) {
+                out.type = LT_ALERT_READ_PIECE;
+                alert_fill_info_hash_from_handle(rp->handle, out.info_hash);
+                out.piece_index = static_cast<int>(rp->piece);
+                out.error_code = rp->error ? rp->error.value() : 0;
+                if (rp->error) {
+                    std::string msg = rp->error.message();
+                    out.message = strdup(msg.empty() ? "" : msg.c_str());
+                } else if (rp->size > 0 && rp->buffer.get()) {
+                    out.piece_data_size = rp->size;
+                    out.piece_data = static_cast<uint8_t*>(std::malloc(rp->size));
+                    if (out.piece_data) {
+                        std::memcpy(out.piece_data, rp->buffer.get(), rp->size);
+                    }
+                }
+            }
+            // ── session_stats_alert ──
+            else if (auto* sa = lt::alert_cast<lt::session_stats_alert>(alert)) {
+                out.type = LT_ALERT_SESSION_STATS;
+                lt::span<std::int64_t const> counters = sa->counters();
+                lt::span<lt::stats_metric const> metrics = lt::session_stats_metrics();
+                for (auto const& m : metrics) {
+                    int idx = m.value_index;
+                    if (idx < 0 || idx >= static_cast<int>(counters.size())) continue;
+                    const char* name = m.name;
+                    if (!name) continue;
+                    std::string namestr(name);
+                    if (namestr == "net.recv_rate") out.download_rate = counters[idx];
+                    else if (namestr == "net.sent_rate") out.upload_rate = counters[idx];
+                    else if (namestr == "net.recv_bytes") out.total_downloaded = counters[idx];
+                    else if (namestr == "net.sent_bytes") out.total_uploaded = counters[idx];
+                    else if (namestr == "dht.dht_nodes") out.dht_nodes = static_cast<int32_t>(counters[idx]);
+                    else if (namestr == "peer.num_peers_connected") out.peers_connected = static_cast<int32_t>(counters[idx]);
+                    else if (namestr == "peer.num_peers_half_open") out.half_open_connections = static_cast<int32_t>(counters[idx]);
+                }
+            }
+            // ── torrent_finished_alert ──
+            else if (auto* tf = lt::alert_cast<lt::torrent_finished_alert>(alert)) {
+                out.type = LT_ALERT_TORRENT_FINISHED;
+                alert_fill_info_hash_from_handle(tf->handle, out.info_hash);
+            }
+            // ── torrent_removed_alert ──
+            else if (auto* tr = lt::alert_cast<lt::torrent_removed_alert>(alert)) {
+                out.type = LT_ALERT_TORRENT_REMOVED;
+                std::string hex = alert_info_hash_to_hex(tr->info_hash);
+                std::memcpy(out.info_hash, hex.c_str(), hex.size() + 1);
+            }
+            // ── other alerts ──
+            else {
+                out.type = LT_ALERT_OTHER;
+                out.category = static_cast<int>(static_cast<unsigned int>(alert->category()));
+                std::string msg = alert->message();
+                out.message = strdup(msg.empty() ? "" : msg.c_str());
+            }
+        } catch (const std::exception& e) {
+            // Any exception during alert processing (e.g. null string
+            // construction) is caught per-alert so other alerts are not lost.
+            out.type = LT_ALERT_OTHER;
+            out.category = 0;
+            out.message = strdup(e.what());
+        }
+    }
+
+    return list;
+}
+
+void lt_alert_list_destroy(lt_alert_list_t* list) {
+    if (!list) return;
+    if (list->alerts) {
+        for (int i = 0; i < list->count; i++) {
+            auto& a = list->alerts[i];
+            if (a.piece_data) std::free(a.piece_data);
+            if (a.message) std::free(const_cast<char*>(a.message));
+        }
+        std::free(list->alerts);
+    }
+    std::free(list);
 }
 
 // ============================================================================

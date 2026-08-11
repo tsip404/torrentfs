@@ -14,11 +14,12 @@ use crate::infrastructure::download::{
 };
 use crate::infrastructure::metadata::TorrentInfo;
 use crate::seeding::SeedingManager;
+use crate::infrastructure::alert::SharedSessionStats;
 
-/// DownloadService wraps DownloadManager behind a shared lock,
-/// providing thread-safe access for the FUSE presentation layer.
+
 pub struct DownloadService {
     download_manager: Arc<Mutex<DownloadManager>>,
+    cached_stats: SharedSessionStats,
 }
 
 impl DownloadService {
@@ -27,9 +28,9 @@ impl DownloadService {
         let dm = DownloadManager::new(cache_dir, config)?;
         Ok(Self {
             download_manager: Arc::new(Mutex::new(dm)),
+            cached_stats: SharedSessionStats::new(),
         })
     }
-
     /// Register a SeedingManager to receive eviction callbacks from the CacheManager.
     pub fn register_seeding_callback(&self, seeding: Arc<SeedingManager>) {
         let mut dm = self
@@ -37,6 +38,24 @@ impl DownloadService {
             .lock()
             .expect("DownloadManager lock poisoned");
         dm.register_seeding_callback(seeding);
+    }
+
+    /// Get the raw libtorrent session pointer for background threads
+    /// (e.g., the AlertConsumer). The pointer remains valid for the
+    /// lifetime of the Session.
+    pub fn session_ptr(&self) -> Option<libtorrent_sys::lt_session_t> {
+        self.download_manager
+            .lock()
+            .ok()
+            .and_then(|dm| dm.session_ptr())
+    }
+    /// Get the shared pending-reads table for the AlertConsumer to
+    /// deliver `read_piece_alert` data.
+    pub fn pending_reads(&self) -> Option<crate::infrastructure::download::PendingReads> {
+        self.download_manager
+            .lock()
+            .ok()
+            .map(|dm| dm.pending_reads())
     }
 
     /// Ensure a lightweight handle exists for the given torrent info.
@@ -84,6 +103,18 @@ impl DownloadService {
             })?;
         dm.get_session_stats()
     }
+
+    /// Snapshot cached session stats — safe to call from FUSE handlers
+    /// without blocking on the libtorrent session FFI.
+    pub fn snapshot_stats(&self) -> SessionStats {
+        self.cached_stats.snapshot()
+    }
+
+    /// Get a clone of the shared cached stats for the alert consumer.
+    pub fn cached_stats(&self) -> SharedSessionStats {
+        self.cached_stats.clone()
+    }
+
 
     /// Get all torrent handles and their info hashes.
     pub fn get_all_handles(&self) -> Vec<(String, Arc<Mutex<TorrentHandle>>)> {
