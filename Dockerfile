@@ -44,14 +44,11 @@ RUN apt-get update && \
     fuse3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-# Create non-root user
-RUN useradd --create-home --shell /bin/bash torrentfs
+# Enable allow_other so containers without --privileged can mount FUSE
+RUN echo "user_allow_other" >> /etc/fuse.conf
 
 COPY --from=builder /torrentfs /usr/local/bin/torrentfs
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 
-USER torrentfs
-WORKDIR /home/torrentfs
-
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["/mnt"]
