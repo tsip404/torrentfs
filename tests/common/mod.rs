@@ -30,9 +30,7 @@ static SESSION_LOCK: Mutex<()> = Mutex::new(());
 /// the `aio_threads=2` limit in `local_test_config()`.
 #[allow(dead_code)]
 pub fn acquire_session_lock() -> MutexGuard<'static, ()> {
-    SESSION_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    SESSION_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ── MiniTracker ──────────────────────────────────────────────────────────────
@@ -662,15 +660,11 @@ impl TestHarness {
             let start = std::time::Instant::now();
             loop {
                 if tracker.peer_count(&info_hash) > 0 {
-                    eprintln!(
-                        "TestHarness: seeder confirmed in tracker peer list"
-                    );
+                    eprintln!("TestHarness: seeder confirmed in tracker peer list");
                     break;
                 }
                 if start.elapsed() > Duration::from_secs(10) {
-                    eprintln!(
-                        "TestHarness: timeout waiting for seeder in peer list"
-                    );
+                    eprintln!("TestHarness: timeout waiting for seeder in peer list");
                     break;
                 }
                 thread::sleep(Duration::from_millis(200));
