@@ -67,7 +67,7 @@ impl TorrentFs {
         let creation_time = Duration::from_secs(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         );
 

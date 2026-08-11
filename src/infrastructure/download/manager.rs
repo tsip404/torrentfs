@@ -325,6 +325,13 @@ impl DownloadManager {
             )));
         }
 
+        if piece_length == 0 {
+            return Err(TorrentError::InvalidFile(format!(
+                "Invalid torrent: piece_length = 0 (num_pieces={})",
+                num_pieces
+            )));
+        }
+
         let start_piece = (absolute_offset / piece_length) as i32;
         let end_offset = absolute_offset + size as u64;
         let end_piece = if size > 0 {
