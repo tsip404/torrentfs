@@ -1,12 +1,14 @@
 #!/bin/bash
-# torrentfs container entrypoint — handles rootless container FUSE requirements.
+# torrentfs container entrypoint — handles FUSE device setup and mount visibility.
 #
-# In rootless containers (podman without --privileged, Docker with limited caps),
-# /dev/fuse is typically absent. This script:
+# Key behaviors:
 #   1. Detects container + FUSE availability
 #   2. Attempts to create /dev/fuse when running as root
 #   3. Provides actionable diagnostics when FUSE is unavailable
-#   4. Falls through to the torrentfs binary when everything is ready
+#   4. Two-stage FUSE mount: mounts on internal path (/mnt-inner), then
+#      bind-mounts to the container-facing path for host visibility via
+#      shared mount propagation (rshared).
+#      See: https://docs.docker.com/engine/storage/bind-mounts/#configure-bind-propagation
 
 set -euo pipefail
 
@@ -107,6 +109,65 @@ DIAG
     exit 100
 fi
 
-echo "[entrypoint] /dev/fuse is available — starting torrentfs" >&2
+# ── FUSE mount with host visibility ──────────────────────────────────────────
+# Runs torrentfs on an internal mount point, then bind-mounts to the
+# container-facing path (typically a shared bind mount). This allows
+# the FUSE filesystem to propagate to the host via shared mount propagation.
+# For the host to see the mount, the container must be started with:
+#   --mount type=bind,source=<host-path>,target=<container-path>,bind-propagation=rshared
+# and the host source directory must itself be a shared mount:
+#   mount --bind <host-path> <host-path> && mount --make-shared <host-path>
+start_torrentfs() {
+    local mountpoint="$1"
+    shift
+    local internal_mnt="/mnt-inner"
 
-exec torrentfs "$@"
+    mkdir -p "$internal_mnt"
+    mkdir -p "$mountpoint"
+
+    echo "[entrypoint] starting torrentfs on internal mount $internal_mnt" >&2
+
+    # Forward termination signals to torrentfs (we are PID 1 in container)
+    local torrentfs_pid=""
+    cleanup() {
+        echo "[entrypoint] shutting down" >&2
+        if [ -n "$torrentfs_pid" ]; then
+            kill "$torrentfs_pid" 2>/dev/null || true
+            wait "$torrentfs_pid" 2>/dev/null || true
+        fi
+        umount "$mountpoint" 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+
+    # Start torrentfs on internal path with remaining args
+    torrentfs "$internal_mnt" "$@" &
+    torrentfs_pid=$!
+
+    # Wait for FUSE mount to become ready (up to 30s)
+    local ready=0
+    for i in $(seq 1 60); do
+        if mountpoint -q "$internal_mnt" 2>/dev/null; then
+            ready=1
+            break
+        fi
+        sleep 0.5
+    done
+
+    if [ "$ready" -eq 0 ]; then
+        echo "[entrypoint] FUSE mount did not become ready within 30s" >&2
+        kill "$torrentfs_pid" 2>/dev/null || true
+        wait "$torrentfs_pid" 2>/dev/null || true
+        exit 1
+    fi
+
+    echo "[entrypoint] FUSE mount ready — publishing to $mountpoint" >&2
+    mount --bind "$internal_mnt" "$mountpoint"
+
+    echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint" >&2
+
+    # Wait for torrentfs to exit
+    wait "$torrentfs_pid" || true
+}
+
+echo "[entrypoint] /dev/fuse is available" >&2
+start_torrentfs "$@"
