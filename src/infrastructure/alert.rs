@@ -258,7 +258,9 @@ impl AlertConsumer {
     }
 
     /// Read a null-terminated fixed-size char array as a &str.
-    fn cstr(buf: &[i8; 41]) -> &str {
+    /// Generic over T to support both `[i8; 41]` (amd64) and `[u8; 41]` (arm64)
+    /// due to platform-specific C `char` signedness.
+    fn cstr<T>(buf: &[T; 41]) -> &str {
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, 41) };
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(41);
         std::str::from_utf8(&bytes[..end]).unwrap_or("")
