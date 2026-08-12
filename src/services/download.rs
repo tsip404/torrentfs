@@ -6,6 +6,8 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use hex;
+
 use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::cache::CacheManager;
 use crate::infrastructure::config::TorrentfsConfig;
@@ -16,18 +18,22 @@ use crate::infrastructure::metadata::TorrentInfo;
 use crate::seeding::SeedingManager;
 use crate::infrastructure::alert::SharedSessionStats;
 
-
 pub struct DownloadService {
     download_manager: Arc<Mutex<DownloadManager>>,
+    /// Cached reference to the CacheManager — avoids locking
+    /// download_manager for fast disk-cache checks.
+    cache_manager: Arc<Mutex<CacheManager>>,
     cached_stats: SharedSessionStats,
 }
 
 impl DownloadService {
-    /// Create a new DownloadService with the given cache directory and config.
+
     pub fn new(cache_dir: &Path, config: &TorrentfsConfig) -> TorrentResult<Self> {
         let dm = DownloadManager::new(cache_dir, config)?;
+        let cm = dm.get_cache_manager();
         Ok(Self {
             download_manager: Arc::new(Mutex::new(dm)),
+            cache_manager: cm,
             cached_stats: SharedSessionStats::new(),
         })
     }
@@ -126,10 +132,202 @@ impl DownloadService {
 
     /// Get the CacheManager shared with the download session.
     pub fn get_cache_manager(&self) -> Option<Arc<Mutex<CacheManager>>> {
-        self.download_manager
-            .lock()
-            .ok()
-            .map(|dm| dm.get_cache_manager())
+        Some(self.cache_manager.clone())
+    }
+
+
+    /// Check whether all piece files needed for a file range exist on disk.
+    ///
+    /// Uses the same criteria as `DownloadManager::is_piece_complete_in_cache`
+    /// (TSI-2048: verified + size check), so the pre-check is consistent with
+    /// the synchronous fast path in `read_file_range`.
+    ///
+    /// Uses only the CacheManager (no DownloadManager lock), so it's safe
+    /// to call from the FUSE thread while a background download is running.
+    pub fn pieces_on_disk(
+        &self,
+        info: &TorrentInfo,
+        file_index: i32,
+        offset: u64,
+        size: u32,
+    ) -> TorrentResult<bool> {
+        let info_hash = hex::encode(info.info_hash()?);
+        let piece_length = info.piece_length() as u64;
+        let num_pieces = info.num_pieces() as i32;
+
+        if num_pieces <= 0 || piece_length == 0 {
+            return Ok(false);
+        }
+
+        let files = info.files()?;
+        let file_start_offset: u64 = files
+            .iter()
+            .take(file_index as usize)
+            .map(|f| f.size)
+            .sum();
+        let file_size = files
+            .get(file_index as usize)
+            .map(|f| f.size)
+            .unwrap_or(0);
+
+        let absolute_offset = file_start_offset + offset;
+        let file_end = file_start_offset + file_size;
+        if absolute_offset >= file_end || size == 0 {
+            return Ok(true); // empty range, nothing to check
+        }
+
+        let size = std::cmp::min(size as u64, file_end - absolute_offset) as u32;
+        let start_piece = (absolute_offset / piece_length) as i32;
+        let end_offset = absolute_offset + size as u64;
+        let end_piece = std::cmp::min(
+            ((end_offset - 1) / piece_length) as i32,
+            num_pieces - 1,
+        );
+
+        if start_piece > end_piece || start_piece >= num_pieces {
+            return Ok(true);
+        }
+
+        let total_size = info.total_size();
+        let cache = self.cache_manager.lock().map_err(|_| TorrentError::Unknown {
+            code: -1,
+            message: "Cache lock poisoned".to_string(),
+        })?;
+
+        for piece_idx in start_piece..=end_piece {
+            let piece_key = format!("{}:piece:{}", info_hash, piece_idx);
+            if !DownloadManager::is_piece_complete_in_cache(
+                &cache,
+                &piece_key,
+                piece_idx,
+                piece_length,
+                num_pieces,
+                total_size,
+            ) {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+    /// Spawn a background thread to download pieces for a file range.
+    ///
+    /// The DownloadManager lock is held only briefly (to get/create the
+    /// torrent handle).  The piece-wait loop runs without the DM lock,
+    /// using only the handle and CacheManager locks, so other FUSE
+    /// operations (stats, cached reads) remain responsive.
+    ///
+    /// Returns immediately.  Data is written to the disk cache by
+    /// libtorrent's custom storage.  FUSE reads should return EAGAIN
+    /// and retry later.
+    pub fn request_download_async(
+        &self,
+        torrent_data: Vec<u8>,
+        file_index: i32,
+        offset: u64,
+        size: u32,
+    ) {
+        let dm = self.download_manager.clone();
+        let cm = self.cache_manager.clone();
+
+        std::thread::spawn(move || {
+            // Parse torrent metadata
+            let info = match TorrentInfo::from_bytes(torrent_data) {
+                Ok(info) => info,
+                Err(e) => {
+                    tracing::warn!("request_download_async: failed to parse torrent: {:?}", e);
+                    return;
+                }
+            };
+
+            let info_hash = match info.info_hash() {
+                Ok(h) => hex::encode(h),
+                Err(e) => {
+                    tracing::warn!("request_download_async: info_hash failed: {:?}", e);
+                    return;
+                }
+            };
+            let piece_length = info.piece_length() as u64;
+            let num_pieces = info.num_pieces() as i32;
+            let total_size = info.total_size();
+
+            // Compute piece range
+            let (start_piece, end_piece) = match Self::compute_piece_range(
+                &info, file_index, offset, size,
+            ) {
+                Some(range) => range,
+                None => return,
+            };
+
+            // Phase 1: get handle (brief DM lock, milliseconds)
+            let (handle, read_timeout) = {
+                let mut mgr = match dm.lock() {
+                    Ok(mgr) => mgr,
+                    Err(_) => {
+                        tracing::error!("request_download_async: DM lock poisoned");
+                        return;
+                    }
+                };
+                let handle = match mgr.get_or_create_handle(&info) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::warn!("request_download_async: get_or_create_handle failed: {:?}", e);
+                        return;
+                    }
+                };
+                (handle, mgr.read_timeout_secs)
+            }; // DM lock RELEASED here
+
+            // Phase 2: wait for pieces (NO DM lock — only handle + cache)
+            DownloadManager::background_wait_for_pieces(
+                &handle,
+                &cm,
+                &info_hash,
+                start_piece,
+                end_piece,
+                piece_length,
+                num_pieces,
+                total_size,
+                std::time::Duration::from_secs(read_timeout),
+            );
+        });
+    }
+
+    /// Compute the piece range covering a file read request.
+    /// Returns `None` on invalid inputs (out-of-range file_index, etc.).
+    fn compute_piece_range(
+        info: &TorrentInfo,
+        file_index: i32,
+        offset: u64,
+        size: u32,
+    ) -> Option<(i32, i32)> {
+        let piece_length = info.piece_length() as u64;
+        let num_pieces = info.num_pieces() as i32;
+        if num_pieces <= 0 || piece_length == 0 {
+            return None;
+        }
+
+        let files = info.files().ok()?;
+        let file_start_offset: u64 = files.iter().take(file_index as usize).map(|f| f.size).sum();
+        let file_size = files.get(file_index as usize)?.size;
+
+        let absolute_offset = file_start_offset + offset;
+        let file_end = file_start_offset + file_size;
+        if absolute_offset >= file_end || size == 0 {
+            return None;
+        }
+
+        let size = std::cmp::min(size as u64, file_end - absolute_offset) as u32;
+        let start_piece = (absolute_offset / piece_length) as i32;
+        let end_offset = absolute_offset + size as u64;
+        let end_piece =
+            std::cmp::min(((end_offset - 1) / piece_length) as i32, num_pieces - 1);
+
+        if start_piece > end_piece || start_piece >= num_pieces {
+            return None;
+        }
+
+        Some((start_piece, end_piece))
     }
 
     /// Query torrent status for a given info_hash without triggering downloads.
