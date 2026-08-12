@@ -18,7 +18,7 @@ use fuser::{
     Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{EACCES, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, EROFS};
+use libc::{EACCES, EAGAIN, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, EROFS};
 use tracing::{error, info, warn};
 
 use self::inodes::{
@@ -174,36 +174,70 @@ impl TorrentFs {
 
         if let Some(ds) = &self.download_service {
             let torrent_data = self.get_torrent_raw_data(torrent_id)?;
-            let info = TorrentInfo::from_bytes(torrent_data).map_err(|e| {
+            // Clone before parsing: from_bytes() takes ownership,
+            // but we may need the raw bytes again for async download.
+            let info = TorrentInfo::from_bytes(torrent_data.clone()).map_err(|e| {
                 error!("Failed to parse torrent info for download: {:?}", e);
                 EIO
             })?;
 
-            // Single read attempt — the underlying fetch_piece_data already
-            // blocks on a sync_channel with recv_timeout (read_timeout_secs),
-            // so no outer retry loop is needed. The FUSE kernel can retry at
-            // its level if the read fails.
-            match ds.read_file_range(&info, file_index, offset as u64, size as u32) {
-                Ok(data) => {
-                    info!(
-                        "Successfully read {} bytes from torrent file \
-                         (torrent_id={}, file_id={})",
-                        data.len(),
-                        torrent_id,
-                        file_id
-                    );
-                    return Ok(data);
-                }
+            // Fast pre-check: are all needed pieces already on disk?
+            // Uses only CacheManager — no DownloadManager lock, so it's
+            // safe even when a background download is in progress.
+            let pieces_ready = match ds
+                .pieces_on_disk(&info, file_index, offset as u64, size as u32)
+            {
+                Ok(true) => true,
+                Ok(false) => false,
                 Err(e) => {
-                    warn!(
-                        "Failed to read from torrent file (torrent_id={}, file_id={}): {}. \
-                         The torrent may have no active peers/seeds. \
-                         Check tracker health with `cat .stats`.",
+                    error!(
+                        "Failed to check pieces on disk (torrent_id={}, file_id={}): {:?}",
                         torrent_id, file_id, e
                     );
-                    Err(EIO)
+                    return Err(EIO);
+                }
+            };
+
+            if pieces_ready {
+                // All pieces are available locally — synchronous read (fast path).
+                match ds.read_file_range(&info, file_index, offset as u64, size as u32) {
+                    Ok(data) => {
+                        info!(
+                            "Successfully read {} bytes from torrent file \
+                             (torrent_id={}, file_id={})",
+                            data.len(),
+                            torrent_id,
+                            file_id
+                        );
+                        return Ok(data);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to read from torrent file (torrent_id={}, file_id={}): {}. \
+                             The torrent may have no active peers/seeds. \
+                             Check tracker health with `cat .stats`.",
+                            torrent_id, file_id, e
+                        );
+                        return Err(EIO);
+                    }
                 }
             }
+
+            // Pieces need downloading — spawn background download and tell
+            // the kernel to retry later.  This keeps the FUSE event loop
+            // responsive for all other operations (getattr, readdir, etc.).
+            info!(
+                "Deferring read for torrent file (torrent_id={}, file_id={}): \
+                 pieces not on disk, starting background download",
+                torrent_id, file_id
+            );
+            ds.request_download_async(
+                torrent_data,
+                file_index,
+                offset as u64,
+                size as u32,
+            );
+            Err(EAGAIN)
         } else {
             error!("Download manager not available");
             Err(EIO)
@@ -831,8 +865,10 @@ impl Filesystem for TorrentFs {
                                 reply.data(&data);
                             }
                             Err(e) => {
-                                warn!("Failed to read torrent file data: {:?}", e);
-                                reply.error(EIO);
+                                if e != EAGAIN {
+                                    warn!("Failed to read torrent file data: {:?}", e);
+                                }
+                                reply.error(e);
                             }
                         }
                     } else {
