@@ -154,4 +154,90 @@ impl Database {
 
         Ok(names)
     }
+
+    /// Recursively removes metadata directory entries that have no torrents
+    /// and no child directories. Starts from `source_path` and walks up the tree,
+    /// stopping at the first ancestor that still has children or torrents.
+    pub fn cleanup_orphaned_metadata_directories(
+        &mut self,
+        source_path: &str,
+    ) -> Result<(), DbError> {
+        if source_path.is_empty() {
+            return Ok(());
+        }
+
+        // Gather directory info before any deletion
+        let dir_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM metadata_directories WHERE path = ?",
+                rusqlite::params![source_path],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        let Some(dir_id) = dir_id else {
+            return Ok(());
+        };
+
+        let parent_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT parent_id FROM metadata_directories WHERE id = ?",
+                rusqlite::params![dir_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        // Resolve parent path before deletion (needed for recursive walk)
+        let parent_path: Option<String> = if let Some(pid) = parent_id {
+            self.conn
+                .query_row(
+                    "SELECT path FROM metadata_directories WHERE id = ?",
+                    rusqlite::params![pid],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten()
+        } else {
+            None
+        };
+
+        // Check if this source_path still has any torrents (exact or descendant)
+        let torrent_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM torrents WHERE source_path = ?1 OR source_path LIKE (?1 || '/%')",
+            rusqlite::params![source_path],
+            |row| row.get(0),
+        )?;
+
+        if torrent_count > 0 {
+            return Ok(());
+        }
+
+        // Check if this directory has any child metadata directories
+        let child_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM metadata_directories WHERE parent_id = ?",
+            rusqlite::params![dir_id],
+            |row| row.get(0),
+        )?;
+
+        if child_count > 0 {
+            return Ok(());
+        }
+
+        // No torrents, no subdirectories — safe to delete
+        self.conn.execute(
+            "DELETE FROM metadata_directories WHERE id = ?",
+            rusqlite::params![dir_id],
+        )?;
+
+        // Walk up to check the parent
+        if let Some(path) = parent_path {
+            self.cleanup_orphaned_metadata_directories(&path)?;
+        }
+
+        Ok(())
+    }
 }

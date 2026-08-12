@@ -1084,3 +1084,175 @@ fn test_migrate_v5_dedup_conflicting_rows() {
         assert_eq!(torrents[0].name, "Torrent New");
     }
 }
+
+// ── orphaned metadata directory cleanup ──
+
+#[test]
+fn test_cleanup_orphaned_single_level() {
+    let mut db = Database::open_in_memory().unwrap();
+
+    // Insert a torrent at "cat-a"
+    db.insert_torrent("cat-a", "Torrent1", "Torrent1", 1024, "hash1", 1)
+        .unwrap();
+
+    // Verify the metadata directory exists
+    let prefixes = db.get_source_path_prefixes("").unwrap();
+    assert!(prefixes.contains(&"cat-a".to_string()));
+
+    // Delete the torrent
+    db.delete_torrent(1).unwrap();
+
+    // Cleanup orphaned directories
+    db.cleanup_orphaned_metadata_directories("cat-a").unwrap();
+
+    // Verify the metadata directory is gone
+    let prefixes = db.get_source_path_prefixes("").unwrap();
+    assert!(!prefixes.contains(&"cat-a".to_string()));
+}
+
+#[test]
+fn test_cleanup_orphaned_stops_when_torrent_exists() {
+    let mut db = Database::open_in_memory().unwrap();
+
+    // Insert torrents at different source_paths under "cat-a"
+    db.insert_torrent("cat-a", "Torrent1", "Torrent1", 1024, "hash1", 1)
+        .unwrap();
+    db.insert_torrent("cat-a/sub", "Torrent2", "Torrent2", 2048, "hash2", 1)
+        .unwrap();
+
+    // Delete the torrent directly under "cat-a"
+    db.delete_torrent(1).unwrap();
+
+    // Cleanup starting from "cat-a" — should NOT remove it because "cat-a/sub" still has a torrent
+    db.cleanup_orphaned_metadata_directories("cat-a").unwrap();
+
+    let prefixes = db.get_source_path_prefixes("").unwrap();
+    assert!(prefixes.contains(&"cat-a".to_string()));
+}
+
+#[test]
+fn test_cleanup_orphaned_recursive() {
+    let mut db = Database::open_in_memory().unwrap();
+
+    // Insert a torrent deep in the tree
+    db.insert_torrent(
+        "anime/naruto/season1",
+        "Naruto S1",
+        "Naruto S1",
+        1024,
+        "hash1",
+        1,
+    )
+    .unwrap();
+
+    // Verify all three levels exist
+    let roots = db.get_source_path_prefixes("").unwrap();
+    assert!(roots.contains(&"anime".to_string()));
+
+    let anime = db.get_source_path_prefixes("anime").unwrap();
+    assert!(anime.contains(&"naruto".to_string()));
+
+    let naruto = db.get_source_path_prefixes("anime/naruto").unwrap();
+    assert!(naruto.contains(&"season1".to_string()));
+
+    // Delete the torrent
+    db.delete_torrent(1).unwrap();
+
+    // Cleanup from the leaf — should cascade up to root
+    db.cleanup_orphaned_metadata_directories("anime/naruto/season1")
+        .unwrap();
+
+    // All three levels should be gone
+    let roots = db.get_source_path_prefixes("").unwrap();
+    assert!(!roots.contains(&"anime".to_string()));
+}
+
+#[test]
+fn test_cleanup_orphaned_stops_at_sibling_torrent() {
+    let mut db = Database::open_in_memory().unwrap();
+
+    // Two torrents at different leaf paths under the same parent
+    db.insert_torrent(
+        "anime/naruto/season1",
+        "Naruto S1",
+        "Naruto S1",
+        1024,
+        "hash1",
+        1,
+    )
+    .unwrap();
+    db.insert_torrent(
+        "anime/naruto/season2",
+        "Naruto S2",
+        "Naruto S2",
+        2048,
+        "hash2",
+        1,
+    )
+    .unwrap();
+
+    // Delete only season1 torrent
+    db.delete_torrent(1).unwrap();
+
+    // Cleanup from season1 — should remove season1 but stop at naruto (still has season2)
+    db.cleanup_orphaned_metadata_directories("anime/naruto/season1")
+        .unwrap();
+
+    // season1 should be gone
+    let naruto = db.get_source_path_prefixes("anime/naruto").unwrap();
+    assert!(!naruto.contains(&"season1".to_string()));
+
+    // anime and naruto should still exist
+    let roots = db.get_source_path_prefixes("").unwrap();
+    assert!(roots.contains(&"anime".to_string()));
+    let anime = db.get_source_path_prefixes("anime").unwrap();
+    assert!(anime.contains(&"naruto".to_string()));
+}
+
+#[test]
+fn test_cleanup_orphaned_empty_source_path_is_noop() {
+    let mut db = Database::open_in_memory().unwrap();
+    // Should not panic or error on empty source_path
+    db.cleanup_orphaned_metadata_directories("").unwrap();
+}
+
+#[test]
+fn test_cleanup_orphaned_nonexistent_path() {
+    let mut db = Database::open_in_memory().unwrap();
+    // Should not error on nonexistent path
+    db.cleanup_orphaned_metadata_directories("nonexistent")
+        .unwrap();
+}
+
+#[test]
+fn test_cleanup_orphaned_keeps_dir_with_child_dirs() {
+    let mut db = Database::open_in_memory().unwrap();
+
+    // Create a parent directory with a subdirectory but no torrents
+    // First create a torrent under the subdirectory to ensure metadata dirs exist
+    db.insert_torrent("cat-a/sub", "Torrent1", "Torrent1", 1024, "hash1", 1)
+        .unwrap();
+
+    // Delete the torrent
+    db.delete_torrent(1).unwrap();
+
+    // Cleanup from sub — should remove sub but keep cat-a (it has child dir)
+    // Actually, after removing the torrent AND sub directory, cat-a has no children.
+    // But the cleanup starts from the leaf — it removes the leaf dir if empty,
+    // then checks the parent recursively. So cat-a should also be removed.
+    // Let's test a different scenario: cat-a has a subdirectory that still has a torrent
+
+    let mut db2 = Database::open_in_memory().unwrap();
+    db2.insert_torrent("cat-a", "T1", "T1", 100, "h1", 1).unwrap();
+    db2.insert_torrent("cat-a/sub", "T2", "T2", 200, "h2", 1)
+        .unwrap();
+
+    // Delete T1 (the root torrent of cat-a)
+    db2.delete_torrent(1).unwrap();
+
+    // Cleanup from cat-a — should NOT remove it because cat-a/sub still has a torrent
+    db2.cleanup_orphaned_metadata_directories("cat-a").unwrap();
+
+    let prefixes = db2.get_source_path_prefixes("").unwrap();
+    assert!(prefixes.contains(&"cat-a".to_string()));
+}

@@ -93,32 +93,39 @@ impl TorrentService {
 
     /// Remove a torrent from the database by filename and source_path.
     pub fn remove_torrent(&self, filename: &str, source_path: &str) -> Result<Option<i64>, i32> {
-        let mut db_guard = self.db.lock().map_err(|_| {
-            error!("Database lock poisoned");
-            libc::EIO
-        })?;
+        let torrent_id = {
+            let mut db_guard = self.db.lock().map_err(|_| {
+                error!("Database lock poisoned");
+                libc::EIO
+            })?;
 
-        match db_guard.get_torrent_by_filename_and_source_path(filename, source_path) {
-            Ok(Some(torrent)) => {
-                let torrent_id = torrent.id;
-                db_guard.delete_torrent(torrent_id).map_err(|e| {
-                    error!("Failed to delete torrent from database: {:?}", e);
-                    libc::EIO
-                })?;
-                info!(
-                    "Deleted torrent '{}' (id={}, source_path='{}')",
-                    filename, torrent_id, source_path
-                );
-                Ok(Some(torrent_id))
+            match db_guard.get_torrent_by_filename_and_source_path(filename, source_path) {
+                Ok(Some(torrent)) => {
+                    let torrent_id = torrent.id;
+                    db_guard.delete_torrent(torrent_id).map_err(|e| {
+                        error!("Failed to delete torrent from database: {:?}", e);
+                        libc::EIO
+                    })?;
+                    info!(
+                        "Deleted torrent '{}' (id={}, source_path='{}')",
+                        filename, torrent_id, source_path
+                    );
+                    Some(torrent_id)
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    error!("Database error during remove_torrent: {:?}", e);
+                    return Err(libc::EIO);
+                }
             }
-            Ok(None) => Ok(None),
-            Err(e) => {
-                error!("Database error during remove_torrent: {:?}", e);
-                Err(libc::EIO)
-            }
+        }; // Drop db lock before cleanup (cleanup acquires its own lock)
+
+        if torrent_id.is_some() {
+            self.cleanup_orphaned_metadata_directories(source_path);
         }
-    }
 
+        Ok(torrent_id)
+    }
     /// Rename a torrent in the database.
     pub fn rename_torrent(
         &self,
@@ -127,6 +134,8 @@ impl TorrentService {
         new_name: &str,
         new_source_path: &str,
     ) -> Result<(), i32> {
+        let path_changed = old_source_path != new_source_path;
+
         let mut db_guard = self.db.lock().map_err(|_| {
             error!("Database lock poisoned");
             libc::EIO
@@ -140,14 +149,20 @@ impl TorrentService {
                         error!("Failed to rename torrent in database: {:?}", e);
                         libc::EIO
                     })?;
-                Ok(())
             }
-            Ok(None) => Ok(()),
+            Ok(None) => return Ok(()),
             Err(e) => {
                 error!("Database error during rename_torrent: {:?}", e);
-                Err(libc::EIO)
+                return Err(libc::EIO);
             }
         }
+        drop(db_guard);
+
+        if path_changed {
+            self.cleanup_orphaned_metadata_directories(old_source_path);
+        }
+
+        Ok(())
     }
 
     /// Ensure metadata directories exist in the database for a given source_path.
@@ -167,17 +182,48 @@ impl TorrentService {
 
     /// Delete a metadata directory from the database.
     pub fn delete_metadata_directory(&self, source_path: &str) -> Result<(), i32> {
-        let mut db_guard = self.db.lock().map_err(|_| {
-            error!("Database lock poisoned");
-            libc::EIO
-        })?;
+        let parent_path: Option<String> = {
+            let mut db_guard = self.db.lock().map_err(|_| {
+                error!("Database lock poisoned");
+                libc::EIO
+            })?;
 
-        db_guard
-            .delete_metadata_directory(source_path)
-            .map_err(|e| {
+            let parent: Option<i64> = db_guard
+                .conn
+                .query_row(
+                    "SELECT parent_id FROM metadata_directories WHERE path = ?",
+                    rusqlite::params![source_path],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten()
+                .flatten();
+
+            let parent_path = parent.and_then(|pid| {
+                db_guard
+                    .conn
+                    .query_row(
+                        "SELECT path FROM metadata_directories WHERE id = ?",
+                        rusqlite::params![pid],
+                        |row| row.get(0),
+                    )
+                    .ok()
+                    .flatten()
+            });
+
+            db_guard.delete_metadata_directory(source_path).map_err(|e| {
                 warn!("Failed to delete metadata directory from database: {:?}", e);
                 libc::EIO
-            })
+            })?;
+
+            parent_path
+        }; // Drop db lock before cleanup
+
+        if let Some(parent) = parent_path {
+            self.cleanup_orphaned_metadata_directories(&parent);
+        }
+
+        Ok(())
     }
 
     /// Rename a metadata directory in the database.
@@ -198,6 +244,21 @@ impl TorrentService {
                 error!("Failed to rename metadata directory in database: {:?}", e);
                 libc::EIO
             })
+    }
+
+    /// Clean up orphaned metadata directories starting from `source_path`.
+    /// Removes metadata_directories entries that have no torrents and no child directories.
+    fn cleanup_orphaned_metadata_directories(&self, source_path: &str) {
+        let mut db_guard = match self.db.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                error!("Database lock poisoned during orphan cleanup");
+                return;
+            }
+        };
+        if let Err(e) = db_guard.cleanup_orphaned_metadata_directories(source_path) {
+            warn!("Failed to cleanup orphaned metadata directories: {:?}", e);
+        }
     }
 
     /// Check if a torrent with the given id exists in the database.
