@@ -18,7 +18,7 @@ use fuser::{
     Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{EACCES, EAGAIN, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, EROFS};
+use libc::{EACCES, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, EROFS};
 use tracing::{error, info, warn};
 
 use self::inodes::{
@@ -223,9 +223,9 @@ impl TorrentFs {
                 }
             }
 
-            // Pieces need downloading — spawn background download and tell
-            // the kernel to retry later.  This keeps the FUSE event loop
-            // responsive for all other operations (getattr, readdir, etc.).
+            // Pieces need downloading — spawn background download.
+            // The async thread downloads without holding the DM lock,
+            // so other FUSE operations remain responsive.
             info!(
                 "Deferring read for torrent file (torrent_id={}, file_id={}): \
                  pieces not on disk, starting background download",
@@ -237,7 +237,87 @@ impl TorrentFs {
                 offset as u64,
                 size as u32,
             );
-            Err(EAGAIN)
+
+            // Poll-wait briefly for pieces to arrive.  The kernel treats
+            // ANY error from a FUSE read reply (including EAGAIN) as a
+            // permanent I/O error (EIO), so we cannot return EAGAIN.
+            // Instead we poll pieces_on_disk (lock-free relative to the
+            // DownloadManager) for a short window; the async download
+            // typically delivers small requests within this window.
+            let poll_timeout = std::time::Duration::from_secs(2);
+            let poll_start = std::time::Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                match ds.pieces_on_disk(&info, file_index, offset as u64, size as u32) {
+                    Ok(true) => {
+                        info!(
+                            "Pieces now on disk after {:.1}s poll (torrent_id={}, file_id={})",
+                            poll_start.elapsed().as_secs_f64(),
+                            torrent_id,
+                            file_id
+                        );
+                        match ds.read_file_range(
+                            &info, file_index, offset as u64, size as u32,
+                        ) {
+                            Ok(data) => return Ok(data),
+                            Err(e) => {
+                                warn!(
+                                    "Failed to read from torrent file after poll-wait \
+                                     (torrent_id={}, file_id={}): {}",
+                                    torrent_id, file_id, e
+                                );
+                                return Err(EIO);
+                            }
+                        }
+                    }
+                    Ok(false) => {
+                        if poll_start.elapsed() >= poll_timeout {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to check pieces on disk during poll \
+                             (torrent_id={}, file_id={}): {:?}",
+                            torrent_id, file_id, e
+                        );
+                        return Err(EIO);
+                    }
+                }
+            }
+
+            // Poll-wait exhausted — fall through to blocking read_file_range.
+            // This holds the DownloadManager lock during piece-wait, but the
+            // short poll above handled the common case where pieces arrive
+            // quickly from a previous async download.
+            warn!(
+                "Poll-wait exhausted after {:.1}s for torrent file \
+                 (torrent_id={}, file_id={}), falling back to blocking read",
+                poll_timeout.as_secs_f64(),
+                torrent_id,
+                file_id
+            );
+            match ds.read_file_range(&info, file_index, offset as u64, size as u32) {
+                Ok(data) => {
+                    info!(
+                        "Successfully read {} bytes from torrent file \
+                         (torrent_id={}, file_id={}) after blocking wait",
+                        data.len(),
+                        torrent_id,
+                        file_id
+                    );
+                    return Ok(data);
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to read from torrent file (torrent_id={}, file_id={}): {}. \
+                         The torrent may have no active peers/seeds. \
+                         Check tracker health with `cat .stats`.",
+                        torrent_id, file_id, e
+                    );
+                    return Err(EIO);
+                }
+            }
         } else {
             error!("Download manager not available");
             Err(EIO)
@@ -865,9 +945,7 @@ impl Filesystem for TorrentFs {
                                 reply.data(&data);
                             }
                             Err(e) => {
-                                if e != EAGAIN {
-                                    warn!("Failed to read torrent file data: {:?}", e);
-                                }
+                                warn!("Failed to read torrent file data: {:?}", e);
                                 reply.error(e);
                             }
                         }
