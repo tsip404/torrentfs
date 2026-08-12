@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use hex;
 
+use crate::domain::pieces_manager::PieceStatus;
 use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::cache::CacheManager;
 use crate::infrastructure::config::TorrentfsConfig;
@@ -136,8 +137,8 @@ impl DownloadService {
     }
 
 
-    /// Get piece status vector `(priority, is_cached)` for all pieces of a torrent.
-    /// Used by `.stats` to render the `-- Pieces --` visualisation block.
+    /// Get piece status vector `PieceStatus` for all pieces of a torrent.
+    /// Used by `.stats` to render the piece markers.
     ///
     /// Clones the PiecesManager Arc under a brief DM lock, then releases the DM lock
     /// before calling PiecesManager to avoid ABBA deadlock with read_file_range.
@@ -145,7 +146,7 @@ impl DownloadService {
         &self,
         info_hash: &str,
         num_pieces: i32,
-    ) -> TorrentResult<Vec<(i32, bool)>> {
+    ) -> TorrentResult<Vec<PieceStatus>> {
         let pm = {
             let dm = self
                 .download_manager

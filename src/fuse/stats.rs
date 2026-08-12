@@ -7,6 +7,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use crate::cache::CacheManager;
 use crate::db::{Database, TorrentStatus};
+use crate::domain::pieces_manager::PieceStatus;
 use crate::services::download::DownloadService;
 use crate::infrastructure::download::SessionStats;
 
@@ -242,6 +243,22 @@ fn status_to_english(status: &TorrentStatus) -> &'static str {
     }
 }
 
+/// Render the piece marker per the `.stats` spec:
+/// `[x]` downloaded, `[]` not wanted, `[N]` priority N, `[X N]` downloaded with N accesses.
+fn piece_marker(status: &PieceStatus) -> String {
+    if status.is_cached {
+        if status.hit_count > 0 {
+            format!("[X {}]", status.hit_count)
+        } else {
+            "[x]".to_string()
+        }
+    } else if status.priority > 0 {
+        format!("[{}]", status.priority)
+    } else {
+        "[]".to_string()
+    }
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Generate global stats (no per-torrent details, no per-infohash cache breakdown).
@@ -399,27 +416,12 @@ pub fn generate_torrent_stats(
         output.push_str("  ⚠ Health: 0 peers / 0 seeds — tracker may be unreachable\n");
     }
 
-    // -- Info --
-    output.push_str("\n-- Info --\n");
-    if let Some(ref cm) = get_cache_manager() {
-        if let Ok(cm_guard) = cm.lock() {
-            let cache_stats = cm_guard.get_cache_stats_by_infohash(info_hash);
-            output.push_str(&format!(
-                "  Cache: {} pieces  {}\n",
-                cache_stats.piece_count,
-                format_bytes(cache_stats.total_size)
-            ));
-        }
-    }
-    output.push_str(&format!("  info_hash: {}\n", t.info_hash));
-    output.push_str(&format!("  source_path: \"{}\"\n", t.source_path));
-
-    // -- Pieces -- visualised piece lifecycle
+    // -- Pieces -- visualised piece lifecycle (info fields merged below)
     // Collect num_pieces from handle first (brief lock), then release
     // handle lock before calling get_pieces_status to avoid ABBA deadlock:
     //   stats path: handle.lock() → ds.get_pieces_status() → DM lock
     //   read path:  DM lock → handle.lock()
-    if let Some(ref ds) = download_service {
+    if let Some(ds) = download_service {
         let handles = ds.get_all_handles();
         // Get num_pieces under a brief handle lock, release it, then
         // query PiecesManager without holding either handle or DM lock.
@@ -443,20 +445,14 @@ pub fn generate_torrent_stats(
                         .map(|(pl, _)| pl as u64)
                         .unwrap_or(0);
                     output.push_str(&format!(
-                        "\n-- Pieces ({} pieces, {} each) --\n  ",
+                        "\n-- Pieces ({} pieces, {} each) --\n",
                         num_pieces,
                         format_bytes(piece_length)
                     ));
-                    for (prio, is_cached) in &pieces {
-                        if *is_cached {
-                            output.push_str("【x】");
-                        } else if *prio > 0 {
-                            output.push_str(&format!("【{}】", prio));
-                        } else {
-                            output.push_str("【】");
-                        }
+                    for (idx, status) in pieces.iter().enumerate() {
+                        output.push_str(&piece_marker(status));
+                        output.push_str(&format!(" piece {}\n", idx));
                     }
-                    output.push('\n');
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -467,6 +463,20 @@ pub fn generate_torrent_stats(
             }
         }
     }
+
+    // Info fields merged after the piece markers (no `-- Info --` header).
+    if let Some(cm) = &get_cache_manager() {
+        if let Ok(cm_guard) = cm.lock() {
+            let cache_stats = cm_guard.get_cache_stats_by_infohash(info_hash);
+            output.push_str(&format!(
+                "Cache: {} pieces  {}\n",
+                cache_stats.piece_count,
+                format_bytes(cache_stats.total_size)
+            ));
+        }
+    }
+    output.push_str(&format!("info_hash: {}\n", t.info_hash));
+    output.push_str(&format!("source_path: \"{}\"\n", t.source_path));
 
     output.push('\n');
     output.push_str(BANNER_LINE);
@@ -736,6 +746,46 @@ mod tests {
     #[test]
     fn test_format_num_u64_max() {
         assert_eq!(format_num(u64::MAX), "18,446,744,073,709,551,615");
+    }
+
+    #[test]
+    fn test_piece_marker_semantics() {
+        // Downloaded, never accessed → `[x]`
+        assert_eq!(
+            piece_marker(&PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 0,
+            }),
+            "[x]"
+        );
+        // Downloaded and accessed 5 times → `[X 5]`
+        assert_eq!(
+            piece_marker(&PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 5,
+            }),
+            "[X 5]"
+        );
+        // Priority 3, not cached → `[3]`
+        assert_eq!(
+            piece_marker(&PieceStatus {
+                priority: 3,
+                is_cached: false,
+                hit_count: 0,
+            }),
+            "[3]"
+        );
+        // Not wanted → `[]`
+        assert_eq!(
+            piece_marker(&PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            }),
+            "[]"
+        );
     }
 
     #[test]
