@@ -26,3 +26,47 @@ main → fuse → services → domain/infrastructure
 - `src/error.rs` — re-exports from `domain::error`
 
 Dependency direction: `domain` has no dependency on `infrastructure`; `infrastructure` implements `domain` traits.
+
+## Container Deployment
+
+torrentfs ships a Docker image (`ghcr.io/tsip404/torrentfs`) with a smart entrypoint that handles FUSE device setup and mount visibility.
+
+### Quick Start
+
+```bash
+# Docker (rootful) — host-visible FUSE mount via shared propagation
+docker run --rm \
+  --device /dev/fuse \
+  --cap-add SYS_ADMIN \
+  --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
+  ghcr.io/tsip404/torrentfs
+```
+
+On the host, prepare the shared mount first:
+```bash
+mkdir -p /host/torrentfs
+mount --bind /host/torrentfs /host/torrentfs
+mount --make-shared /host/torrentfs
+```
+
+### Rootless podman
+
+Rootless podman **does not support shared mount propagation** (`rshared`). This is a fundamental limitation of user namespaces — the container cannot create mount events that propagate to the host.
+
+**What works**: torrentfs mounts and operates correctly inside the container. Use `podman exec` to access the filesystem:
+
+```bash
+podman run -d --name torrentfs \
+  --device /dev/fuse \
+  --cap-add SYS_ADMIN \
+  ghcr.io/tsip404/torrentfs
+
+podman exec torrentfs ls /mnt/metadata/
+```
+
+**What does not work**: the host cannot access the FUSE mount through a bind-mounted directory. If you need host-visible FUSE mounts:
+
+- Use rootful podman (`sudo podman run ...`) or Docker
+- Run torrentfs directly on the host without a container
+
+The entrypoint automatically detects rootless podman and runs in container-only mode, skipping the unsupported bind mount step.
