@@ -136,6 +136,36 @@ impl DownloadService {
     }
 
 
+    /// Get piece status vector `(priority, is_cached)` for all pieces of a torrent.
+    /// Used by `.stats` to render the `-- Pieces --` visualisation block.
+    ///
+    /// Clones the PiecesManager Arc under a brief DM lock, then releases the DM lock
+    /// before calling PiecesManager to avoid ABBA deadlock with read_file_range.
+    pub fn get_pieces_status(
+        &self,
+        info_hash: &str,
+        num_pieces: i32,
+    ) -> TorrentResult<Vec<(i32, bool)>> {
+        let pm = {
+            let dm = self
+                .download_manager
+                .lock()
+                .map_err(|_| TorrentError::Unknown {
+                    code: -1,
+                    message: "DownloadManager lock poisoned".to_string(),
+                })?;
+            dm.pieces_manager_arc()
+        };
+        let pm_guard = pm
+            .lock()
+            .map_err(|_| TorrentError::Unknown {
+                code: -1,
+                message: "PiecesManager lock poisoned".to_string(),
+            })?;
+        pm_guard.get_pieces_status(info_hash, num_pieces)
+    }
+
+
     /// Check whether all piece files needed for a file range exist on disk.
     ///
     /// Uses the same criteria as `DownloadManager::is_piece_complete_in_cache`
@@ -259,8 +289,9 @@ impl DownloadService {
                 None => return,
             };
 
-            // Phase 1: get handle (brief DM lock, milliseconds)
-            let (handle, read_timeout) = {
+            // Phase 1: get handle + apply selective priority (brief DM lock)
+            // Phase 1: get handle + pieces_manager + apply selective priority
+            let (handle, read_timeout, pm) = {
                 let mut mgr = match dm.lock() {
                     Ok(mgr) => mgr,
                     Err(_) => {
@@ -268,20 +299,34 @@ impl DownloadService {
                         return;
                     }
                 };
-                let handle = match mgr.get_or_create_handle(&info) {
+                let handle = match mgr.ensure_handle_lightweight(&info) {
                     Ok(h) => h,
                     Err(e) => {
-                        tracing::warn!("request_download_async: get_or_create_handle failed: {:?}", e);
+                        tracing::warn!("request_download_async: ensure_handle_lightweight failed: {:?}", e);
                         return;
                     }
                 };
-                (handle, mgr.read_timeout_secs)
+                // Clone PiecesManager Arc for background thread use.
+                let pm = mgr.pieces_manager_arc();
+                // Apply selective piece priority while we hold the DM lock.
+                if let Ok(h) = handle.lock() {
+                    if let Err(e) = mgr.apply_read_priority(
+                        &h, &info, file_index, offset, size,
+                    ) {
+                        tracing::warn!(
+                            "request_download_async: apply_read_priority failed: {:?}",
+                            e
+                        );
+                    }
+                }
+                (handle, mgr.read_timeout_secs, pm)
             }; // DM lock RELEASED here
 
-            // Phase 2: wait for pieces (NO DM lock — only handle + cache)
+            // Phase 2: wait for pieces (NO DM lock — only handle + cache + pieces_manager)
             DownloadManager::background_wait_for_pieces(
                 &handle,
                 &cm,
+                &pm,
                 &info_hash,
                 start_piece,
                 end_piece,

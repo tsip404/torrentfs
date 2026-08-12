@@ -281,7 +281,7 @@ pub fn generate_torrent_stats(
     torrent_id: i64,
     info_hash: &str,
     db: &Option<Arc<Mutex<Database>>>,
-    download_service: &Option<DownloadService>,
+    download_service: &Option<Arc<DownloadService>>,
     get_cache_manager: impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
 ) -> Vec<u8> {
     let mut output = String::new();
@@ -414,6 +414,60 @@ pub fn generate_torrent_stats(
     output.push_str(&format!("  info_hash: {}\n", t.info_hash));
     output.push_str(&format!("  source_path: \"{}\"\n", t.source_path));
 
+    // -- Pieces -- visualised piece lifecycle
+    // Collect num_pieces from handle first (brief lock), then release
+    // handle lock before calling get_pieces_status to avoid ABBA deadlock:
+    //   stats path: handle.lock() → ds.get_pieces_status() → DM lock
+    //   read path:  DM lock → handle.lock()
+    if let Some(ref ds) = download_service {
+        let handles = ds.get_all_handles();
+        // Get num_pieces under a brief handle lock, release it, then
+        // query PiecesManager without holding either handle or DM lock.
+        let num_pieces = handles
+            .iter()
+            .find(|(ih, _)| ih == info_hash)
+            .and_then(|(_, handle)| handle.lock().ok())
+            .and_then(|h| h.get_torrent_info().ok())
+            .map(|(_, n)| n)
+            .unwrap_or(0);
+
+        if num_pieces > 0 {
+            match ds.get_pieces_status(info_hash, num_pieces as i32) {
+                Ok(pieces) => {
+                    // piece_length from any handle for display; brief lock only
+                    let piece_length = handles
+                        .iter()
+                        .find(|(ih, _)| ih == info_hash)
+                        .and_then(|(_, handle)| handle.lock().ok())
+                        .and_then(|h| h.get_torrent_info().ok())
+                        .map(|(pl, _)| pl as u64)
+                        .unwrap_or(0);
+                    output.push_str(&format!(
+                        "\n-- Pieces ({} pieces, {} each) --\n  ",
+                        num_pieces,
+                        format_bytes(piece_length)
+                    ));
+                    for (prio, is_cached) in &pieces {
+                        if *is_cached {
+                            output.push_str("【x】");
+                        } else if *prio > 0 {
+                            output.push_str(&format!("【{}】", prio));
+                        } else {
+                            output.push_str("【】");
+                        }
+                    }
+                    output.push('\n');
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to get pieces status for {}: {:?}",
+                        info_hash, e
+                    );
+                }
+            }
+        }
+    }
+
     output.push('\n');
     output.push_str(BANNER_LINE);
     output.push('\n');
@@ -424,7 +478,7 @@ pub fn generate_torrent_stats(
 pub fn generate_directory_stats(
     source_path: &str,
     db: &Option<Arc<Mutex<Database>>>,
-    download_service: &Option<DownloadService>,
+    download_service: &Option<Arc<DownloadService>>,
     get_cache_manager: impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
 ) -> Vec<u8> {
     let mut output = String::new();

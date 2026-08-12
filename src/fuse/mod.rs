@@ -39,7 +39,7 @@ pub struct TorrentFs {
     pub db: Option<Arc<Mutex<Database>>>,
     pub torrent_service: Option<TorrentService>,
     pub processing_torrents: Arc<Mutex<HashMap<String, ()>>>,
-    pub download_service: Option<DownloadService>,
+    pub download_service: Option<Arc<DownloadService>>,
     pub torrent_data_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub listen_addr: String,
 }
@@ -55,7 +55,7 @@ impl TorrentFs {
             }
         }
 
-        let download_service = DownloadService::new(cache_path.as_path(), config).ok();
+        let download_service = DownloadService::new(cache_path.as_path(), config).ok().map(Arc::new);
 
         // Register SeedingManager as eviction callback on the DownloadService's CacheManager
         if let Some(ref ds) = download_service {
@@ -117,7 +117,7 @@ impl TorrentFs {
         };
 
         let db_arc = Arc::new(Mutex::new(db));
-        fs.torrent_service = Some(TorrentService::new(db_arc.clone()));
+        fs.torrent_service = Some(TorrentService::new(db_arc.clone(), fs.download_service.clone()));
         fs.db = Some(db_arc);
         fs.inode_mgr.restore_metadata_inodes(dirs, torrents);
         fs

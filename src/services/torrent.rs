@@ -7,18 +7,29 @@ use crate::db::{Database, FileEntry, InsertTorrentResult, TorrentFile};
 use crate::metadata::TorrentInfo;
 use tracing::{error, info, warn};
 
+use super::download::DownloadService;
+
 /// TorrentService wraps database operations for torrent lifecycle management.
 pub struct TorrentService {
     db: Arc<Mutex<Database>>,
+    download_service: Option<Arc<DownloadService>>,
 }
 
 impl TorrentService {
-    pub fn new(db: Arc<Mutex<Database>>) -> Self {
-        Self { db }
+    pub fn new(
+        db: Arc<Mutex<Database>>,
+        download_service: Option<Arc<DownloadService>>,
+    ) -> Self {
+        Self {
+            db,
+            download_service,
+        }
     }
 
     /// Add a torrent to the database. Parses the torrent data, extracts metadata,
-    /// and persists everything atomically.
+    /// and persists everything atomically.  After persistence, creates an
+    /// upload_mode libtorrent handle so peer/seed information is immediately
+    /// available without downloading any data.
     pub fn add_torrent(&self, data: &[u8], source_path: &str, filename: &str) -> Result<(), i32> {
         let info = TorrentInfo::from_bytes(data.to_vec()).map_err(|e| {
             warn!("Failed to parse torrent {}: {:?}", filename, e);
@@ -32,59 +43,88 @@ impl TorrentService {
 
         let info_hash_hex = hex::encode(metadata.info_hash);
 
-        let mut db_guard = self.db.lock().map_err(|_| {
-            error!("Database lock poisoned");
-            libc::EIO
-        })?;
-
-        let files: Vec<FileEntry> = metadata
-            .files
-            .iter()
-            .map(|f| FileEntry {
-                path: f.path.clone(),
-                size: f.size as i64,
-            })
-            .collect();
-
-        let result = db_guard
-            .insert_torrent_with_files(
-                source_path,
-                &metadata.name,
-                filename,
-                metadata.total_size as i64,
-                &info_hash_hex,
-                metadata.num_files as i64,
-                &files,
-            )
-            .map_err(|e| {
-                error!("Failed to insert torrent with files {}: {:?}", filename, e);
+        let is_new = {
+            let mut db_guard = self.db.lock().map_err(|_| {
+                error!("Database lock poisoned");
                 libc::EIO
             })?;
 
-        match result {
-            InsertTorrentResult::Inserted(torrent_id) => {
-                db_guard.set_torrent_data(torrent_id, data).map_err(|e| {
-                    error!("Failed to store torrent data for {}: {:?}", filename, e);
+            let files: Vec<FileEntry> = metadata
+                .files
+                .iter()
+                .map(|f| FileEntry {
+                    path: f.path.clone(),
+                    size: f.size as i64,
+                })
+                .collect();
+
+            let result = db_guard
+                .insert_torrent_with_files(
+                    source_path,
+                    &metadata.name,
+                    filename,
+                    metadata.total_size as i64,
+                    &info_hash_hex,
+                    metadata.num_files as i64,
+                    &files,
+                )
+                .map_err(|e| {
+                    error!("Failed to insert torrent with files {}: {:?}", filename, e);
                     libc::EIO
                 })?;
 
-                info!(
-                    "Persisted torrent '{}' ({} files, {} bytes) from {}",
-                    metadata.name,
-                    metadata.num_files,
-                    metadata.total_size,
-                    if source_path.is_empty() {
-                        "root"
-                    } else {
-                        source_path
+            let is_new = match result {
+                InsertTorrentResult::Inserted(torrent_id) => {
+                    db_guard.set_torrent_data(torrent_id, data).map_err(|e| {
+                        error!("Failed to store torrent data for {}: {:?}", filename, e);
+                        libc::EIO
+                    })?;
+
+                    info!(
+                        "Persisted torrent '{}' ({} files, {} bytes) from {}",
+                        metadata.name,
+                        metadata.num_files,
+                        metadata.total_size,
+                        if source_path.is_empty() {
+                            "root"
+                        } else {
+                            source_path
+                        }
+                    );
+                    true
+                }
+                InsertTorrentResult::Duplicate(existing_id) => {
+                    info!(
+                        "Torrent '{}' already exists (id={}), duplicate recorded",
+                        metadata.name, existing_id
+                    );
+                    false
+                }
+            };
+            // db_guard dropped here (end of block scope)
+            is_new
+        };
+
+        // Create upload_mode handle so peer/seed info is visible immediately
+        // without triggering any data download (all pieces at priority 0).
+        if is_new {
+            if let Some(ref ds) = self.download_service {
+                match ds.ensure_handle_lightweight(&info) {
+                    Ok(_) => {
+                        info!(
+                            "Created lightweight handle for torrent '{}' (upload_mode)",
+                            metadata.name
+                        );
                     }
-                );
-            }
-            InsertTorrentResult::Duplicate(existing_id) => {
-                info!(
-                    "Torrent '{}' already exists (id={}), duplicate recorded",
-                    metadata.name, existing_id
-                );
+                    Err(e) => {
+                        warn!(
+                            "Failed to create lightweight handle for torrent '{}': {:?}",
+                            metadata.name, e
+                        );
+                        // Non-fatal: the torrent is already in the database and
+                        // a handle will be created lazily when first accessed.
+                    }
+                }
             }
         }
 

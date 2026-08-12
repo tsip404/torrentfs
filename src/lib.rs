@@ -19,7 +19,8 @@ pub use infrastructure::{
 // domain layer re-exports
 pub use domain::{
     DbError as DomainDbError, FileEntry as DomainFileEntry, FileRepository,
-    InsertTorrentResult as DomainInsertResult, Torrent as DomainTorrent,
+    InsertTorrentResult as DomainInsertResult, PiecePriorityConfig, PiecesManager,
+    Torrent as DomainTorrent,
     TorrentDirectory as DomainTorrentDirectory, TorrentFile as DomainTorrentFile,
     TorrentRepository, TorrentStatus as DomainTorrentStatus,
 };
