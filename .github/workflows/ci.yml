@@ -12,8 +12,16 @@ concurrency:
 
 jobs:
   test:
-    name: Cargo Test
-    runs-on: ubuntu-24.04
+    name: Cargo Test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+      fail-fast: false
     container: debian:sid-slim
     steps:
       - uses: actions/checkout@v5
@@ -43,15 +51,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-sid21-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-${{ hashFiles('**/Cargo.lock', '.github/workflows/ci.yml') }}
           restore-keys: |
-            ${{ runner.os }}-sid21-cargo-
+            ${{ runner.os }}-${{ runner.arch }}-sid21-cargo-
 
       - name: Run tests
         run: cargo test --locked --workspace --no-fail-fast
 
-  docker-build:
-    name: Docker Build
+  docker-build-amd64:
+    name: Docker Build (amd64)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -59,21 +67,34 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image (amd64 + arm64)
+      - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: false
-          platforms: linux/amd64,linux/arm64
+          load: true
+          platforms: linux/amd64
           tags: torrentfs:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Smoke test image (amd64 only)
-        run: |
-          docker buildx build \
-            --platform linux/amd64 \
-            --load \
-            -t torrentfs:ci \
-            .
-          docker run --rm torrentfs:ci --help
+      - name: Smoke test image
+        run: docker run --rm torrentfs:ci --help
+
+  docker-build-arm64:
+    name: Docker Build (arm64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          platforms: linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
