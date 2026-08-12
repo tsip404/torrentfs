@@ -39,6 +39,25 @@ is_root() {
     test "$(id -u)" -eq 0
 }
 
+is_rootless_podman() {
+    # Rootless podman: container detected via podman signatures AND the
+    # user namespace maps container UID 0 to a non-zero host UID.
+    # (/proc/self/uid_map row 1 col 2 is the host-side UID; != 0 means
+    # we are in a user namespace, i.e. rootless.)
+    # In rootless podman, shared mount propagation (rshared) is not supported
+    # because the user namespace lacks the necessary mount privileges.
+    # Ref: https://lists.podman.io/archives/list/podman@lists.podman.io/thread/YOGMR5I2M4MLCMQGZGFUV3NOJYJKZZ2X/
+    if in_container; then
+        # Podman signatures: /run/.containerenv or libpod- cgroup
+        if test -f /run/.containerenv || grep -q ':/libpod-' /proc/1/cgroup 2>/dev/null; then
+            if awk 'NR==1 { exit !($2 != 0) }' /proc/self/uid_map 2>/dev/null; then
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
 fuse_device_exists() {
     test -c /dev/fuse
 }
@@ -101,6 +120,12 @@ if ! ensure_fuse_device; then
 ║         cap_add:                                                     ║
 ║           - SYS_ADMIN                                                ║
 ║                                                                      ║
+║  Rootless podman caveat: shared mount propagation (rshared) is not   ║
+║  supported in rootless podman. Even with /dev/fuse available, the    ║
+║  FUSE mount will only be visible inside the container — the host     ║
+║  cannot access it via a bind mount. Use rootful podman or Docker     ║
+║  for host-visible FUSE mounts.                                       ║
+║                                                                      ║
 ║  If you cannot grant these privileges, torrentfs cannot mount its    ║
 ║  FUSE filesystem inside a container. Run torrentfs on the host or    ║
 ║  in a privileged container instead.                                  ║
@@ -117,17 +142,31 @@ fi
 #   --mount type=bind,source=<host-path>,target=<container-path>,bind-propagation=rshared
 # and the host source directory must itself be a shared mount:
 #   mount --bind <host-path> <host-path> && mount --make-shared <host-path>
+#
+# Rootless podman does not support shared mount propagation, so the
+# two-stage bind mount is skipped: torrentfs mounts directly on $mountpoint
+# and the FUSE filesystem is only visible inside the container.
 start_torrentfs() {
     local mountpoint="$1"
     shift
-    local internal_mnt="/mnt-inner"
 
-    mkdir -p "$internal_mnt"
+    if is_rootless_podman; then
+        start_torrentfs_rootless "$mountpoint" "$@"
+    else
+        start_torrentfs_rootful "$mountpoint" "$@"
+    fi
+}
+
+# Rootless podman path: direct FUSE mount, no bind mount (propagation not supported).
+start_torrentfs_rootless() {
+    local mountpoint="$1"
+    shift
+
     mkdir -p "$mountpoint"
 
-    echo "[entrypoint] starting torrentfs on internal mount $internal_mnt" >&2
+    echo "[entrypoint] rootless podman detected — FUSE mount will only be visible inside the container" >&2
+    echo "[entrypoint] starting torrentfs directly on $mountpoint" >&2
 
-    # Forward termination signals to torrentfs (we are PID 1 in container)
     local torrentfs_pid=""
     cleanup() {
         echo "[entrypoint] shutting down" >&2
@@ -139,11 +178,56 @@ start_torrentfs() {
     }
     trap cleanup EXIT INT TERM
 
-    # Start torrentfs on internal path with remaining args
-    torrentfs "$internal_mnt" "$@" &
+    torrentfs "$mountpoint" "$@" &
     torrentfs_pid=$!
 
     # Wait for FUSE mount to become ready (up to 30s)
+    local ready=0
+    for i in $(seq 1 60); do
+        if mountpoint -q "$mountpoint" 2>/dev/null; then
+            ready=1
+            break
+        fi
+        sleep 0.5
+    done
+
+    if [ "$ready" -eq 0 ]; then
+        echo "[entrypoint] FUSE mount did not become ready within 30s" >&2
+        kill "$torrentfs_pid" 2>/dev/null || true
+        wait "$torrentfs_pid" 2>/dev/null || true
+        exit 1
+    fi
+
+    echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint (container-only)" >&2
+
+    wait "$torrentfs_pid" || true
+}
+
+# Rootful container (or Docker) path: two-stage bind mount for host visibility.
+start_torrentfs_rootful() {
+    local mountpoint="$1"
+    shift
+    local internal_mnt="/mnt-inner"
+
+    mkdir -p "$internal_mnt"
+    mkdir -p "$mountpoint"
+
+    echo "[entrypoint] starting torrentfs on internal mount $internal_mnt" >&2
+
+    local torrentfs_pid=""
+    cleanup() {
+        echo "[entrypoint] shutting down" >&2
+        if [ -n "$torrentfs_pid" ]; then
+            kill "$torrentfs_pid" 2>/dev/null || true
+            wait "$torrentfs_pid" 2>/dev/null || true
+        fi
+        umount "$mountpoint" 2>/dev/null || true
+    }
+    trap cleanup EXIT INT TERM
+
+    torrentfs "$internal_mnt" "$@" &
+    torrentfs_pid=$!
+
     local ready=0
     for i in $(seq 1 60); do
         if mountpoint -q "$internal_mnt" 2>/dev/null; then
@@ -165,7 +249,6 @@ start_torrentfs() {
 
     echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint" >&2
 
-    # Wait for torrentfs to exit
     wait "$torrentfs_pid" || true
 }
 
