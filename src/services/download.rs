@@ -115,6 +115,13 @@ impl DownloadService {
     pub fn snapshot_stats(&self) -> SessionStats {
         self.cached_stats.snapshot()
     }
+    /// The read timeout (seconds) used to bound piece-download waits.
+    pub fn read_timeout_secs(&self) -> u64 {
+        self.download_manager
+            .lock()
+            .map(|dm| dm.read_timeout_secs)
+            .unwrap_or(30)
+    }
 
     /// Get a clone of the shared cached stats for the alert consumer.
     pub fn cached_stats(&self) -> SharedSessionStats {

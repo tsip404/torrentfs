@@ -44,6 +44,20 @@ pub struct TorrentFs {
     pub listen_addr: String,
 }
 
+/// Outcome of a synchronous attempt to serve a torrent file read.
+enum TorrentReadOutcome {
+    /// Data served synchronously (in-memory cache hit or all pieces on disk).
+    Ready(Vec<u8>),
+    /// Pieces still need downloading. The read must be completed off the FUSE
+    /// dispatch thread so other operations (readdir, `.stats`) stay responsive.
+    Deferred {
+        info: TorrentInfo,
+        file_index: i32,
+        offset: u64,
+        size: u32,
+    },
+}
+
 impl TorrentFs {
     pub fn new_with_cache_path(
         cache_path: PathBuf,
@@ -137,7 +151,7 @@ impl TorrentFs {
         file_id: i64,
         offset: usize,
         size: usize,
-    ) -> Result<Vec<u8>, i32> {
+    ) -> Result<TorrentReadOutcome, i32> {
         let ts = self.torrent_service.as_ref().ok_or_else(|| {
             error!("Torrent service not available");
             EIO
@@ -165,9 +179,9 @@ impl TorrentFs {
             if let Some(cached) = cache.get(&cache_key) {
                 let end = std::cmp::min(offset + size, cached.len());
                 if offset < cached.len() {
-                    return Ok(cached[offset..end].to_vec());
+                    return Ok(TorrentReadOutcome::Ready(cached[offset..end].to_vec()));
                 } else {
-                    return Ok(Vec::new());
+                    return Ok(TorrentReadOutcome::Ready(Vec::new()));
                 }
             }
         }
@@ -209,7 +223,7 @@ impl TorrentFs {
                             torrent_id,
                             file_id
                         );
-                        return Ok(data);
+                        return Ok(TorrentReadOutcome::Ready(data));
                     }
                     Err(e) => {
                         warn!(
@@ -259,7 +273,7 @@ impl TorrentFs {
                         match ds.read_file_range(
                             &info, file_index, offset as u64, size as u32,
                         ) {
-                            Ok(data) => return Ok(data),
+                            Ok(data) => return Ok(TorrentReadOutcome::Ready(data)),
                             Err(e) => {
                                 warn!(
                                     "Failed to read from torrent file after poll-wait \
@@ -286,38 +300,25 @@ impl TorrentFs {
                 }
             }
 
-            // Poll-wait exhausted — fall through to blocking read_file_range.
-            // This holds the DownloadManager lock during piece-wait, but the
-            // short poll above handled the common case where pieces arrive
-            // quickly from a previous async download.
+            // Poll-wait exhausted — complete the read on a background worker
+            // thread instead of blocking the FUSE dispatch loop.  fuser's
+            // read-dispatch loop is single-threaded (`&mut self`), so a
+            // blocking read_file_range here would stall every other FUSE
+            // operation (readdir, `.stats`, getattr) for up to
+            // read_timeout_secs (TSI-2114).
             warn!(
                 "Poll-wait exhausted after {:.1}s for torrent file \
-                 (torrent_id={}, file_id={}), falling back to blocking read",
+                 (torrent_id={}, file_id={}), deferring read to worker thread",
                 poll_timeout.as_secs_f64(),
                 torrent_id,
                 file_id
             );
-            match ds.read_file_range(&info, file_index, offset as u64, size as u32) {
-                Ok(data) => {
-                    info!(
-                        "Successfully read {} bytes from torrent file \
-                         (torrent_id={}, file_id={}) after blocking wait",
-                        data.len(),
-                        torrent_id,
-                        file_id
-                    );
-                    return Ok(data);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to read from torrent file (torrent_id={}, file_id={}): {}. \
-                         The torrent may have no active peers/seeds. \
-                         Check tracker health with `cat .stats`.",
-                        torrent_id, file_id, e
-                    );
-                    return Err(EIO);
-                }
-            }
+            return Ok(TorrentReadOutcome::Deferred {
+                info,
+                file_index,
+                offset: offset as u64,
+                size: size as u32,
+            });
         } else {
             error!("Download manager not available");
             Err(EIO)
@@ -941,8 +942,71 @@ impl Filesystem for TorrentFs {
                             offset,
                             result_size,
                         ) {
-                            Ok(data) => {
+                            Ok(TorrentReadOutcome::Ready(data)) => {
                                 reply.data(&data);
+                            }
+                            Ok(TorrentReadOutcome::Deferred {
+                                info,
+                                file_index,
+                                offset: file_offset,
+                                size: read_len,
+                            }) => {
+                                // Complete the read on a worker thread and reply
+                                // asynchronously, keeping the FUSE dispatch loop
+                                // free for readdir/.stats (TSI-2114).  The worker
+                                // polls pieces_on_disk (CacheManager only) and only
+                                // locks the DownloadManager briefly for the final
+                                // fast-path read, so `.stats` never blocks on a
+                                // pending piece download.
+                                match self.download_service.clone() {
+                                    Some(ds) => {
+                                        let timeout =
+                                            std::time::Duration::from_secs(ds.read_timeout_secs());
+                                        std::thread::spawn(move || {
+                                            let start = std::time::Instant::now();
+                                            let result: Result<Vec<u8>, i32> = loop {
+                                                match ds.pieces_on_disk(
+                                                    &info,
+                                                    file_index,
+                                                    file_offset,
+                                                    read_len,
+                                                ) {
+                                                    Ok(true) => {
+                                                        break ds
+                                                            .read_file_range(
+                                                                &info,
+                                                                file_index,
+                                                                file_offset,
+                                                                read_len,
+                                                            )
+                                                            .map_err(|_| EIO);
+                                                    }
+                                                    Ok(false) => {
+                                                        if start.elapsed() >= timeout {
+                                                            break Err(EIO);
+                                                        }
+                                                        std::thread::sleep(
+                                                            std::time::Duration::from_millis(200),
+                                                        );
+                                                    }
+                                                    Err(_) => break Err(EIO),
+                                                }
+                                            };
+                                            match result {
+                                                Ok(data) => reply.data(&data),
+                                                Err(e) => {
+                                                    warn!(
+                                                        "Failed to read torrent file data \
+                                                         (async): {}",
+                                                        e
+                                                    );
+                                                    reply.error(EIO);
+                                                }
+                                            }
+                                        });
+                                    }
+                                    None => reply.error(EIO),
+                                }
                             }
                             Err(e) => {
                                 warn!("Failed to read torrent file data: {:?}", e);
