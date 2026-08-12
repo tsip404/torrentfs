@@ -18,7 +18,7 @@ use fuser::{
     Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{EACCES, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EROFS};
+use libc::{EACCES, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, EROFS};
 use tracing::{error, info, warn};
 
 use self::inodes::{
@@ -1155,22 +1155,25 @@ impl Filesystem for TorrentFs {
         let name_str = name.to_string_lossy();
         let newname_str = newname.to_string_lossy();
 
-        // Check parent existence — if the source parent inode doesn't exist in the
-        // inode table, the directory it references has been removed.  Return ENOENT
-        // rather than a misleading EACCES from the metadata-child check below.
-        if !self.inode_mgr.inodes.contains_key(&parent) {
+        // Check parent existence in both inodes and data_inodes tables.
+        // data/ subdirectories (TorrentRoot, TorrentDir, etc.) live in data_inodes,
+        // not inodes, so searching only inodes produces a misleading ENOENT.
+        let parent_exists = self.inode_mgr.inodes.contains_key(&parent)
+            || self.inode_mgr.data_inodes.contains_key(&parent);
+        if !parent_exists {
             warn!(
-                "Rename source parent inode {} not found in inode table",
+                "Rename source parent inode {} not found",
                 parent
             );
             reply.error(ENOENT);
             return;
         }
 
-        // Same check for the target parent.
-        if !self.inode_mgr.inodes.contains_key(&newparent) {
+        let newparent_exists = self.inode_mgr.inodes.contains_key(&newparent)
+            || self.inode_mgr.data_inodes.contains_key(&newparent);
+        if !newparent_exists {
             warn!(
-                "Rename target parent inode {} not found in inode table (directory does not exist)",
+                "Rename target parent inode {} not found",
                 newparent
             );
             reply.error(ENOENT);
@@ -1180,7 +1183,7 @@ impl Filesystem for TorrentFs {
         if !self.inode_mgr.is_metadata_child(parent) || !self.inode_mgr.is_metadata_child(newparent)
         {
             error!("Rename only allowed within metadata/ directory");
-            reply.error(EACCES);
+            reply.error(EPERM);
             return;
         }
 
