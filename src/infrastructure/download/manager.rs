@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::cache::CacheManager;
 use crate::config::TorrentfsConfig;
+use crate::domain::PiecesManager;
 use crate::error::{TorrentError, TorrentResult};
 use crate::seeding::SeedingManager;
 
@@ -24,6 +25,7 @@ pub struct DownloadManager {
     pub(crate) read_timeout_secs: u64,
     pub(crate) seeding_manager: Option<Arc<SeedingManager>>,
     pub(crate) pending_reads: PendingReads,
+    pub(crate) pieces_manager: Arc<Mutex<PiecesManager>>,
 }
 
 impl DownloadManager {
@@ -38,6 +40,12 @@ impl DownloadManager {
         let session = Session::new_with_custom_storage(config, &pieces_dir)?;
 
         let cache_manager = CacheManager::new(cache_dir, 1024 * 1024 * 1024)?;
+        let cache_manager = Arc::new(Mutex::new(cache_manager));
+
+        let pieces_manager = Arc::new(Mutex::new(PiecesManager::new(
+            cache_manager.clone(),
+            crate::domain::PiecePriorityConfig::default(),
+        )));
 
         let read_timeout_secs = config
             .timeouts
@@ -49,10 +57,11 @@ impl DownloadManager {
             session: Arc::new(Mutex::new(session)),
             handles: HashMap::new(),
             cache_dir: cache_dir_str,
-            cache_manager: Arc::new(Mutex::new(cache_manager)),
+            cache_manager,
             read_timeout_secs,
             seeding_manager: None,
             pending_reads: Arc::new(Mutex::new(HashMap::new())),
+            pieces_manager,
         })
     }
 
@@ -100,6 +109,11 @@ impl DownloadManager {
     }
 
     /// Ensure a lightweight handle exists for the given torrent info.
+    /// Initializes the PiecesManager tracking for this torrent so that
+    /// all pieces start at priority 0.  Uses normal add_torrent (not
+    /// upload_mode) so that piece priority elevations actually trigger
+    /// downloading; all pieces are set to priority 0 immediately to
+    /// prevent automatic full download.
     pub fn ensure_handle_lightweight(
         &mut self,
         info: &crate::TorrentInfo,
@@ -111,31 +125,67 @@ impl DownloadManager {
             return Ok(handle.clone());
         }
 
-        // Create handle using upload_mode: connects to trackers/peers
-        // but never requests pieces. Uses custom storage for the first
-        // torrent to set up PieceStorageDiskIO.
         let cache_base = Path::new(&self.cache_dir);
         let pieces_dir = cache_base.join("pieces");
         std::fs::create_dir_all(&pieces_dir).map_err(|e| TorrentError::IoError(e.to_string()))?;
+
+        let torrent_save_dir = pieces_dir.join(&info_hash);
+        std::fs::create_dir_all(&torrent_save_dir)
+            .map_err(|e| TorrentError::IoError(e.to_string()))?;
 
         let mut session = self.session.lock().map_err(|_| TorrentError::Unknown {
             code: -1,
             message: "Session lock poisoned".to_string(),
         })?;
 
-        let handle = session.add_torrent_upload_mode(info, &pieces_dir)?;
+        let handle = session.add_torrent(info, &torrent_save_dir)?;
 
         // Set all pieces to priority 0 to prevent automatic downloading.
         let (_piece_length, num_pieces) = handle.get_torrent_info()?;
         if num_pieces > 0 {
+            // SAFETY: handle.inner is a valid lt_torrent_handle_t returned by
+            // session.add_torrent, guaranteed to be valid for the session lifetime.
             unsafe {
                 libtorrent_sys::lt_torrent_handle_set_all_piece_priorities(handle.inner, 0);
             }
         }
+        // Initialize PiecesManager tracking for this torrent.
+        self.pieces_manager
+            .lock()
+            .map_err(|_| TorrentError::Unknown {
+                code: -1,
+                message: "PiecesManager lock poisoned".to_string(),
+            })?
+            .init_upload_mode(&handle, &info_hash, num_pieces as i32)?;
+
         let handle = Arc::new(Mutex::new(handle));
         self.handles.insert(info_hash.clone(), handle.clone());
 
         Ok(handle)
+    }
+
+    /// Get a shared reference to the PiecesManager for cross-thread access.
+    pub fn pieces_manager_arc(&self) -> Arc<Mutex<PiecesManager>> {
+        self.pieces_manager.clone()
+    }
+
+    /// Apply selective piece priority for a file read range.
+    /// Delegates to PiecesManager::apply_read_priority.
+    pub fn apply_read_priority(
+        &self,
+        handle: &TorrentHandle,
+        info: &crate::TorrentInfo,
+        file_index: i32,
+        offset: u64,
+        size: u32,
+    ) -> TorrentResult<()> {
+        self.pieces_manager
+            .lock()
+            .map_err(|_| TorrentError::Unknown {
+                code: -1,
+                message: "PiecesManager lock poisoned".to_string(),
+            })?
+            .apply_read_priority(handle, info, file_index, offset, size)
     }
 
     /// Query torrent status for a given info_hash without triggering downloads.
@@ -146,40 +196,10 @@ impl DownloadManager {
             .and_then(|guard| guard.status().ok())
     }
 
-    pub fn get_or_create_handle(
-        &mut self,
-        info: &crate::TorrentInfo,
-    ) -> TorrentResult<Arc<Mutex<TorrentHandle>>> {
-        let info_hash = hex::encode(info.info_hash()?);
-
-        if let Some(handle) = self.handles.get(&info_hash) {
-            return Ok(handle.clone());
-        }
-
-        // Use cache/pieces/ as the piece storage directory.
-        let cache_base = Path::new(&self.cache_dir);
-        let pieces_dir = cache_base.join("pieces");
-        std::fs::create_dir_all(&pieces_dir).map_err(|e| TorrentError::IoError(e.to_string()))?;
-
-        let mut session = self.session.lock().map_err(|_| TorrentError::Unknown {
-            code: -1,
-            message: "Session lock poisoned".to_string(),
-        })?;
-
-        let torrent_save_dir = pieces_dir.join(&info_hash);
-        std::fs::create_dir_all(&torrent_save_dir)
-            .map_err(|e| TorrentError::IoError(e.to_string()))?;
-        let handle = session.add_torrent(info, &torrent_save_dir)?;
-
-        let handle = Arc::new(Mutex::new(handle));
-        self.handles.insert(info_hash.clone(), handle.clone());
-
-        Ok(handle)
-    }
-
     pub(crate) fn make_piece_key(info_hash: &str, piece_idx: i32) -> String {
         format!("{}:piece:{}", info_hash, piece_idx)
     }
+
 
     /// Compute the byte-range within a piece's data that overlaps with a requested
     /// read range. Returns `(local_start, local_end)` indices into `piece_data`,
@@ -260,7 +280,7 @@ impl DownloadManager {
         offset: u64,
         size: u32,
     ) -> TorrentResult<Vec<u8>> {
-        let handle = self.get_or_create_handle(info)?;
+        let handle = self.ensure_handle_lightweight(info)?;
         let handle_guard = handle.lock().map_err(|_| TorrentError::Unknown {
             code: -1,
             message: "Handle lock poisoned".to_string(),
@@ -311,6 +331,18 @@ impl DownloadManager {
             status.num_peers,
             status.num_seeds
         );
+        // Apply selective piece priority: gradient from current read range.
+        // This replaces the old all-or-nothing model (all pieces priority=1)
+        // with on-demand selective download.
+        if let Err(e) = self.apply_read_priority(&handle_guard, info, file_index, offset, size) {
+            tracing::warn!(
+                "read_file_range: apply_read_priority failed: {:?}",
+                e
+            );
+            // Non-fatal: proceed with the piece-wait loop even if
+            // priority elevation fails (the piece deadline path still works).
+        }
+
 
         let info_hash = handle_guard.info_hash().to_string();
         let piece_info = handle_guard.get_file_piece_info(file_index)?;
@@ -962,25 +994,36 @@ impl DownloadManager {
         // or until the read timeout expires.
         match rx.recv_timeout(std::time::Duration::from_secs(self.read_timeout_secs)) {
             Ok(data) => {
-                // Cache the result for future reads.
+                // Cache the result for future reads, then deprioritize the piece
+                // via PiecesManager so the elevated priority table is updated.
                 if !data.is_empty() {
-                    let mut cache =
-                        self.cache_manager
-                            .lock()
-                            .map_err(|_| TorrentError::Unknown {
+                    let info_hash = piece_key
+                        .split(':')
+                        .next()
+                        .unwrap_or("unknown");
+                    // Write piece data to disk via CacheManager.
+                    {
+                        let mut cache = self.cache_manager.lock().map_err(|_| {
+                            TorrentError::Unknown {
                                 code: -1,
                                 message: "Cache lock poisoned".to_string(),
-                            })?;
-                    let piece_path = cache.ensure_piece_dir(piece_key)?;
-                    if let Err(e) = std::fs::write(&piece_path, &data) {
-                        tracing::warn!("Failed to write cache piece {}: {:?}", piece_key, e);
+                            }
+                        })?;
+                        let piece_path = cache.ensure_piece_dir(piece_key)?;
+                        if let Err(e) = std::fs::write(&piece_path, &data) {
+                            tracing::warn!("Failed to write cache piece {}: {:?}", piece_key, e);
+                        }
                     }
-                    if let Err(e) = cache.add_piece(piece_key, data.len() as u64) {
-                        tracing::warn!(
-                            "Failed to add piece {} to cache metadata: {:?}",
-                            piece_key,
-                            e
-                        );
+                    // Register in PiecesManager (cache + deprioritize).
+                    if let Ok(mut pm) = self.pieces_manager.lock() {
+                        if let Err(e) = pm.add_piece(
+                            handle_guard, info_hash, piece_idx, data.len() as u64,
+                        ) {
+                            tracing::warn!(
+                                "fetch_piece_data: PiecesManager::add_piece failed for {}: {:?}",
+                                piece_key, e
+                            );
+                        }
                     }
                 }
                 Ok(data)
@@ -1020,68 +1063,50 @@ impl DownloadManager {
     }
 
     /// Background piece download — waits for pieces to become available
-    /// without holding `&mut self` (only uses the provided handle and cache).
-    ///
-    /// Safe to call from any thread.  The DownloadManager lock is NOT held
-    /// during the piece-wait loop, so other FUSE operations (stats, cached reads)
+    /// without holding `&mut self` (only uses the provided handle, cache,
+    /// and pieces_manager).  The DownloadManager lock is NOT held during
+    /// the piece-wait loop, so other FUSE operations (stats, cached reads)
     /// remain responsive.
 
-    /// Register a piece that is now available (via have_piece or download)
-    /// in the CacheManager so that `is_piece_complete_in_cache` and
-    /// `pieces_on_disk` return true on subsequent FUSE retries.
-    ///
-    /// Reads the actual file size from disk, which is authoritative after
-    /// `have_piece` returns true (libtorrent has written and hash-verified
-    /// the piece data via custom storage).
+    /// Register a newly downloaded piece via PiecesManager so the elevated
+    /// priority table is updated and the piece is deprioritized to 0.
     fn register_piece_in_cache(
-        cache: &Arc<Mutex<CacheManager>>,
+        pieces_manager: &Arc<Mutex<PiecesManager>>,
+        handle: &Arc<Mutex<TorrentHandle>>,
         info_hash: &str,
         piece_idx: i32,
         piece_length: u64,
         num_pieces: i32,
         total_size: u64,
     ) {
-        let piece_key = Self::make_piece_key(info_hash, piece_idx);
-        let mut c = match cache.lock() {
-            Ok(c) => c,
-            Err(_) => {
-                tracing::error!("register_piece_in_cache: cache lock poisoned");
-                return;
-            }
-        };
-
-        // Already verified — nothing to do.
-        if c.is_piece_verified(&piece_key) {
-            return;
-        }
-
         // Determine the expected size for this piece.
         let expected_size = if piece_idx == num_pieces - 1 {
             let remainder = total_size.saturating_sub(((num_pieces - 1) as u64) * piece_length);
-            // If remainder is 0 (total_size exactly divisible), piece is full-length.
             if remainder > 0 { remainder } else { piece_length }
         } else {
             piece_length
         };
 
-        // Register with the expected size so `is_piece_complete_in_cache`
-        // validates correctly (size >= expected).
-        if let Err(e) = c.add_piece(&piece_key, expected_size) {
-            tracing::warn!(
-                "register_piece_in_cache: add_piece failed for {}: {:?}",
-                piece_key, e
-            );
+        // Use PiecesManager::add_piece which registers in cache AND deprioritizes.
+        if let Ok(mut pm) = pieces_manager.lock() {
+            if let Ok(h) = handle.lock() {
+                if let Err(e) = pm.add_piece(&h, info_hash, piece_idx, expected_size) {
+                    tracing::warn!(
+                        "register_piece_in_cache: add_piece via PiecesManager failed for {}:piece:{}: {:?}",
+                        info_hash, piece_idx, e
+                    );
+                }
+            }
         } else {
-            tracing::debug!(
-                "register_piece_in_cache: registered piece {} (size={})",
-                piece_key, expected_size
-            );
+            tracing::error!("register_piece_in_cache: PiecesManager lock poisoned");
         }
     }
+
 
     pub fn background_wait_for_pieces(
         handle: &Arc<Mutex<TorrentHandle>>,
         cache: &Arc<Mutex<CacheManager>>,
+        pieces_manager: &Arc<Mutex<PiecesManager>>,
         info_hash: &str,
         start_piece: i32,
         end_piece: i32,
@@ -1120,10 +1145,9 @@ impl DownloadManager {
                     Err(_) => break,
                 };
                 if h.have_piece(piece_idx) {
-                    // Piece is already available — ensure it's registered in cache
-                    // so `pieces_on_disk` returns true on subsequent FUSE retries.
                     Self::register_piece_in_cache(
-                        cache, info_hash, piece_idx, piece_length, num_pieces, total_size,
+                        pieces_manager, handle, info_hash, piece_idx,
+                        piece_length, num_pieces, total_size,
                     );
                     continue;
                 }
@@ -1175,7 +1199,8 @@ impl DownloadManager {
                         piece_start.elapsed().as_secs_f64()
                     );
                     Self::register_piece_in_cache(
-                        cache, info_hash, piece_idx, piece_length, num_pieces, total_size,
+                        pieces_manager, handle, info_hash, piece_idx,
+                        piece_length, num_pieces, total_size,
                     );
                     break;
                 }
