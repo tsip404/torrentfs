@@ -177,7 +177,7 @@ impl DownloadManager {
         Ok(handle)
     }
 
-    fn make_piece_key(info_hash: &str, piece_idx: i32) -> String {
+    pub(crate) fn make_piece_key(info_hash: &str, piece_idx: i32) -> String {
         format!("{}:piece:{}", info_hash, piece_idx)
     }
 
@@ -223,7 +223,7 @@ impl DownloadManager {
     /// holes (from out-of-order writes + crash) would pass condition 2
     /// alone but fail condition 1 — `scan_pieces_subdirectory` never
     /// marks pieces as verified.
-    fn is_piece_complete_in_cache(
+    pub(crate) fn is_piece_complete_in_cache(
         cache: &crate::cache::CacheManager,
         piece_key: &str,
         piece_idx: i32,
@@ -1017,6 +1017,214 @@ impl DownloadManager {
         file.read_exact(&mut buf)
             .map_err(|e| TorrentError::IoError(format!("Fast-path read error: {}", e)))?;
         Ok(buf)
+    }
+
+    /// Background piece download — waits for pieces to become available
+    /// without holding `&mut self` (only uses the provided handle and cache).
+    ///
+    /// Safe to call from any thread.  The DownloadManager lock is NOT held
+    /// during the piece-wait loop, so other FUSE operations (stats, cached reads)
+    /// remain responsive.
+
+    /// Register a piece that is now available (via have_piece or download)
+    /// in the CacheManager so that `is_piece_complete_in_cache` and
+    /// `pieces_on_disk` return true on subsequent FUSE retries.
+    ///
+    /// Reads the actual file size from disk, which is authoritative after
+    /// `have_piece` returns true (libtorrent has written and hash-verified
+    /// the piece data via custom storage).
+    fn register_piece_in_cache(
+        cache: &Arc<Mutex<CacheManager>>,
+        info_hash: &str,
+        piece_idx: i32,
+        piece_length: u64,
+        num_pieces: i32,
+        total_size: u64,
+    ) {
+        let piece_key = Self::make_piece_key(info_hash, piece_idx);
+        let mut c = match cache.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                tracing::error!("register_piece_in_cache: cache lock poisoned");
+                return;
+            }
+        };
+
+        // Already verified — nothing to do.
+        if c.is_piece_verified(&piece_key) {
+            return;
+        }
+
+        // Determine the expected size for this piece.
+        let expected_size = if piece_idx == num_pieces - 1 {
+            let remainder = total_size.saturating_sub(((num_pieces - 1) as u64) * piece_length);
+            // If remainder is 0 (total_size exactly divisible), piece is full-length.
+            if remainder > 0 { remainder } else { piece_length }
+        } else {
+            piece_length
+        };
+
+        // Register with the expected size so `is_piece_complete_in_cache`
+        // validates correctly (size >= expected).
+        if let Err(e) = c.add_piece(&piece_key, expected_size) {
+            tracing::warn!(
+                "register_piece_in_cache: add_piece failed for {}: {:?}",
+                piece_key, e
+            );
+        } else {
+            tracing::debug!(
+                "register_piece_in_cache: registered piece {} (size={})",
+                piece_key, expected_size
+            );
+        }
+    }
+
+    pub fn background_wait_for_pieces(
+        handle: &Arc<Mutex<TorrentHandle>>,
+        cache: &Arc<Mutex<CacheManager>>,
+        info_hash: &str,
+        start_piece: i32,
+        end_piece: i32,
+        piece_length: u64,
+        num_pieces: i32,
+        total_size: u64,
+        timeout: std::time::Duration,
+    ) {
+        // Phase 1: set piece deadlines (brief handle lock only)
+        {
+            let h = match handle.lock() {
+                Ok(h) => h,
+                Err(_) => {
+                    tracing::error!("background_wait: handle lock poisoned during deadline setup");
+                    return;
+                }
+            };
+            for piece_idx in start_piece..=end_piece {
+                if !h.have_piece(piece_idx) {
+                    tracing::debug!(
+                        "background_wait: setting piece deadline for piece {}",
+                        piece_idx
+                    );
+                    h.set_piece_deadline(piece_idx, 0);
+                }
+            }
+        }
+
+        // Phase 2: wait for each missing piece (handle + cache locks only, NO DM lock)
+        let start = std::time::Instant::now();
+        for piece_idx in start_piece..=end_piece {
+            // Quick check: already have the piece?
+            {
+                let h = match handle.lock() {
+                    Ok(h) => h,
+                    Err(_) => break,
+                };
+                if h.have_piece(piece_idx) {
+                    // Piece is already available — ensure it's registered in cache
+                    // so `pieces_on_disk` returns true on subsequent FUSE retries.
+                    Self::register_piece_in_cache(
+                        cache, info_hash, piece_idx, piece_length, num_pieces, total_size,
+                    );
+                    continue;
+                }
+            }
+
+            let piece_key = Self::make_piece_key(info_hash, piece_idx);
+
+            // Quick check: already in cache?
+            {
+                let c = match cache.lock() {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                if Self::is_piece_complete_in_cache(
+                    &c, &piece_key, piece_idx,
+                    piece_length, num_pieces, total_size,
+                ) {
+                    continue;
+                }
+            }
+
+            // Wait for this piece
+            let piece_start = std::time::Instant::now();
+            let mut last_log = piece_start;
+            loop {
+                if start.elapsed() >= timeout {
+                    tracing::warn!(
+                        "background_wait: timed out waiting for piece {} after {:.0}s",
+                        piece_idx,
+                        timeout.as_secs()
+                    );
+                    return;
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(200));
+
+                // Check have_piece (handle lock)
+                let acquired = {
+                    let h = match handle.lock() {
+                        Ok(h) => h,
+                        Err(_) => break,
+                    };
+                    h.have_piece(piece_idx)
+                };
+                if acquired {
+                    tracing::debug!(
+                        "background_wait: piece {} acquired after {:.1}s",
+                        piece_idx,
+                        piece_start.elapsed().as_secs_f64()
+                    );
+                    Self::register_piece_in_cache(
+                        cache, info_hash, piece_idx, piece_length, num_pieces, total_size,
+                    );
+                    break;
+                }
+
+                // Re-check cache
+                {
+                    let c = match cache.lock() {
+                        Ok(c) => c,
+                        Err(_) => break,
+                    };
+                    if Self::is_piece_complete_in_cache(
+                        &c, &piece_key, piece_idx,
+                        piece_length, num_pieces, total_size,
+                    ) {
+                        tracing::debug!(
+                            "background_wait: piece {} found in cache after {:.1}s",
+                            piece_idx,
+                            piece_start.elapsed().as_secs_f64()
+                        );
+                        break;
+                    }
+                }
+
+                // Periodic status log
+                if last_log.elapsed() >= std::time::Duration::from_secs(5) {
+                    if let Ok(h) = handle.lock() {
+                        if let Ok(s) = h.status() {
+                            tracing::debug!(
+                                "background_wait: piece {} waiting ({:.0}s), \
+                                 peers={}, seeds={}, progress={:.2}%",
+                                piece_idx,
+                                piece_start.elapsed().as_secs_f64(),
+                                s.num_peers,
+                                s.num_seeds,
+                                s.progress * 100.0
+                            );
+                        }
+                    }
+                    last_log = std::time::Instant::now();
+                }
+            }
+        }
+
+        tracing::debug!(
+            "background_wait: complete (pieces {}-{}, elapsed {:.1}s)",
+            start_piece,
+            end_piece,
+            start.elapsed().as_secs_f64()
+        );
     }
 }
 
