@@ -1,14 +1,20 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 
 use crate::cache::CacheManager;
 use crate::config::TorrentfsConfig;
-use crate::error::{is_transient_read_error, TorrentError, TorrentResult};
+use crate::error::{TorrentError, TorrentResult};
 use crate::seeding::SeedingManager;
 
 use super::session::{Session, TorrentHandle};
 use super::types::{SessionStats, TorrentState, TorrentStatus};
+
+/// Shared pending-reads table: key `"{info_hash}:piece:{idx}"` → oneshot sender.
+/// Written by `fetch_piece_data` before enqueueing a read, consumed by
+/// the AlertConsumer when `read_piece_alert` arrives.
+pub type PendingReads = Arc<Mutex<HashMap<String, SyncSender<Vec<u8>>>>>;
 
 pub struct DownloadManager {
     pub(crate) session: Arc<Mutex<Session>>,
@@ -17,6 +23,7 @@ pub struct DownloadManager {
     pub(crate) cache_manager: Arc<Mutex<CacheManager>>,
     pub(crate) read_timeout_secs: u64,
     pub(crate) seeding_manager: Option<Arc<SeedingManager>>,
+    pub(crate) pending_reads: PendingReads,
 }
 
 impl DownloadManager {
@@ -45,7 +52,20 @@ impl DownloadManager {
             cache_manager: Arc::new(Mutex::new(cache_manager)),
             read_timeout_secs,
             seeding_manager: None,
+            pending_reads: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Get the raw libtorrent session pointer for use by background threads
+    /// (e.g., the alert consumer). The pointer remains valid for the lifetime
+    /// of the Session, even after this lock is released.
+    pub fn session_ptr(&self) -> Option<libtorrent_sys::lt_session_t> {
+        self.session.lock().ok().map(|s| s.inner())
+    }
+    /// Get a clone of the shared pending-reads table for use by the
+    /// AlertConsumer to deliver `read_piece_alert` data.
+    pub fn pending_reads(&self) -> PendingReads {
+        self.pending_reads.clone()
     }
 
     pub fn get_cache_manager(&self) -> Arc<Mutex<CacheManager>> {
@@ -784,25 +804,14 @@ impl DownloadManager {
             }
         }
 
-        let session = self.session.lock().map_err(|_| TorrentError::Unknown {
-            code: -1,
-            message: "Session lock poisoned".to_string(),
-        })?;
-
         let mut result = Vec::with_capacity(size as usize);
         let mut bytes_read = 0usize;
 
         for piece_idx in start_piece..=end_piece {
             let piece_key = Self::make_piece_key(&info_hash, piece_idx);
 
-            // ── Fetch piece data (cache-first, then libtorrent) ──────────
-            let piece_data = Self::fetch_piece_data(
-                &self.cache_manager,
-                &handle_guard,
-                &session,
-                &piece_key,
-                piece_idx,
-            )?;
+            // ── Fetch piece data (cache-first, then channel-based read) ──────────
+            let piece_data = self.fetch_piece_data(&handle_guard, &piece_key, piece_idx)?;
 
             // ── Validate: empty piece data means data is not ready ───────
             if piece_data.is_empty() {
@@ -864,34 +873,29 @@ impl DownloadManager {
     }
 
     /// Fetch piece data for a single piece, preferring the on-disk cache.
-    /// Falls back to libtorrent `read_piece` when the cache is empty or
-    /// the cached data is invalid (empty file).
-    ///
-    /// On `PieceNotReady` from `read_piece`, retries up to 3 times with
-    /// a 200 ms sleep between attempts.
+    /// Enqueues a `read_piece` request and waits on a sync_channel for
+    /// the AlertConsumer to deliver the `read_piece_alert` result.
     fn fetch_piece_data(
-        cache_manager: &Arc<Mutex<CacheManager>>,
+        &mut self,
         handle_guard: &TorrentHandle,
-        session: &Session,
         piece_key: &str,
         piece_idx: i32,
     ) -> TorrentResult<Vec<u8>> {
         // ── Try cache first (minimize lock hold time) ────────────────
         {
             let piece_path = {
-                let cache = cache_manager.lock().map_err(|_| TorrentError::Unknown {
-                    code: -1,
-                    message: "Cache lock poisoned".to_string(),
-                })?;
-                // TSI-2048: only read from cache when the piece is
-                // registered in metadata.  Metadata registration is only
-                // done after a verified successful download (add_piece via
-                // read_piece fallback) — never from bare file existence.
+                let cache = self
+                    .cache_manager
+                    .lock()
+                    .map_err(|_| TorrentError::Unknown {
+                        code: -1,
+                        message: "Cache lock poisoned".to_string(),
+                    })?;
                 if !cache.has_piece(piece_key) {
                     None
                 } else {
                     let path = cache.piece_path(piece_key);
-                    drop(cache); // release lock before disk I/O
+                    drop(cache);
                     Some(path)
                 }
             };
@@ -899,8 +903,7 @@ impl DownloadManager {
             if let Some(piece_path) = piece_path {
                 match std::fs::read(&piece_path) {
                     Ok(data) if !data.is_empty() => {
-                        // Record access for LRU.
-                        if let Ok(mut cache) = cache_manager.lock() {
+                        if let Ok(mut cache) = self.cache_manager.lock() {
                             if let Err(e) = cache.record_access(piece_key) {
                                 tracing::warn!(
                                     "Failed to record cache access for {}: {:?}",
@@ -917,7 +920,6 @@ impl DownloadManager {
                         return Ok(data);
                     }
                     Ok(_) => {
-                        // Empty file on disk — fall through to read_piece.
                         tracing::warn!(
                             "Cached piece {} has empty file on disk; falling through to read_piece",
                             piece_key
@@ -931,18 +933,44 @@ impl DownloadManager {
                     }
                 }
             }
-        } // cache lock released here
+        }
 
-        // ── Fallback to libtorrent read_piece with transient-error retry ──
-        let max_retries = 3u32;
-        for retry in 0..=max_retries {
-            match handle_guard.read_piece(session, piece_idx) {
-                Ok(data) if !data.is_empty() => {
-                    // Cache the result for future reads.
-                    let mut cache = cache_manager.lock().map_err(|_| TorrentError::Unknown {
-                        code: -1,
-                        message: "Cache lock poisoned".to_string(),
-                    })?;
+        // ── Enqueue read_piece and wait for AlertConsumer delivery ──
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        {
+            let mut pending = self
+                .pending_reads
+                .lock()
+                .map_err(|_| TorrentError::Unknown {
+                    code: -1,
+                    message: "Pending reads lock poisoned".to_string(),
+                })?;
+            pending.insert(piece_key.to_string(), tx);
+        }
+
+        // Enqueue the read.  enqueue_read_piece returns immediately
+        // (the C++ side just calls h->read_piece() and returns).
+        if let Err(e) = handle_guard.enqueue_read_piece(piece_idx) {
+            // Clean up pending entry on enqueue failure.
+            if let Ok(mut pending) = self.pending_reads.lock() {
+                pending.remove(piece_key);
+            }
+            return Err(e);
+        }
+
+        // Block until the AlertConsumer delivers the read_piece_alert,
+        // or until the read timeout expires.
+        match rx.recv_timeout(std::time::Duration::from_secs(self.read_timeout_secs)) {
+            Ok(data) => {
+                // Cache the result for future reads.
+                if !data.is_empty() {
+                    let mut cache =
+                        self.cache_manager
+                            .lock()
+                            .map_err(|_| TorrentError::Unknown {
+                                code: -1,
+                                message: "Cache lock poisoned".to_string(),
+                            })?;
                     let piece_path = cache.ensure_piece_dir(piece_key)?;
                     if let Err(e) = std::fs::write(&piece_path, &data) {
                         tracing::warn!("Failed to write cache piece {}: {:?}", piece_key, e);
@@ -954,54 +982,25 @@ impl DownloadManager {
                             e
                         );
                     }
-                    return Ok(data);
                 }
-                Err(ref e) if is_transient_read_error(e) => {
-                    if retry < max_retries {
-                        tracing::debug!(
-                            "Piece {} read error (retry {}/{}): {:?}, waiting 200ms",
-                            piece_idx,
-                            retry + 1,
-                            max_retries,
-                            e
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                        continue;
-                    }
-                    return Err(TorrentError::PieceNotReady(format!(
-                        "Piece {} still not ready after {} retries",
-                        piece_idx, max_retries
-                    )));
-                }
-                Ok(_) => {
-                    // Data is empty — this shouldn't happen after the
-                    // read_piece fix, but if it does, treat as not ready.
-                    if retry < max_retries {
-                        tracing::warn!(
-                            "Piece {} returned empty data (retry {}/{})",
-                            piece_idx,
-                            retry + 1,
-                            max_retries
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(200));
-                        continue;
-                    }
-                    return Err(TorrentError::PieceNotReady(format!(
-                        "Piece {} returned empty data after {} retries",
-                        piece_idx, max_retries
-                    )));
-                }
-                Err(e) => return Err(e),
+                Ok(data)
             }
+            Err(RecvTimeoutError::Timeout) => {
+                // Clean up pending entry.
+                if let Ok(mut pending) = self.pending_reads.lock() {
+                    pending.remove(piece_key);
+                }
+                Err(TorrentError::Timeout(format!(
+                    "Timed out waiting for piece {} after {}s",
+                    piece_idx, self.read_timeout_secs
+                )))
+            }
+            Err(RecvTimeoutError::Disconnected) => Err(TorrentError::PieceNotReady(format!(
+                "Piece {} channel disconnected (AlertConsumer dropped sender)",
+                piece_idx
+            ))),
         }
-
-        // Shouldn't reach here, but guard:
-        Err(TorrentError::PieceNotReady(format!(
-            "Piece {} unavailable after {} retries",
-            piece_idx, max_retries
-        )))
     }
-
     /// Read a byte range from an already-open piece file.  Used by the
     /// fast path to avoid holding the cache lock during disk I/O.
     fn read_file_offset(

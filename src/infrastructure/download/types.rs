@@ -1,5 +1,5 @@
 /// Statistics collected from the libtorrent session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionStats {
     pub download_rate: i64,
     pub upload_rate: i64,

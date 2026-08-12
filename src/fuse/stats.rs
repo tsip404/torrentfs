@@ -8,6 +8,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use crate::cache::CacheManager;
 use crate::db::{Database, TorrentStatus};
 use crate::services::download::DownloadService;
+use crate::infrastructure::download::SessionStats;
+
 
 /// Format bytes into human-readable form.
 pub fn format_bytes(bytes: u64) -> String {
@@ -61,7 +63,7 @@ fn write_overview(
     output: &mut String,
     creation_time: Duration,
     db: &Option<Arc<Mutex<Database>>>,
-    download_service: &Option<DownloadService>,
+    session_stats: Option<&SessionStats>,
     get_cache_manager: &impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
     listen_addr: &str,
 ) {
@@ -110,13 +112,7 @@ fn write_overview(
         cache_pct
     ));
 
-    let session_stats = if let Some(ref ds) = download_service {
-        ds.get_session_stats().ok()
-    } else {
-        None
-    };
-
-    if let Some(ref ss) = session_stats {
+    if let Some(ss) = session_stats {
         output.push_str(&format!("  Listen:       {}\n", listen_addr));
         output.push_str(&format!("  DHT Nodes:    {}\n", ss.dht_nodes));
     } else {
@@ -125,15 +121,9 @@ fn write_overview(
     }
 }
 
-fn write_global_rates(output: &mut String, download_service: &Option<DownloadService>) {
-    let session_stats = if let Some(ref ds) = download_service {
-        ds.get_session_stats().ok()
-    } else {
-        None
-    };
-
+fn write_global_rates(output: &mut String, session_stats: Option<&SessionStats>) {
     output.push_str("\n-- Global Rates --\n");
-    if let Some(ref ss) = session_stats {
+    if let Some(ss) = session_stats {
         output.push_str(&format!(
             "  Download Rate:  {}/s\n",
             format_bytes(ss.download_rate as u64)
@@ -158,15 +148,9 @@ fn write_global_rates(output: &mut String, download_service: &Option<DownloadSer
     }
 }
 
-fn write_connections(output: &mut String, download_service: &Option<DownloadService>) {
-    let session_stats = if let Some(ref ds) = download_service {
-        ds.get_session_stats().ok()
-    } else {
-        None
-    };
-
+fn write_connections(output: &mut String, session_stats: Option<&SessionStats>) {
     output.push_str("\n-- Connections --\n");
-    if let Some(ref ss) = session_stats {
+    if let Some(ss) = session_stats {
         output.push_str(&format!("  Connected:      {}\n", ss.peers_connected));
         output.push_str(&format!("  Half-open:      {}\n", ss.half_open_connections));
         output.push_str("  Total Attempts: —\n");
@@ -264,23 +248,24 @@ fn status_to_english(status: &TorrentStatus) -> &'static str {
 pub fn generate_global_stats(
     creation_time: Duration,
     db: &Option<Arc<Mutex<Database>>>,
-    download_service: &Option<DownloadService>,
+    session_stats: Option<SessionStats>,
     get_cache_manager: impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
     listen_addr: &str,
 ) -> Vec<u8> {
     let mut output = String::new();
 
     write_banner(&mut output, None);
+    let ss_ref = session_stats.as_ref();
     write_overview(
         &mut output,
         creation_time,
         db,
-        download_service,
+        ss_ref,
         &get_cache_manager,
         listen_addr,
     );
-    write_global_rates(&mut output, download_service);
-    write_connections(&mut output, download_service);
+    write_global_rates(&mut output, ss_ref);
+    write_connections(&mut output, ss_ref);
     write_torrent_overview_counts(&mut output, db);
     write_global_cache_summary(&mut output, &get_cache_manager);
     write_performance(&mut output);
@@ -620,7 +605,7 @@ pub fn generate_directory_stats(
 pub fn generate_stats(
     creation_time: Duration,
     db: &Option<Arc<Mutex<Database>>>,
-    download_service: &Option<DownloadService>,
+    session_stats: Option<SessionStats>,
     get_cache_manager: impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
     torrent_data_cache: &Arc<Mutex<HashMap<String, Vec<u8>>>>,
     listen_addr: &str,
@@ -629,7 +614,7 @@ pub fn generate_stats(
     generate_global_stats(
         creation_time,
         db,
-        download_service,
+        session_stats,
         get_cache_manager,
         listen_addr,
     )
@@ -704,7 +689,7 @@ mod tests {
         let stats = generate_global_stats(
             Duration::from_secs(0),
             &None,
-            &None,
+            None,
             || None,
             "0.0.0.0:6881",
         );
@@ -718,7 +703,7 @@ mod tests {
         let stats = generate_global_stats(
             Duration::from_secs(0),
             &None,
-            &None,
+            None,
             || None,
             "0.0.0.0:6881",
         );
@@ -731,7 +716,7 @@ mod tests {
         let stats = generate_global_stats(
             Duration::from_secs(0),
             &None,
-            &None,
+            None,
             || None,
             "0.0.0.0:6881",
         );
@@ -758,14 +743,14 @@ mod tests {
         let global = generate_global_stats(
             Duration::from_secs(0),
             &None,
-            &None,
+            None,
             || None,
             "0.0.0.0:6881",
         );
         let wrapper = generate_stats(
             Duration::from_secs(0),
             &None,
-            &None,
+            None,
             || None,
             &Arc::new(Mutex::new(HashMap::new())),
             "0.0.0.0:6881",
@@ -791,7 +776,7 @@ mod tests {
         let stats = generate_global_stats(
             Duration::from_secs(0),
             &None,
-            &None,
+            None,
             || None,
             "0.0.0.0:6881",
         );
@@ -805,7 +790,7 @@ mod tests {
         let stats = generate_global_stats(
             Duration::from_secs(0),
             &None,
-            &None,
+            None,
             || None,
             "0.0.0.0:6881",
         );
@@ -823,7 +808,7 @@ mod tests {
         let stats = generate_global_stats(
             Duration::from_secs(0),
             &None,
-            &None,
+            None,
             || None,
             "0.0.0.0:6881",
         );

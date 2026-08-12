@@ -7,6 +7,7 @@
 //! - `config` — TOML configuration management (TorrentfsConfig)
 //! - `metadata` — .torrent file parsing (TorrentInfo)
 
+pub mod alert;
 pub mod cache;
 pub mod config;
 pub mod db;
