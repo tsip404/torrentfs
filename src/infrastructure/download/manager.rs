@@ -141,7 +141,7 @@ impl DownloadManager {
         let handle = session.add_torrent(info, &torrent_save_dir)?;
 
         // Set all pieces to priority 0 to prevent automatic downloading.
-        let (_piece_length, num_pieces) = handle.get_torrent_info()?;
+        let (piece_length, num_pieces) = handle.get_torrent_info()?;
         if num_pieces > 0 {
             // SAFETY: handle.inner is a valid lt_torrent_handle_t returned by
             // session.add_torrent, guaranteed to be valid for the session lifetime.
@@ -156,7 +156,7 @@ impl DownloadManager {
                 code: -1,
                 message: "PiecesManager lock poisoned".to_string(),
             })?
-            .init_upload_mode(&handle, &info_hash, num_pieces as i32)?;
+            .init_upload_mode(&handle, &info_hash, num_pieces as i32, piece_length)?;
 
         let handle = Arc::new(Mutex::new(handle));
         self.handles.insert(info_hash.clone(), handle.clone());

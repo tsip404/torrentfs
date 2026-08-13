@@ -38,6 +38,21 @@
 #include <dirent.h>
 #include <openssl/sha.h>
 
+// ── DIAG logging gate ──────────────────────────────────────────────────────
+// Verbose per-piece/per-operation `[DIAG]` logging floods stderr during active
+// download (one line per `async_write` / `async_hash` / `write_piece` block).
+// Gate it behind `TORRENTFS_DIAG=1` so it is off by default (TSI-2119).
+static bool torrentfs_diag_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("TORRENTFS_DIAG");
+        return v && (*v == '1' || *v == 't' || *v == 'T');
+    }();
+    return enabled;
+}
+
+#define TORRENTFS_DIAG(...) \
+    do { if (torrentfs_diag_enabled()) { fprintf(stderr, __VA_ARGS__); } } while (0)
+
 struct lt_error {
     std::string message;
     int code;
@@ -1219,7 +1234,7 @@ public:
         file.seekg(offset);
         file.read(buf, size);
         bool ok = file.good() || (file.eof() && file.gcount() > 0);
-        fprintf(stderr, "[DIAG] read_piece piece=%d offset=%d size=%d ok=%d first4=%02x%02x%02x%02x\n",
+        TORRENTFS_DIAG("[DIAG] read_piece piece=%d offset=%d size=%d ok=%d first4=%02x%02x%02x%02x\n",
                 piece_index, offset, size, ok,
                 (unsigned char)(size>0?buf[0]:0), (unsigned char)(size>1?buf[1]:0),
                 (unsigned char)(size>2?buf[2]:0), (unsigned char)(size>3?buf[3]:0));
@@ -1234,7 +1249,7 @@ public:
             return false;
         }
         std::string path = piece_path(piece_index);
-        fprintf(stderr, "[DIAG] write_piece piece=%d offset=%d size=%d first4=%02x%02x%02x%02x path=%s\n",
+        TORRENTFS_DIAG("[DIAG] write_piece piece=%d offset=%d size=%d first4=%02x%02x%02x%02x path=%s\n",
                 piece_index, offset, size,
                 (unsigned char)(size>0?buf[0]:0), (unsigned char)(size>1?buf[1]:0),
                 (unsigned char)(size>2?buf[2]:0), (unsigned char)(size>3?buf[3]:0),
@@ -1391,7 +1406,7 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         std::string info_hash_hex = sha1_to_hex(p.info_hash);
-        fprintf(stderr, "[DIAG] new_torrent info_hash=%s\n",
+        TORRENTFS_DIAG("[DIAG] new_torrent info_hash=%s\n",
                 info_hash_hex.c_str());
         auto storage = std::make_unique<PieceStorage>(m_piece_cache_dir, info_hash_hex);
         lt::storage_index_t idx = m_next_index;
@@ -1465,11 +1480,11 @@ public:
         }
 
         if (ps->write_piece(static_cast<int>(r.piece), r.start, buf, r.length)) {
-            fprintf(stderr, "[DIAG] async_write piece=%d offset=%d len=%d => OK (posted)\n",
+            TORRENTFS_DIAG("[DIAG] async_write piece=%d offset=%d len=%d => OK (posted)\n",
                     static_cast<int>(r.piece), r.start, r.length);
             boost::asio::post(m_ios, [h = std::move(handler)] { h(lt::storage_error()); });
         } else {
-            fprintf(stderr, "[DIAG] async_write piece=%d offset=%d len=%d => FAIL\n",
+            TORRENTFS_DIAG("[DIAG] async_write piece=%d offset=%d len=%d => FAIL\n",
                     static_cast<int>(r.piece), r.start, r.length);
             boost::asio::post(m_ios, [h = std::move(handler)] {
                 h(lt::storage_error(lt::error_code(boost::system::errc::io_error, boost::system::generic_category())));
@@ -1485,11 +1500,11 @@ public:
         std::function<void(lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const&)> handler) override
     {
         (void)flags;
-        fprintf(stderr, "[DIAG] async_hash CALLED piece=%d v2_size=%zu\n",
+        TORRENTFS_DIAG("[DIAG] async_hash CALLED piece=%d v2_size=%zu\n",
                 static_cast<int>(piece), v2.size());
         auto* ps = get_storage(storage);
         if (!ps) {
-            fprintf(stderr, "[DIAG] async_hash piece=%d => no storage\n", static_cast<int>(piece));
+            TORRENTFS_DIAG("[DIAG] async_hash piece=%d => no storage\n", static_cast<int>(piece));
             // Zero out v2 hashes for hybrid torrents — no data available
             for (auto& h : v2) h = lt::sha256_hash();
             boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
@@ -1501,9 +1516,9 @@ public:
 
         int piece_idx = static_cast<int>(piece);
         int64_t sz = ps->piece_size(piece_idx);
-        fprintf(stderr, "[DIAG] async_hash piece=%d file_size=%ld\n", piece_idx, (long)sz);
+        TORRENTFS_DIAG("[DIAG] async_hash piece=%d file_size=%ld\n", piece_idx, (long)sz);
         if (sz <= 0) {
-            fprintf(stderr, "[DIAG] async_hash piece=%d => file_size<=0, empty hash\n", piece_idx);
+            TORRENTFS_DIAG("[DIAG] async_hash piece=%d => file_size<=0, empty hash\n", piece_idx);
             // Zero out v2 hashes for hybrid torrents — no piece data yet
             for (auto& h : v2) h = lt::sha256_hash();
             boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
@@ -1516,7 +1531,7 @@ public:
         // Read full piece data so we can compute v2 sub-range hashes
         auto data = ps->read_piece_data(piece_idx);
         if (data.empty()) {
-            fprintf(stderr, "[DIAG] async_hash piece=%d => read_piece_data empty\n", piece_idx);
+            TORRENTFS_DIAG("[DIAG] async_hash piece=%d => read_piece_data empty\n", piece_idx);
             for (auto& h : v2) h = lt::sha256_hash();
             boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
                 h(p, lt::sha1_hash(), lt::storage_error(lt::error_code(
@@ -1545,11 +1560,11 @@ public:
                 SHA256_Update(&ctx, data.data() + start, end - start);
                 SHA256_Final(reinterpret_cast<unsigned char*>(v2[j].data()), &ctx);
             }
-            fprintf(stderr, "[DIAG] async_hash piece=%d v2_blocks=%zu block_sz=%zu => populated\n",
+            TORRENTFS_DIAG("[DIAG] async_hash piece=%d v2_blocks=%zu block_sz=%zu => populated\n",
                     piece_idx, n, block_sz);
         }
 
-        fprintf(stderr, "[DIAG] async_hash piece=%d size=%d hash=%02x%02x%02x%02x... => posted\n",
+        TORRENTFS_DIAG("[DIAG] async_hash piece=%d size=%d hash=%02x%02x%02x%02x... => posted\n",
                 piece_idx, static_cast<int>(data.size()),
                 (unsigned char)hash[0], (unsigned char)hash[1],
                 (unsigned char)hash[2], (unsigned char)hash[3]);
@@ -1563,11 +1578,11 @@ public:
         int /*offset*/, lt::disk_job_flags_t /*flags*/,
         std::function<void(lt::piece_index_t, lt::sha256_hash const&, lt::storage_error const&)> handler) override
     {
-        fprintf(stderr, "[DIAG] async_hash2 CALLED piece=%d\n",
+        TORRENTFS_DIAG("[DIAG] async_hash2 CALLED piece=%d\n",
                 static_cast<int>(piece));
         auto* ps = get_storage(storage);
         if (!ps) {
-            fprintf(stderr, "[DIAG] async_hash2 piece=%d => no storage\n", static_cast<int>(piece));
+            TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d => no storage\n", static_cast<int>(piece));
             boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
                 h(p, lt::sha256_hash(), lt::storage_error(lt::error_code(
                     boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
@@ -1577,9 +1592,9 @@ public:
 
         int piece_idx = static_cast<int>(piece);
         int64_t sz = ps->piece_size(piece_idx);
-        fprintf(stderr, "[DIAG] async_hash2 piece=%d file_size=%ld\n", piece_idx, (long)sz);
+        TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d file_size=%ld\n", piece_idx, (long)sz);
         if (sz <= 0) {
-            fprintf(stderr, "[DIAG] async_hash2 piece=%d => file_size<=0, empty hash\n", piece_idx);
+            TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d => file_size<=0, empty hash\n", piece_idx);
             boost::asio::post(m_ios, [h = std::move(handler), p = piece] {
                 h(p, lt::sha256_hash(), lt::storage_error(lt::error_code(
                     boost::system::errc::no_such_file_or_directory, boost::system::generic_category())));
@@ -1588,7 +1603,7 @@ public:
         }
 
         lt::sha256_hash hash = ps->hash_piece_sha256(piece_idx, static_cast<int>(sz));
-        fprintf(stderr, "[DIAG] async_hash2 piece=%d size=%d hash=%02x%02x%02x%02x... => posted\n",
+        TORRENTFS_DIAG("[DIAG] async_hash2 piece=%d size=%d hash=%02x%02x%02x%02x... => posted\n",
                 piece_idx, static_cast<int>(sz),
                 (unsigned char)hash[0], (unsigned char)hash[1],
                 (unsigned char)hash[2], (unsigned char)hash[3]);

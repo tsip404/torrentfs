@@ -173,6 +173,34 @@ impl DownloadService {
         pm_guard.get_pieces_status(info_hash, num_pieces)
     }
 
+    /// Non-blocking piece status for `.stats`: returns `(piece_length, statuses)`,
+    /// or `None` when the DownloadManager / PiecesManager / cache locks are
+    /// contended (an in-flight read is downloading).  `.stats` must never block
+    /// on the download path (TSI-2119).
+    pub fn try_get_pieces_status(&self, info_hash: &str) -> Option<(u64, Vec<PieceStatus>)> {
+        let pm = {
+            let dm = self.download_manager.try_lock().ok()?;
+            dm.pieces_manager_arc()
+        };
+        let pm_guard = pm.try_lock().ok()?;
+        let num_pieces = pm_guard.num_pieces(info_hash)?;
+        let piece_length = pm_guard.piece_length(info_hash).unwrap_or(0);
+        let statuses = pm_guard.get_pieces_status(info_hash, num_pieces).ok()?;
+        Some((piece_length, statuses))
+    }
+
+    /// Non-blocking torrent status: returns `None` when the DownloadManager or
+    /// handle lock is contended (download in progress), so `.stats` degrades to
+    /// zeroes instead of blocking (TSI-2119).
+    pub fn try_query_torrent_status(&self, info_hash: &str) -> Option<TorrentStatus> {
+        let handle = {
+            let dm = self.download_manager.try_lock().ok()?;
+            dm.handles.get(info_hash)?.clone()
+        };
+        let guard = handle.try_lock().ok()?;
+        guard.status().ok()
+    }
+
 
     /// Check whether all piece files needed for a file range exist on disk.
     ///
