@@ -372,6 +372,22 @@ impl PiecesManager {
         self.piece_lengths.get(info_hash).map(|&v| v as u64)
     }
 
+    /// Indices of pieces currently elevated (priority > 0) for this
+    /// info_hash.  Used for proactive piece registration so `.stats`
+    /// reflects download progress without an additional read (TSI-2133).
+    pub fn elevated_pieces(&self, info_hash: &str) -> Vec<i32> {
+        self.elevated
+            .get(info_hash)
+            .map(|v| {
+                v.iter()
+                    .enumerate()
+                    .filter(|(_, &prio)| prio > 0)
+                    .map(|(i, _)| i as i32)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Get the full status vector `PieceStatus` for all pieces.
     ///
     /// Used by `.stats` to render the piece markers.
@@ -594,5 +610,27 @@ mod tests {
         let piece_length: u64 = 262144; // 256 KiB
         let prefetch_pieces = (prefetch_bytes + piece_length - 1) / piece_length;
         assert_eq!(prefetch_pieces, 16);
+    }
+
+    #[test]
+    fn test_elevated_pieces_lists_only_nonzero_priorities() {
+        let tmp = std::env::temp_dir().join("pieces_mgr_test_elevated_pieces");
+        let _ = std::fs::create_dir_all(&tmp);
+        let cm = CacheManager::new(&tmp, 1024 * 1024).unwrap();
+        let cm = Arc::new(Mutex::new(cm));
+        let mut pm = PiecesManager::new(cm, PiecePriorityConfig::default());
+
+        let info_hash = "elevated_pieces";
+        pm.elevated.insert(
+            info_hash.to_string(),
+            vec![0, 7, 0, 3, 0, 2],
+        );
+
+        let mut elevated = pm.elevated_pieces(info_hash);
+        elevated.sort_unstable();
+        assert_eq!(elevated, vec![1, 3, 5]);
+
+        // Unknown hash → empty list.
+        assert!(pm.elevated_pieces("unknown").is_empty());
     }
 }

@@ -276,102 +276,78 @@ impl DownloadService {
 
         Ok(true)
     }
-    /// Spawn a background thread to download pieces for a file range.
+    /// Blocking read of a file range, driving the piece download if needed.
     ///
-    /// The DownloadManager lock is held only briefly (to get/create the
-    /// torrent handle).  The piece-wait loop runs without the DM lock,
-    /// using only the handle and CacheManager locks, so other FUSE
-    /// operations (stats, cached reads) remain responsive.
+    /// Runs WITHOUT holding the DownloadManager lock during the piece-wait
+    /// (only handle + cache + PiecesManager locks), so `.stats` and other
+    /// FUSE operations stay responsive while the read is blocked waiting for
+    /// its pieces (TSI-2114 / TSI-2119 / TSI-2133).
     ///
-    /// Returns immediately.  Data is written to the disk cache by
-    /// libtorrent's custom storage.  FUSE reads should return EAGAIN
-    /// and retry later.
-    pub fn request_download_async(
+    /// Blocks until the requested pieces are downloaded and the data is
+    /// returned — no premature EIO on slow peers or transient disconnects.
+    /// Call this from a dedicated worker thread, NOT the FUSE dispatch loop.
+    pub fn read_file_range_blocking(
         &self,
-        torrent_data: Vec<u8>,
+        info: &TorrentInfo,
         file_index: i32,
         offset: u64,
         size: u32,
-    ) {
+    ) -> TorrentResult<Vec<u8>> {
         let dm = self.download_manager.clone();
         let cm = self.cache_manager.clone();
 
-        std::thread::spawn(move || {
-            // Parse torrent metadata
-            let info = match TorrentInfo::from_bytes(torrent_data) {
-                Ok(info) => info,
-                Err(e) => {
-                    tracing::warn!("request_download_async: failed to parse torrent: {:?}", e);
-                    return;
+        let info_hash = hex::encode(info.info_hash()?);
+        let piece_length = info.piece_length() as u64;
+        let num_pieces = info.num_pieces() as i32;
+        let total_size = info.total_size();
+
+        let (start_piece, end_piece) = Self::compute_piece_range(info, file_index, offset, size)
+            .ok_or_else(|| TorrentError::InvalidFile(
+                "read_file_range_blocking: invalid read range".to_string(),
+            ))?;
+
+        // Phase 1: ensure handle + elevate selective priority (brief DM lock).
+        let (handle, pm) = {
+            let mut mgr = dm.lock().map_err(|_| TorrentError::Unknown {
+                code: -1,
+                message: "DownloadManager lock poisoned".to_string(),
+            })?;
+            let handle = mgr.ensure_handle_lightweight(info)?;
+            let pm = mgr.pieces_manager_arc();
+            {
+                let h = handle.lock().map_err(|_| TorrentError::Unknown {
+                    code: -1,
+                    message: "Handle lock poisoned".to_string(),
+                })?;
+                if let Err(e) = mgr.apply_read_priority(&h, info, file_index, offset, size) {
+                    tracing::warn!(
+                        "read_file_range_blocking: apply_read_priority failed: {:?}",
+                        e
+                    );
                 }
-            };
+            }
+            (handle, pm)
+        }; // DM lock released here.
 
-            let info_hash = match info.info_hash() {
-                Ok(h) => hex::encode(h),
-                Err(e) => {
-                    tracing::warn!("request_download_async: info_hash failed: {:?}", e);
-                    return;
-                }
-            };
-            let piece_length = info.piece_length() as u64;
-            let num_pieces = info.num_pieces() as i32;
-            let total_size = info.total_size();
+        // Phase 2: block until all needed pieces are on disk (no DM lock).
+        DownloadManager::background_wait_for_pieces(
+            &handle,
+            &cm,
+            &pm,
+            &info_hash,
+            start_piece,
+            end_piece,
+            piece_length,
+            num_pieces,
+            total_size,
+        );
 
-            // Compute piece range
-            let (start_piece, end_piece) = match Self::compute_piece_range(
-                &info, file_index, offset, size,
-            ) {
-                Some(range) => range,
-                None => return,
-            };
-
-            // Phase 1: get handle + apply selective priority (brief DM lock)
-            // Phase 1: get handle + pieces_manager + apply selective priority
-            let (handle, read_timeout, pm) = {
-                let mut mgr = match dm.lock() {
-                    Ok(mgr) => mgr,
-                    Err(_) => {
-                        tracing::error!("request_download_async: DM lock poisoned");
-                        return;
-                    }
-                };
-                let handle = match mgr.ensure_handle_lightweight(&info) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        tracing::warn!("request_download_async: ensure_handle_lightweight failed: {:?}", e);
-                        return;
-                    }
-                };
-                // Clone PiecesManager Arc for background thread use.
-                let pm = mgr.pieces_manager_arc();
-                // Apply selective piece priority while we hold the DM lock.
-                if let Ok(h) = handle.lock() {
-                    if let Err(e) = mgr.apply_read_priority(
-                        &h, &info, file_index, offset, size,
-                    ) {
-                        tracing::warn!(
-                            "request_download_async: apply_read_priority failed: {:?}",
-                            e
-                        );
-                    }
-                }
-                (handle, mgr.read_timeout_secs, pm)
-            }; // DM lock RELEASED here
-
-            // Phase 2: wait for pieces (NO DM lock — only handle + cache + pieces_manager)
-            DownloadManager::background_wait_for_pieces(
-                &handle,
-                &cm,
-                &pm,
-                &info_hash,
-                start_piece,
-                end_piece,
-                piece_length,
-                num_pieces,
-                total_size,
-                std::time::Duration::from_secs(read_timeout),
-            );
-        });
+        // Phase 3: read the range (fast path — pieces are now on disk).
+        let mut mgr = dm.lock().map_err(|_| TorrentError::Unknown {
+            code: -1,
+            message: "DownloadManager lock poisoned".to_string(),
+        })?;
+        mgr.read_file_range(info, file_index, offset, size)
     }
 
     /// Compute the piece range covering a file read request.
