@@ -63,6 +63,8 @@ pub struct PieceStatus {
 pub struct PiecesManager {
     /// Per-info_hash priority vector: `elevated[info_hash][piece_idx]` = current priority.
     pub(crate) elevated: HashMap<String, Vec<i32>>,
+    /// Per-info_hash piece length (bytes) for `.stats` rendering without the handle lock.
+    pub(crate) piece_lengths: HashMap<String, i64>,
     /// Priority configuration.
     pub(crate) config: PiecePriorityConfig,
     /// Reference to the disk cache for piece-availability queries.
@@ -77,6 +79,7 @@ impl PiecesManager {
     ) -> Self {
         Self {
             elevated: HashMap::new(),
+            piece_lengths: HashMap::new(),
             config,
             cache_manager,
         }
@@ -91,19 +94,19 @@ impl PiecesManager {
     /// priority vector so subsequent calls know the base state.
     /// Record an all-zero priority vector for this info_hash.
     /// The caller (`ensure_handle_lightweight`) has already batched
-    /// `lt_torrent_handle_set_all_piece_priorities(handle.inner, 0)`,
-    /// so we only persist the tracking state here.
     pub fn init_upload_mode(
         &mut self,
         _handle: &TorrentHandle,
         info_hash: &str,
         num_pieces: i32,
+        piece_length: i64,
     ) -> TorrentResult<()> {
         if num_pieces <= 0 {
             return Ok(());
         }
         let priorities = vec![0i32; num_pieces as usize];
         self.elevated.insert(info_hash.to_string(), priorities);
+        self.piece_lengths.insert(info_hash.to_string(), piece_length);
         Ok(())
     }
 
@@ -356,6 +359,19 @@ impl PiecesManager {
             .unwrap_or(0)
     }
 
+    /// Number of pieces tracked for this info_hash, if the torrent was
+    /// initialized.  Derived from the elevated-priority vector without
+    /// touching the handle or cache locks.
+    pub fn num_pieces(&self, info_hash: &str) -> Option<i32> {
+        self.elevated.get(info_hash).map(|v| v.len() as i32)
+    }
+
+    /// Piece length (bytes) recorded at torrent initialization, for
+    /// `.stats` rendering without the handle lock.
+    pub fn piece_length(&self, info_hash: &str) -> Option<u64> {
+        self.piece_lengths.get(info_hash).map(|&v| v as u64)
+    }
+
     /// Get the full status vector `PieceStatus` for all pieces.
     ///
     /// Used by `.stats` to render the piece markers.
@@ -364,13 +380,13 @@ impl PiecesManager {
         info_hash: &str,
         num_pieces: i32,
     ) -> TorrentResult<Vec<PieceStatus>> {
-        let cache = self
-            .cache_manager
-            .lock()
-            .map_err(|_| crate::error::TorrentError::Unknown {
-                code: -1,
-                message: "Cache lock poisoned".to_string(),
-            })?;
+        // Non-blocking cache access: if the cache lock is held (e.g. by a
+        // priority sweep during an active download), degrade to an empty
+        // status vector instead of blocking `.stats` (TSI-2119).
+        let cache = match self.cache_manager.try_lock() {
+            Ok(c) => c,
+            Err(_) => return Ok(Vec::new()),
+        };
 
         let priorities = self.elevated.get(info_hash);
         let mut result = Vec::with_capacity(num_pieces as usize);

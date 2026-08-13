@@ -88,7 +88,7 @@ fn write_overview(
 
     let (cache_total_size, cache_max_size, cache_dir_str) =
         if let Some(ref cm) = get_cache_manager() {
-            if let Ok(cm_guard) = cm.lock() {
+            if let Ok(cm_guard) = cm.try_lock() {
                 (
                     cm_guard.current_size(),
                     cm_guard.max_cache_size(),
@@ -206,7 +206,7 @@ fn write_global_cache_summary(
 ) {
     output.push_str("\n-- Cache --\n");
     let (global_hits, global_misses) = if let Some(ref cm) = get_cache_manager() {
-        if let Ok(cm_guard) = cm.lock() {
+        if let Ok(cm_guard) = cm.try_lock() {
             (cm_guard.hit_count, cm_guard.miss_count)
         } else {
             (0, 0)
@@ -343,34 +343,23 @@ pub fn generate_torrent_stats(
         total_done,
         total_upload,
         total_download,
-    ) = if let Some(ref ds) = download_service {
-        let handles = ds.get_all_handles();
-        if let Some((_, handle)) = handles.iter().find(|(ih, _)| ih == info_hash) {
-            if let Ok(h) = handle.lock() {
-                if let Ok(status) = h.status() {
-                    (
-                        status.download_rate,
-                        status.upload_rate,
-                        status.num_peers,
-                        status.num_seeds,
-                        status.progress,
-                        status.total,
-                        status.total_done,
-                        status.total_upload,
-                        status.total_download,
-                    )
-                } else {
-                    (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
-                }
-            } else {
-                (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
-            }
-        } else {
-            (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
-        }
-    } else {
-        (0, 0, 0, 0, 0.0, 0, 0, 0, 0)
-    };
+    ) = download_service
+        .as_ref()
+        .and_then(|ds| ds.try_query_torrent_status(info_hash))
+        .map(|status| {
+            (
+                status.download_rate,
+                status.upload_rate,
+                status.num_peers,
+                status.num_seeds,
+                status.progress,
+                status.total,
+                status.total_done,
+                status.total_upload,
+                status.total_download,
+            )
+        })
+        .unwrap_or((0, 0, 0, 0, 0.0, 0, 0, 0, 0));
 
     let prog_pct = if total_size > 0 {
         progress * 100.0
@@ -416,57 +405,28 @@ pub fn generate_torrent_stats(
         output.push_str("  ⚠ Health: 0 peers / 0 seeds — tracker may be unreachable\n");
     }
 
-    // -- Pieces -- visualised piece lifecycle (info fields merged below)
-    // Collect num_pieces from handle first (brief lock), then release
-    // handle lock before calling get_pieces_status to avoid ABBA deadlock:
-    //   stats path: handle.lock() → ds.get_pieces_status() → DM lock
-    //   read path:  DM lock → handle.lock()
+    // -- Pieces -- visualised piece lifecycle (GitHub commit-record grid).
+    // Uses only non-blocking locks so `.stats` never blocks on an active
+    // download (TSI-2119).
     if let Some(ds) = download_service {
-        let handles = ds.get_all_handles();
-        // Get num_pieces under a brief handle lock, release it, then
-        // query PiecesManager without holding either handle or DM lock.
-        let num_pieces = handles
-            .iter()
-            .find(|(ih, _)| ih == info_hash)
-            .and_then(|(_, handle)| handle.lock().ok())
-            .and_then(|h| h.get_torrent_info().ok())
-            .map(|(_, n)| n)
-            .unwrap_or(0);
-
-        if num_pieces > 0 {
-            match ds.get_pieces_status(info_hash, num_pieces as i32) {
-                Ok(pieces) => {
-                    // piece_length from any handle for display; brief lock only
-                    let piece_length = handles
-                        .iter()
-                        .find(|(ih, _)| ih == info_hash)
-                        .and_then(|(_, handle)| handle.lock().ok())
-                        .and_then(|h| h.get_torrent_info().ok())
-                        .map(|(pl, _)| pl as u64)
-                        .unwrap_or(0);
-                    output.push_str(&format!(
-                        "\n-- Pieces ({} pieces, {} each) --\n",
-                        num_pieces,
-                        format_bytes(piece_length)
-                    ));
-                    for (idx, status) in pieces.iter().enumerate() {
-                        output.push_str(&piece_marker(status));
-                        output.push_str(&format!(" piece {}\n", idx));
-                    }
+        if let Some((piece_length, pieces)) = ds.try_get_pieces_status(info_hash) {
+            if !pieces.is_empty() {
+                output.push_str(&format!(
+                    "\n-- Pieces ({} pieces, {} each) --\n  ",
+                    pieces.len(),
+                    format_bytes(piece_length)
+                ));
+                for status in &pieces {
+                    output.push_str(&piece_marker(status));
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to get pieces status for {}: {:?}",
-                        info_hash, e
-                    );
-                }
+                output.push('\n');
             }
         }
     }
 
     // Info fields merged after the piece markers (no `-- Info --` header).
     if let Some(cm) = &get_cache_manager() {
-        if let Ok(cm_guard) = cm.lock() {
+        if let Ok(cm_guard) = cm.try_lock() {
             let cache_stats = cm_guard.get_cache_stats_by_infohash(info_hash);
             output.push_str(&format!(
                 "Cache: {} pieces  {}\n",
@@ -527,21 +487,17 @@ pub fn generate_directory_stats(
 
     for t in &torrents {
         total_size += t.total_size as u64;
-        if let Some(ref ds) = download_service {
-            let handles = ds.get_all_handles();
-            if let Some((_, handle)) = handles.iter().find(|(ih, _)| ih == &t.info_hash) {
-                if let Ok(h) = handle.lock() {
-                    if let Ok(status) = h.status() {
-                        total_done += status.total_done;
-                        total_upload += status.total_upload as u64;
-                        total_download += status.total_download as u64;
-                        aggregate_dl_rate += status.download_rate;
-                        aggregate_ul_rate += status.upload_rate;
-                        aggregate_peers += status.num_peers;
-                        aggregate_seeds += status.num_seeds;
-                    }
-                }
-            }
+        if let Some(status) = download_service
+            .as_ref()
+            .and_then(|ds| ds.try_query_torrent_status(&t.info_hash))
+        {
+            total_done += status.total_done;
+            total_upload += status.total_upload as u64;
+            total_download += status.total_download as u64;
+            aggregate_dl_rate += status.download_rate;
+            aggregate_ul_rate += status.upload_rate;
+            aggregate_peers += status.num_peers;
+            aggregate_seeds += status.num_seeds;
         }
     }
 
@@ -574,7 +530,7 @@ pub fn generate_directory_stats(
     // -- Cache --
     output.push_str("\n-- Cache --\n");
     if let Some(ref cm) = get_cache_manager() {
-        if let Ok(cm_guard) = cm.lock() {
+        if let Ok(cm_guard) = cm.try_lock() {
             let (cache_total_size, cache_max_size) =
                 (cm_guard.current_size(), cm_guard.max_cache_size());
             let global_hits = cm_guard.hit_count;
@@ -613,32 +569,20 @@ pub fn generate_directory_stats(
     for (idx, t) in torrents.iter().enumerate() {
         let status_str = status_to_english(&t.status);
 
-        let (dl_rate, ul_rate, peers, seeds, progress, ts) = if let Some(ref ds) = download_service
-        {
-            let handles = ds.get_all_handles();
-            if let Some((_, handle)) = handles.iter().find(|(ih, _)| ih == &t.info_hash) {
-                if let Ok(h) = handle.lock() {
-                    if let Ok(status) = h.status() {
-                        (
-                            status.download_rate,
-                            status.upload_rate,
-                            status.num_peers,
-                            status.num_seeds,
-                            status.progress,
-                            status.total,
-                        )
-                    } else {
-                        (0, 0, 0, 0, 0.0, 0)
-                    }
-                } else {
-                    (0, 0, 0, 0, 0.0, 0)
-                }
-            } else {
-                (0, 0, 0, 0, 0.0, 0)
-            }
-        } else {
-            (0, 0, 0, 0, 0.0, 0)
-        };
+        let (dl_rate, ul_rate, peers, seeds, progress, ts) = download_service
+            .as_ref()
+            .and_then(|ds| ds.try_query_torrent_status(&t.info_hash))
+            .map(|status| {
+                (
+                    status.download_rate,
+                    status.upload_rate,
+                    status.num_peers,
+                    status.num_seeds,
+                    status.progress,
+                    status.total,
+                )
+            })
+            .unwrap_or((0, 0, 0, 0, 0.0, 0));
 
         let prog_pct = if ts > 0 { progress * 100.0 } else { 0.0 };
 
