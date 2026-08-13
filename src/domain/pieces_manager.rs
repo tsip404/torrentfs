@@ -43,6 +43,17 @@ impl Default for PiecePriorityConfig {
     }
 }
 
+/// Status of a single piece for `.stats` rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PieceStatus {
+    /// Current piece priority (0 = not wanted).
+    pub priority: i32,
+    /// Whether the piece is present in the disk cache (downloaded).
+    pub is_cached: bool,
+    /// Number of cache accesses (read hits) for this piece.
+    pub hit_count: u64,
+}
+
 // ── PiecesManager ─────────────────────────────────────────────────────────
 
 /// Manages piece priority lifecycle across all active torrents.
@@ -345,14 +356,14 @@ impl PiecesManager {
             .unwrap_or(0)
     }
 
-    /// Get the full status vector `(priority, is_cached)` for all pieces.
+    /// Get the full status vector `PieceStatus` for all pieces.
     ///
-    /// Used by `.stats` to render the `-- Pieces --` visualisation block.
+    /// Used by `.stats` to render the piece markers.
     pub fn get_pieces_status(
         &self,
         info_hash: &str,
         num_pieces: i32,
-    ) -> TorrentResult<Vec<(i32, bool)>> {
+    ) -> TorrentResult<Vec<PieceStatus>> {
         let cache = self
             .cache_manager
             .lock()
@@ -367,6 +378,11 @@ impl PiecesManager {
         for p in 0..num_pieces {
             let piece_key = format!("{}:piece:{}", info_hash, p);
             let is_cached = cache.has_piece(&piece_key);
+            let hit_count = if is_cached {
+                cache.piece_hit_count(&piece_key)
+            } else {
+                0
+            };
             let priority = priorities
                 .and_then(|v| {
                     if (p as usize) < v.len() {
@@ -376,7 +392,11 @@ impl PiecesManager {
                     }
                 })
                 .unwrap_or(0);
-            result.push((priority, is_cached));
+            result.push(PieceStatus {
+                priority,
+                is_cached,
+                hit_count,
+            });
         }
 
         Ok(result)
@@ -435,8 +455,9 @@ mod tests {
         let status = pm.get_pieces_status("deadbeef", 4).unwrap();
         assert_eq!(status.len(), 4);
         for s in &status {
-            assert_eq!(s.0, 0);
-            assert!(!s.1);
+            assert_eq!(s.priority, 0);
+            assert!(!s.is_cached);
+            assert_eq!(s.hit_count, 0);
         }
     }
 
@@ -459,7 +480,7 @@ mod tests {
         let status = pm.get_pieces_status(info_hash, 8).unwrap();
         assert_eq!(status.len(), 8);
         for s in &status {
-            assert_eq!(s.0, 0);
+            assert_eq!(s.priority, 0);
         }
     }
 
@@ -479,10 +500,29 @@ mod tests {
         );
 
         let status = pm.get_pieces_status(info_hash, 4).unwrap();
-        assert_eq!(status[0], (7, false));
-        assert_eq!(status[1], (6, false));
-        assert_eq!(status[2], (5, false));
-        assert_eq!(status[3], (0, false));
+        assert_eq!(status[0], PieceStatus { priority: 7, is_cached: false, hit_count: 0 });
+        assert_eq!(status[1], PieceStatus { priority: 6, is_cached: false, hit_count: 0 });
+        assert_eq!(status[2], PieceStatus { priority: 5, is_cached: false, hit_count: 0 });
+        assert_eq!(status[3], PieceStatus { priority: 0, is_cached: false, hit_count: 0 });
+    }
+
+    #[test]
+    fn test_get_pieces_status_with_hit_count() {
+        let tmp = std::env::temp_dir().join("pieces_mgr_test_hits");
+        let _ = std::fs::create_dir_all(&tmp);
+        let mut cache = CacheManager::new(&tmp, 1024 * 1024).unwrap();
+        cache.add_piece("hash_hits:piece:0", 16384).unwrap();
+        cache.record_access("hash_hits:piece:0").unwrap();
+        cache.record_access("hash_hits:piece:0").unwrap();
+
+        let cm = Arc::new(Mutex::new(cache));
+        let pm = PiecesManager::new(cm, PiecePriorityConfig::default());
+
+        let status = pm.get_pieces_status("hash_hits", 2).unwrap();
+        assert_eq!(status[0].is_cached, true);
+        assert_eq!(status[0].hit_count, 2);
+        assert_eq!(status[1].is_cached, false);
+        assert_eq!(status[1].hit_count, 0);
     }
 
     #[test]

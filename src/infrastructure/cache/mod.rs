@@ -443,6 +443,12 @@ impl CacheManager {
         self.metadata.get(piece_key).map(|m| m.size)
     }
 
+    /// Get the registered hit count (access count) for a piece from cache metadata.
+    /// Returns 0 if the piece is not in metadata.
+    pub fn piece_hit_count(&self, piece_key: &str) -> u64 {
+        self.metadata.get(piece_key).map(|m| m.hit_count).unwrap_or(0)
+    }
+
     /// TSI-2048: whether a piece's metadata was registered via add_piece
     /// (verified by a successful libtorrent read_piece).  Pieces
     /// registered only by scan_pieces_subdirectory at startup are NOT
