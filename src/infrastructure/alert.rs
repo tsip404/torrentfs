@@ -7,12 +7,12 @@
 //! - other alerts          → `tracing::debug!`
 
 use std::collections::HashMap;
+use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-
 
 use crate::infrastructure::download::SessionStats;
 
@@ -70,50 +70,119 @@ impl From<i32> for AlertType {
     }
 }
 
+// ── Alert notify (wakeup) machinery ─────────────────────────
+
+/// Safety-net timeout for the condvar wait. The notify callback is the
+/// primary wakeup; this timeout only guards against a missed wakeup in the
+/// narrow window between an empty `pop_alerts` and entering the wait. It is
+/// deliberately generous (not a poll interval) so an idle consumer sleeps.
+const SAFETY_NET_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Shared state signaled by the C alert-notify callback and waited on by the
+/// consumer thread. `flag` closes the missed-wakeup race: the callback sets
+/// it before `notify_one`, and the consumer clears it under the mutex before
+/// deciding whether to block.
+struct NotifyState {
+    flag: AtomicBool,
+    cv: Condvar,
+    mutex: Mutex<()>,
+}
+
+impl NotifyState {
+    /// Block until a notify arrives or `timeout` elapses.
+    ///
+    /// Returns `true` if a notify was observed (the flag was set by the
+    /// callback, either before this call or via `notify_one` while blocked),
+    /// `false` if the wait timed out.
+    fn wait(&self, timeout: Duration) -> bool {
+        let guard = self
+            .mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.flag.swap(false, Ordering::SeqCst) {
+            // A callback already fired before we blocked — don't block.
+            return true;
+        }
+        let (_guard, timed_out) = self
+            .cv
+            .wait_timeout(guard, timeout)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.flag.store(false, Ordering::SeqCst);
+        !timed_out.timed_out()
+    }
+}
+
+/// libtorrent alert-notify callback. Invoked on libtorrent's internal
+/// thread(s) whenever the alert queue goes 0→1. Must be non-blocking and must
+/// not touch the session — it only flags and notifies the consumer.
+unsafe extern "C" fn notify_cb(user_data: *mut c_void) {
+    // SAFETY: `user_data` is `Arc::as_ptr(&notify)` and remains valid for as
+    // long as the session is alive (the callback is unregistered before the
+    // shared state is freed; see `AlertConsumer::stop`).
+    let state = &*(user_data as *const NotifyState);
+    state.flag.store(true, Ordering::SeqCst);
+    state.cv.notify_one();
+}
+
 // ── AlertConsumer ───────────────────────────────────────────
 
 /// Background thread that continuously pops and dispatches libtorrent alerts.
+/// Woken by the libtorrent `set_alert_notify` callback instead of a fixed
+/// poll interval.
 pub struct AlertConsumer {
     handle: Option<JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
+    /// Raw session pointer — kept only to unregister the notify callback in
+    /// [`AlertConsumer::stop`], which is always called while the session is
+    /// still alive.
+    session: libtorrent_sys::lt_session_t,
+    notify: Arc<NotifyState>,
 }
 
 impl AlertConsumer {
     /// Spawn a background alert consumer thread.
     ///
-    /// - `session`: raw libtorrent session pointer
+    /// - `session`: raw libtorrent session pointer (valid for the session's
+    ///   lifetime; the notify callback is registered on it and unregistered
+    ///   in [`AlertConsumer::stop`]).
+    /// - `stats`: shared session-stats snapshot updated on `session_stats_alert`.
     /// - `pending_reads`: table of pending read requests keyed by
-    ///   `"{info_hash}:piece:{idx}"` → oneshot sender
-    /// - `poll_interval_ms`: sleep between pop cycles (0 = disable)
+    ///   `"{info_hash}:piece:{idx}"` → oneshot sender.
     pub fn spawn(
         session: libtorrent_sys::lt_session_t,
         stats: SharedSessionStats,
         pending_reads: Option<Arc<Mutex<HashMap<String, SyncSender<Vec<u8>>>>>>,
-        poll_interval_ms: u64,
     ) -> Self {
-        if poll_interval_ms == 0 {
-            tracing::info!("Alert consumer disabled (poll_interval_ms=0)");
-            return Self {
-                handle: None,
-                stop_flag: Arc::new(AtomicBool::new(false)),
-            };
+        let notify = Arc::new(NotifyState {
+            flag: AtomicBool::new(false),
+            cv: Condvar::new(),
+            mutex: Mutex::new(()),
+        });
+
+        // Register the non-blocking notify hook. It fires on libtorrent's
+        // thread(s) whenever the alert queue goes 0→1 and only signals this
+        // consumer — all alert draining stays on the consumer thread.
+        unsafe {
+            libtorrent_sys::lt_session_set_alert_notify(
+                session,
+                Some(notify_cb),
+                Arc::as_ptr(&notify) as *mut c_void,
+            );
         }
 
-        let interval = Duration::from_millis(poll_interval_ms);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop = stop_flag.clone();
-        // Cast to usize to work around `*mut c_void: !Send`.  The pointer
-        // is valid for the lifetime of the `BackgroundSession` and the
+        // Cast to usize to work around `*mut c_void: !Send`. The pointer is
+        // valid for the session's lifetime, and `stop()` (called before the
+        // session is dropped) unregisters the notify hook.
         let session_ptr = session as usize;
         let stats_clone = stats.clone();
+        let notify_thread = notify.clone();
 
         let handle = thread::Builder::new()
             .name("alert-consumer".into())
             .spawn(move || {
-                tracing::info!(
-                    "Alert consumer started (poll_interval={}ms)",
-                    poll_interval_ms
-                );
+                tracing::info!("Alert consumer started (event-driven via set_alert_notify)");
                 let session = session_ptr as libtorrent_sys::lt_session_t;
                 loop {
                     if stop.load(Ordering::Relaxed) {
@@ -123,7 +192,9 @@ impl AlertConsumer {
 
                     let list = unsafe { libtorrent_sys::lt_session_pop_alerts(session) };
                     if list.is_null() {
-                        thread::sleep(interval);
+                        // Queue empty — block until the notify callback fires,
+                        // or the safety-net timeout elapses.
+                        let _ = notify_thread.wait(SAFETY_NET_TIMEOUT);
                         continue;
                     }
 
@@ -139,7 +210,6 @@ impl AlertConsumer {
                     }
 
                     unsafe { libtorrent_sys::lt_alert_list_destroy(list) };
-                    thread::sleep(interval);
                 }
             })
             .expect("Failed to spawn alert-consumer thread");
@@ -147,13 +217,22 @@ impl AlertConsumer {
         Self {
             handle: Some(handle),
             stop_flag,
+            session,
+            notify,
         }
     }
 
-    /// Signal the alert consumer to stop. Does not join — call
-    /// `Drop` or join the handle for that.
+    /// Signal the alert consumer to stop and unregister the notify callback.
+    /// Must be called while the session is still alive. Does not join — call
+    /// `Drop` (or join the handle) for that.
     pub fn stop(&self) {
+        // Unregister the hook first so libtorrent stops invoking the callback
+        // before the shared `notify` state is freed.
+        unsafe {
+            libtorrent_sys::lt_session_set_alert_notify(self.session, None, std::ptr::null_mut());
+        }
         self.stop_flag.store(true, Ordering::Relaxed);
+        self.notify.cv.notify_all();
     }
 
     fn dispatch(
@@ -280,9 +359,50 @@ impl AlertConsumer {
 
 impl Drop for AlertConsumer {
     fn drop(&mut self) {
-        self.stop();
+        // Do not unregister the notify hook here: the session may already be
+        // destroyed by the time this runs — `stop()` unregisters it while the
+        // session is still alive (the caller must invoke `stop()` first). Just
+        // wake the consumer thread and join it.
+        self.stop_flag.store(true, Ordering::Relaxed);
+        self.notify.cv.notify_all();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn new_state() -> Arc<NotifyState> {
+        Arc::new(NotifyState {
+            flag: AtomicBool::new(false),
+            cv: Condvar::new(),
+            mutex: Mutex::new(()),
+        })
+    }
+
+    #[test]
+    fn notify_cb_sets_flag() {
+        let state = new_state();
+        unsafe { notify_cb(Arc::as_ptr(&state) as *mut c_void) };
+        assert!(state.flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn wait_returns_immediately_when_already_flagged() {
+        // Simulate a callback firing before the consumer blocks (the
+        // missed-wakeup race). The flag must make `wait` return at once
+        // instead of blocking for the full timeout.
+        let state = new_state();
+        state.flag.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        assert!(state.wait(Duration::from_secs(60)));
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "wait should return immediately when the flag is already set"
+        );
     }
 }
