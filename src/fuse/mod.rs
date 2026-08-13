@@ -29,11 +29,11 @@ use self::stats::{generate_directory_stats, generate_global_stats, generate_torr
 
 use crate::cache::CacheManager;
 use crate::db::Database;
+use crate::infrastructure::metrics::Metrics;
 use crate::metadata::TorrentInfo;
 use crate::services::download::DownloadService;
 use crate::services::seeding::SeedingService;
 use crate::services::torrent::TorrentService;
-
 pub struct TorrentFs {
     pub inode_mgr: InodeManager,
     pub db: Option<Arc<Mutex<Database>>>,
@@ -42,6 +42,7 @@ pub struct TorrentFs {
     pub download_service: Option<Arc<DownloadService>>,
     pub torrent_data_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub listen_addr: String,
+    metrics: Arc<Metrics>,
 }
 
 /// Outcome of a synchronous attempt to serve a torrent file read.
@@ -69,7 +70,10 @@ impl TorrentFs {
             }
         }
 
-        let download_service = DownloadService::new(cache_path.as_path(), config).ok().map(Arc::new);
+        let metrics = Arc::new(Metrics::new());
+        let download_service = DownloadService::new_with_metrics(cache_path.as_path(), config, metrics.clone())
+            .ok()
+            .map(Arc::new);
 
         // Register SeedingManager as eviction callback on the DownloadService's CacheManager
         if let Some(ref ds) = download_service {
@@ -100,6 +104,7 @@ impl TorrentFs {
             download_service,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
             listen_addr,
+            metrics,
         }
     }
 
@@ -205,6 +210,7 @@ impl TorrentFs {
         {
             let cache = self.torrent_data_cache.lock().map_err(|_| EIO)?;
             if let Some(cached) = cache.get(&cache_key) {
+                self.metrics.l1_hit();
                 let end = std::cmp::min(offset + size, cached.len());
                 if offset < cached.len() {
                     return Ok(TorrentReadOutcome::Ready(cached[offset..end].to_vec()));
@@ -213,9 +219,13 @@ impl TorrentFs {
                 }
             }
         }
+        self.metrics.l1_miss();
 
         if let Some(ds) = &self.download_service {
             // Parse the torrent info for the download/read path.
+            // L3 (metadata) cache: no parsed-TorrentInfo cache exists yet,
+            // so every parse is a miss until the L3 cache lands (Stage 3).
+            self.metrics.l3_miss();
             let info = TorrentInfo::from_bytes(self.get_torrent_raw_data(torrent_id)?).map_err(
                 |e| {
                     error!("Failed to parse torrent info for download: {:?}", e);
@@ -228,6 +238,7 @@ impl TorrentFs {
             // safe even when a background download is in progress.
             match ds.pieces_on_disk(&info, file_index, offset as u64, size as u32) {
                 Ok(true) => {
+                    self.metrics.l2_hit();
                     // All pieces are available locally — synchronous read (fast path).
                     match ds.read_file_range(&info, file_index, offset as u64, size as u32) {
                         Ok(data) => {
@@ -252,6 +263,8 @@ impl TorrentFs {
                     }
                 }
                 Ok(false) => {
+                    self.metrics.l2_miss();
+                    self.metrics.deferred_read();
                     // Pieces need downloading.  Defer the whole read to a worker
                     // thread that blocks until the pieces arrive, keeping the
                     // FUSE dispatch loop free (TSI-2133).
@@ -914,7 +927,9 @@ impl Filesystem for TorrentFs {
                                 // (TSI-2114 / TSI-2133).
                                 match self.download_service.clone() {
                                     Some(ds) => {
+                                        let metrics = self.metrics.clone();
                                         std::thread::spawn(move || {
+                                            let _worker = metrics.worker_guard();
                                             match ds.read_file_range_blocking(
                                                 &info,
                                                 file_index,
@@ -1649,6 +1664,7 @@ impl TorrentFs {
             session_stats,
             get_cm,
             &self.listen_addr,
+            Some(self.metrics.snapshot()),
         )
     }
 

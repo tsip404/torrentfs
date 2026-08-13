@@ -10,7 +10,7 @@ use crate::db::{Database, TorrentStatus};
 use crate::domain::pieces_manager::PieceStatus;
 use crate::services::download::DownloadService;
 use crate::infrastructure::download::SessionStats;
-
+use crate::infrastructure::metrics::MetricsSnapshot;
 
 /// Format bytes into human-readable form.
 pub fn format_bytes(bytes: u64) -> String {
@@ -234,6 +234,76 @@ fn write_performance(output: &mut String) {
     output.push_str("  Memory (RSS):   —\n");
 }
 
+fn hit_rate(hits: u64, misses: u64) -> f64 {
+    let total = hits + misses;
+    if total > 0 {
+        (hits as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    }
+}
+
+/// Render the observability counters (TSI-2139). Absent counters (no
+/// metrics wired, e.g. unit tests) render as zeroes/`—`.
+fn write_observability(output: &mut String, metrics: Option<&MetricsSnapshot>) {
+    output.push_str("\n-- Observability --\n");
+
+    let m = metrics.cloned().unwrap_or_default();
+
+    output.push_str(&format!(
+        "  Cache L1 (memory):   hits {}  misses {}  hit rate {:.1}%\n",
+        format_num(m.l1_hits),
+        format_num(m.l1_misses),
+        hit_rate(m.l1_hits, m.l1_misses)
+    ));
+    output.push_str(&format!(
+        "  Cache L2 (disk):     hits {}  misses {}  hit rate {:.1}%\n",
+        format_num(m.l2_hits),
+        format_num(m.l2_misses),
+        hit_rate(m.l2_hits, m.l2_misses)
+    ));
+    output.push_str(&format!(
+        "  Cache L3 (metadata): hits {}  misses {}  hit rate {:.1}%\n",
+        format_num(m.l3_hits),
+        format_num(m.l3_misses),
+        hit_rate(m.l3_hits, m.l3_misses)
+    ));
+    output.push_str(&format!(
+        "  Deferred reads:      {}  Pending: {} current / {} peak\n",
+        format_num(m.deferred_reads),
+        format_num(m.pending_reads_current),
+        format_num(m.pending_reads_peak)
+    ));
+    output.push_str(&format!(
+        "  Poll hit rate:       hits {} / checks {} ({:.1}%)\n",
+        format_num(m.poll_hits),
+        format_num(m.poll_checks),
+        hit_rate(m.poll_hits, m.poll_checks)
+    ));
+    output.push_str(&format!(
+        "  Download queue:      {} current / {} peak\n",
+        format_num(m.download_queue_current),
+        format_num(m.download_queue_peak)
+    ));
+    output.push_str(&format!(
+        "  Workers:             {} active / {} peak\n",
+        format_num(m.workers_active),
+        format_num(m.workers_peak)
+    ));
+
+    let avg_wait_us = if m.lock_acquires > 0 {
+        m.lock_wait_nanos / m.lock_acquires / 1_000
+    } else {
+        0
+    };
+    output.push_str(&format!(
+        "  Lock wait:           {} acquisitions, avg {} µs (total {} ms)\n",
+        format_num(m.lock_acquires),
+        format_num(avg_wait_us),
+        m.lock_wait_nanos / 1_000_000
+    ));
+}
+
 fn status_to_english(status: &TorrentStatus) -> &'static str {
     match status {
         TorrentStatus::Pending => "Pending",
@@ -268,6 +338,7 @@ pub fn generate_global_stats(
     session_stats: Option<SessionStats>,
     get_cache_manager: impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
     listen_addr: &str,
+    metrics: Option<MetricsSnapshot>,
 ) -> Vec<u8> {
     let mut output = String::new();
 
@@ -286,6 +357,7 @@ pub fn generate_global_stats(
     write_torrent_overview_counts(&mut output, db);
     write_global_cache_summary(&mut output, &get_cache_manager);
     write_performance(&mut output);
+    write_observability(&mut output, metrics.as_ref());
 
     output.push('\n');
     output.push_str(BANNER_LINE);
@@ -617,6 +689,7 @@ pub fn generate_stats(
     get_cache_manager: impl Fn() -> Option<Arc<Mutex<CacheManager>>>,
     torrent_data_cache: &Arc<Mutex<HashMap<String, Vec<u8>>>>,
     listen_addr: &str,
+    metrics: Option<MetricsSnapshot>,
 ) -> Vec<u8> {
     let _ = torrent_data_cache;
     generate_global_stats(
@@ -625,6 +698,7 @@ pub fn generate_stats(
         session_stats,
         get_cache_manager,
         listen_addr,
+        metrics,
     )
 }
 
@@ -740,6 +814,7 @@ mod tests {
             None,
             || None,
             "0.0.0.0:6881",
+            None,
         );
         let text = String::from_utf8_lossy(&stats);
         assert!(text.contains("torrentfs v0.1.0"));
@@ -754,6 +829,7 @@ mod tests {
             None,
             || None,
             "0.0.0.0:6881",
+            None,
         );
         let text = String::from_utf8_lossy(&stats);
         assert!(!text.contains("── 种子详情 ──"));
@@ -767,6 +843,7 @@ mod tests {
             None,
             || None,
             "0.0.0.0:6881",
+            None,
         );
         let text = String::from_utf8_lossy(&stats);
         assert!(!text.contains("[info_hash]"));
@@ -794,6 +871,7 @@ mod tests {
             None,
             || None,
             "0.0.0.0:6881",
+            None,
         );
         let wrapper = generate_stats(
             Duration::from_secs(0),
@@ -802,6 +880,7 @@ mod tests {
             || None,
             &Arc::new(Mutex::new(HashMap::new())),
             "0.0.0.0:6881",
+            None,
         );
         let gtext = String::from_utf8_lossy(&global);
         let wtext = String::from_utf8_lossy(&wrapper);
@@ -827,6 +906,7 @@ mod tests {
             None,
             || None,
             "0.0.0.0:6881",
+            None,
         );
         let text = String::from_utf8_lossy(&stats);
         assert!(text.contains("====="), "borders must be ASCII '='");
@@ -841,6 +921,7 @@ mod tests {
             None,
             || None,
             "0.0.0.0:6881",
+            None,
         );
         let text = String::from_utf8_lossy(&stats);
         assert!(text.contains("-- Overview --"));
@@ -849,7 +930,33 @@ mod tests {
         assert!(text.contains("-- Torrents --"));
         assert!(text.contains("-- Cache --"));
         assert!(text.contains("-- Performance --"));
+        assert!(text.contains("-- Observability --"));
     }
+
+    #[test]
+    fn test_observability_renders_layered_cache_hit_rate() {
+        let mut m = MetricsSnapshot::default();
+        m.l1_hits = 40;
+        m.l1_misses = 60;
+        let stats = generate_global_stats(
+            Duration::from_secs(0),
+            &None,
+            None,
+            || None,
+            "0.0.0.0:6881",
+            Some(m),
+        );
+        let text = String::from_utf8_lossy(&stats);
+        assert!(text.contains("Cache L1 (memory):"), "missing L1 line: {text}");
+        assert!(text.contains("hit rate 40.0%"), "missing L1 hit rate: {text}");
+        assert!(text.contains("Cache L2 (disk):"), "missing L2 line: {text}");
+        assert!(text.contains("Cache L3 (metadata):"), "missing L3 line: {text}");
+        assert!(text.contains("Deferred reads:"), "missing Deferred line: {text}");
+        assert!(text.contains("Poll hit rate:"), "missing poll line: {text}");
+        assert!(text.contains("Download queue:"), "missing queue line: {text}");
+        assert!(text.contains("Workers:"), "missing workers line: {text}");
+        assert!(text.contains("Lock wait:"), "missing lock wait line: {text}");
+     }
 
     #[test]
     fn test_global_stats_total_unique_format() {
@@ -859,6 +966,7 @@ mod tests {
             None,
             || None,
             "0.0.0.0:6881",
+            None,
         );
         let text = String::from_utf8_lossy(&stats);
         assert!(text.contains("Total: "));

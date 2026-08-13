@@ -6,13 +6,13 @@
 //! - `cache` — LRU piece cache (CacheManager)
 //! - `config` — TOML configuration management (TorrentfsConfig)
 //! - `metadata` — .torrent file parsing (TorrentInfo)
-
 pub mod alert;
 pub mod cache;
 pub mod config;
 pub mod db;
 pub mod download;
 pub mod metadata;
+pub mod metrics;
 
 pub use cache::{CacheManager, PieceMetadata};
 pub use config::TorrentfsConfig;
@@ -25,3 +25,4 @@ pub use download::{
     TorrentStatus as DownloadTorrentStatus,
 };
 pub use metadata::TorrentInfo;
+pub use metrics::{Metrics, MetricsSnapshot};

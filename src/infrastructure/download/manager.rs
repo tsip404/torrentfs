@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::cache::CacheManager;
 use crate::config::TorrentfsConfig;
 use crate::domain::PiecesManager;
 use crate::error::{TorrentError, TorrentResult};
+use crate::infrastructure::metrics::Metrics;
 use crate::seeding::SeedingManager;
 
 use super::session::{Session, TorrentHandle};
@@ -26,10 +28,19 @@ pub struct DownloadManager {
     pub(crate) seeding_manager: Option<Arc<SeedingManager>>,
     pub(crate) pending_reads: PendingReads,
     pub(crate) pieces_manager: Arc<Mutex<PiecesManager>>,
+    pub(crate) metrics: Arc<Metrics>,
 }
 
 impl DownloadManager {
     pub fn new(cache_dir: &Path, config: &TorrentfsConfig) -> TorrentResult<Self> {
+        Self::new_with_metrics(cache_dir, config, Arc::new(Metrics::new()))
+    }
+
+    pub fn new_with_metrics(
+        cache_dir: &Path,
+        config: &TorrentfsConfig,
+        metrics: Arc<Metrics>,
+    ) -> TorrentResult<Self> {
         let cache_dir_str = cache_dir.to_string_lossy().into_owned();
 
         // Create pieces directory for custom piece storage
@@ -62,6 +73,7 @@ impl DownloadManager {
             seeding_manager: None,
             pending_reads: Arc::new(Mutex::new(HashMap::new())),
             pieces_manager,
+            metrics,
         })
     }
 
@@ -81,6 +93,11 @@ impl DownloadManager {
         self.cache_manager.clone()
     }
 
+    /// Shared observability counters.
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.metrics.clone()
+    }
+
     /// Register a SeedingManager to receive eviction callbacks from the CacheManager.
     pub fn register_seeding_callback(&mut self, seeding: Arc<SeedingManager>) {
         let mut cache = self
@@ -93,10 +110,12 @@ impl DownloadManager {
 
     /// Get session-level stats.
     pub fn get_session_stats(&self) -> TorrentResult<SessionStats> {
+        let lock_start = Instant::now();
         let session = self.session.lock().map_err(|_| TorrentError::Unknown {
             code: -1,
             message: "Session lock poisoned".to_string(),
         })?;
+        self.metrics.record_lock_wait(lock_start.elapsed());
         session.get_stats()
     }
 
@@ -133,10 +152,12 @@ impl DownloadManager {
         std::fs::create_dir_all(&torrent_save_dir)
             .map_err(|e| TorrentError::IoError(e.to_string()))?;
 
+        let lock_start = Instant::now();
         let mut session = self.session.lock().map_err(|_| TorrentError::Unknown {
             code: -1,
             message: "Session lock poisoned".to_string(),
         })?;
+        self.metrics.record_lock_wait(lock_start.elapsed());
 
         let handle = session.add_torrent(info, &torrent_save_dir)?;
 
@@ -760,6 +781,7 @@ impl DownloadManager {
                 );
                 let piece_wait_start = std::time::Instant::now();
                 let mut last_status_check = piece_wait_start;
+                let _queue_guard = self.metrics.download_queue_guard();
                 loop {
                     if piece_wait_start.elapsed() >= piece_wait_timeout {
                         status = handle_guard.status()?;
@@ -773,8 +795,9 @@ impl DownloadManager {
                             status.num_seeds
                         )));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    if handle_guard.have_piece(piece_idx) {
+                    let have_piece = handle_guard.have_piece(piece_idx);
+                    self.metrics.record_poll(have_piece);
+                    if have_piece {
                         tracing::debug!(
                             "read_file_range: piece {} is now available after {:.1}s",
                             piece_idx,
@@ -813,16 +836,16 @@ impl DownloadManager {
                                     code: -1,
                                     message: "Cache lock poisoned".to_string(),
                                 })?;
-                        // TSI-2048: validate metadata size matches expected
-                        // piece length before trusting the cache hit.
-                        if Self::is_piece_complete_in_cache(
+                        let complete = Self::is_piece_complete_in_cache(
                             &cache,
                             &piece_key,
                             piece_idx,
                             piece_length,
                             num_pieces,
                             total_size,
-                        ) {
+                        );
+                        self.metrics.record_poll(complete);
+                        if complete {
                             tracing::debug!(
                                 "read_file_range: piece {} validated in cache during wait (size ok, on_disk={} for info) after {:.1}s",
                                 piece_idx,
@@ -978,6 +1001,7 @@ impl DownloadManager {
                     message: "Pending reads lock poisoned".to_string(),
                 })?;
             pending.insert(piece_key.to_string(), tx);
+            self.metrics.pending_reads_inc();
         }
 
         // Enqueue the read.  enqueue_read_piece returns immediately
@@ -985,7 +1009,9 @@ impl DownloadManager {
         if let Err(e) = handle_guard.enqueue_read_piece(piece_idx) {
             // Clean up pending entry on enqueue failure.
             if let Ok(mut pending) = self.pending_reads.lock() {
-                pending.remove(piece_key);
+                if pending.remove(piece_key).is_some() {
+                    self.metrics.pending_reads_dec();
+                }
             }
             return Err(e);
         }
@@ -1031,7 +1057,9 @@ impl DownloadManager {
             Err(RecvTimeoutError::Timeout) => {
                 // Clean up pending entry.
                 if let Ok(mut pending) = self.pending_reads.lock() {
-                    pending.remove(piece_key);
+                    if pending.remove(piece_key).is_some() {
+                        self.metrics.pending_reads_dec();
+                    }
                 }
                 Err(TorrentError::Timeout(format!(
                     "Timed out waiting for piece {} after {}s",
@@ -1107,6 +1135,7 @@ impl DownloadManager {
         handle: &Arc<Mutex<TorrentHandle>>,
         cache: &Arc<Mutex<CacheManager>>,
         pieces_manager: &Arc<Mutex<PiecesManager>>,
+        metrics: &Arc<Metrics>,
         info_hash: &str,
         start_piece: i32,
         end_piece: i32,
@@ -1171,10 +1200,10 @@ impl DownloadManager {
                     continue;
                 }
             }
-
             // Wait for this piece
             let piece_start = std::time::Instant::now();
             let mut last_log = piece_start;
+            let _queue_guard = metrics.download_queue_guard();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(200));
 
@@ -1186,6 +1215,7 @@ impl DownloadManager {
                     };
                     h.have_piece(piece_idx)
                 };
+                metrics.record_poll(acquired);
                 if acquired {
                     tracing::debug!(
                         "background_wait: piece {} acquired after {:.1}s",
@@ -1205,10 +1235,12 @@ impl DownloadManager {
                         Ok(c) => c,
                         Err(_) => break,
                     };
-                    if Self::is_piece_complete_in_cache(
+                    let complete = Self::is_piece_complete_in_cache(
                         &c, &piece_key, piece_idx,
                         piece_length, num_pieces, total_size,
-                    ) {
+                    );
+                    metrics.record_poll(complete);
+                    if complete {
                         tracing::debug!(
                             "background_wait: piece {} found in cache after {:.1}s",
                             piece_idx,
