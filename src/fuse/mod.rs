@@ -1,119 +1,61 @@
-//! FUSE module — TorrentFs struct and Filesystem trait implementation.
-//! Delegates inode management to InodeManager, data lookups to DataResolver,
-//! stats generation to StatsGenerator, and torrent operations to TorrentService.
+//! FUSE module — the thin protocol adapter (`TorrentFs`) over `FsService`.
+//!
+//! `TorrentFs` is now pure glue: every `Filesystem` method converts the FUSE
+//! request parameters into a domain call, delegates to `FsService`, and
+//! converts the domain result back into a `fuser` reply. All domain logic,
+//! inode management, data resolution and stats rendering live in `FsService`
+//! (and its helpers), which is unit-testable without a FUSE session.
+//!
+//! The errno mapping (`impl From<FsError> for libc::c_int`) lives in `errno`
+//! — the single exit point from domain errors to kernel error codes.
 
+pub mod errno;
+pub mod fs_service;
+pub mod fs_types;
 pub mod inodes;
 pub mod lookup;
 pub mod stats;
 
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::raw::c_int;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{
     Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
-use libc::{EACCES, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, EPERM, EROFS};
-use tracing::{error, info, warn};
+use tracing::warn;
 
-use self::inodes::{
-    DataInode, InodeData, InodeManager, DATA_INO, METADATA_INO, ROOT_INO, STATS_INO,
-};
-use self::lookup::DataResolver;
-use self::stats::{generate_directory_stats, generate_global_stats, generate_torrent_stats};
+pub use self::fs_service::FsService;
+use self::fs_types::{Attr, FileKind, ReadOutcome, StatsKind};
 
 use crate::cache::CacheManager;
+use crate::config::TorrentfsConfig;
 use crate::db::Database;
-use crate::infrastructure::metrics::Metrics;
-use crate::metadata::TorrentInfo;
+use crate::domain::fs_error::FsError;
 use crate::services::download::DownloadService;
-use crate::services::seeding::SeedingService;
-use crate::services::torrent::TorrentService;
-pub struct TorrentFs {
-    pub inode_mgr: InodeManager,
-    pub db: Option<Arc<Mutex<Database>>>,
-    pub torrent_service: Option<TorrentService>,
-    pub processing_torrents: Arc<Mutex<HashMap<String, ()>>>,
-    pub download_service: Option<Arc<DownloadService>>,
-    pub torrent_data_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
-    pub listen_addr: String,
-    metrics: Arc<Metrics>,
-}
 
-/// Outcome of a synchronous attempt to serve a torrent file read.
-enum TorrentReadOutcome {
-    /// Data served synchronously (in-memory cache hit or all pieces on disk).
-    Ready(Vec<u8>),
-    /// Pieces still need downloading. The read must be completed off the FUSE
-    /// dispatch thread so other operations (readdir, `.stats`) stay responsive.
-    Deferred {
-        info: TorrentInfo,
-        file_index: i32,
-        offset: u64,
-        size: u32,
-    },
+/// FUSE entry TTL (seconds).
+const TTL: Duration = Duration::from_secs(1);
+
+pub struct TorrentFs {
+    service: FsService,
 }
 
 impl TorrentFs {
-    pub fn new_with_cache_path(
-        cache_path: PathBuf,
-        config: &crate::config::TorrentfsConfig,
-    ) -> Self {
-        if !cache_path.exists() {
-            if let Err(e) = std::fs::create_dir_all(&cache_path) {
-                warn!("Failed to create cache directory {:?}: {:?}", cache_path, e);
-            }
-        }
-
-        let metrics = Arc::new(Metrics::new());
-        let download_service = DownloadService::new_with_metrics(cache_path.as_path(), config, metrics.clone())
-            .ok()
-            .map(Arc::new);
-
-        // Register SeedingManager as eviction callback on the DownloadService's CacheManager
-        if let Some(ref ds) = download_service {
-            if let Ok(seeding_svc) = SeedingService::new(&cache_path, config) {
-                ds.register_seeding_callback(seeding_svc.get_seeding_manager());
-                info!("SeedingManager registered as CacheManager eviction callback");
-            }
-        }
-
-        let creation_time = Duration::from_secs(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        );
-
-        let listen_addr = config
-            .connections
-            .listen_interfaces
-            .clone()
-            .unwrap_or_else(|| "0.0.0.0:6881".to_string());
-
+    pub fn new_with_cache_path(cache_path: PathBuf, config: &TorrentfsConfig) -> Self {
         Self {
-            inode_mgr: InodeManager::new(creation_time),
-            db: None,
-            torrent_service: None,
-            processing_torrents: Arc::new(Mutex::new(HashMap::new())),
-            download_service,
-            torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
-            listen_addr,
-            metrics,
+            service: FsService::new_with_cache_path(cache_path, config),
         }
     }
 
     #[allow(dead_code)]
     pub fn new() -> Self {
-        Self::new_with_cache_path(
-            PathBuf::from("/tmp/torrentfs-cache"),
-            &crate::config::TorrentfsConfig::default_config(),
-        )
+        Self {
+            service: FsService::new(),
+        }
     }
 
     #[allow(dead_code)]
@@ -124,220 +66,59 @@ impl TorrentFs {
     pub fn new_with_db_and_cache(
         db: Database,
         cache_path: PathBuf,
-        config: &crate::config::TorrentfsConfig,
+        config: &TorrentfsConfig,
     ) -> Self {
-        let mut fs = Self::new_with_cache_path(cache_path, config);
-
-        // Collect data from database before moving it
-        let (dirs, torrents, torrent_datas) = {
-            let dirs = db.get_all_metadata_directories().unwrap_or_default();
-            let torrents = db.get_all_torrents().unwrap_or_default();
-            let torrent_datas: Vec<Vec<u8>> = torrents
-                .iter()
-                .filter_map(|t| t.torrent_data.clone())
-                .collect();
-            (dirs, torrents, torrent_datas)
-        };
-
-        let db_arc = Arc::new(Mutex::new(db));
-        fs.torrent_service = Some(TorrentService::new(db_arc.clone(), fs.download_service.clone()));
-        fs.db = Some(db_arc);
-        fs.inode_mgr.restore_metadata_inodes(dirs, torrents);
-
-        // Recreate lightweight libtorrent handles for all persisted torrents so
-        // peer/seed information and `.stats` piece status are visible without a
-        // read (TSI-2112 / TSI-2133).  Handles join with every piece at priority
-        // 0, so nothing is downloaded until a read elevates priorities.
-        if let Some(ref ds) = fs.download_service {
-            for data in torrent_datas {
-                match TorrentInfo::from_bytes(data) {
-                    Ok(info) => {
-                        if let Err(e) = ds.ensure_handle_lightweight(&info) {
-                            warn!(
-                                "Failed to restore lightweight handle for torrent '{}': {:?}",
-                                info.name(),
-                                e
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to parse stored torrent data on startup: {:?}", e);
-                    }
-                }
-            }
+        Self {
+            service: FsService::new_with_db_and_cache(db, cache_path, config),
         }
+    }
 
-        fs
+    /// The download service, for the background alert consumer.
+    pub fn download_service(&self) -> Option<&Arc<DownloadService>> {
+        self.service.download_service.as_ref()
     }
 
     /// Get the CacheManager shared with DownloadService.
     pub fn get_cache_manager(&self) -> Option<Arc<Mutex<CacheManager>>> {
-        self.download_service
-            .as_ref()
-            .and_then(|ds| ds.get_cache_manager())
+        self.service.get_cache_manager()
     }
 
-    /// Read torrent file data from the BitTorrent network.
-    fn read_torrent_file_data(
-        &self,
-        torrent_id: i64,
-        file_id: i64,
-        offset: usize,
-        size: usize,
-    ) -> Result<TorrentReadOutcome, i32> {
-        let ts = self.torrent_service.as_ref().ok_or_else(|| {
-            error!("Torrent service not available");
-            EIO
-        })?;
-
-        let (info_hash, _source_path, files) =
-            ts.get_torrent_with_files(torrent_id)?.ok_or_else(|| {
-                error!("Torrent not found: {}", torrent_id);
-                ENOENT
-            })?;
-
-        let _file = files.iter().find(|f| f.id == file_id).ok_or_else(|| {
-            error!("File not found: {}", file_id);
-            ENOENT
-        })?;
-
-        let file_index = files.iter().position(|f| f.id == file_id).ok_or_else(|| {
-            error!("File index not found for file_id: {}", file_id);
-            EIO
-        })? as i32;
-
-        let cache_key = format!("{}:{}", info_hash, file_id);
-        {
-            let cache = self.torrent_data_cache.lock().map_err(|_| EIO)?;
-            if let Some(cached) = cache.get(&cache_key) {
-                self.metrics.l1_hit();
-                let end = std::cmp::min(offset + size, cached.len());
-                if offset < cached.len() {
-                    return Ok(TorrentReadOutcome::Ready(cached[offset..end].to_vec()));
-                } else {
-                    return Ok(TorrentReadOutcome::Ready(Vec::new()));
-                }
-            }
-        }
-        self.metrics.l1_miss();
-
-        if let Some(ds) = &self.download_service {
-            // Parse the torrent info for the download/read path.
-            // L3 (metadata) cache: no parsed-TorrentInfo cache exists yet,
-            // so every parse is a miss until the L3 cache lands (Stage 3).
-            self.metrics.l3_miss();
-            let info = TorrentInfo::from_bytes(self.get_torrent_raw_data(torrent_id)?).map_err(
-                |e| {
-                    error!("Failed to parse torrent info for download: {:?}", e);
-                    EIO
-                },
-            )?;
-
-            // Fast pre-check: are all needed pieces already on disk?
-            // Uses only CacheManager — no DownloadManager lock, so it's
-            // safe even when a background download is in progress.
-            match ds.pieces_on_disk(&info, file_index, offset as u64, size as u32) {
-                Ok(true) => {
-                    self.metrics.l2_hit();
-                    // All pieces are available locally — synchronous read (fast path).
-                    match ds.read_file_range(&info, file_index, offset as u64, size as u32) {
-                        Ok(data) => {
-                            info!(
-                                "Successfully read {} bytes from torrent file \
-                                 (torrent_id={}, file_id={})",
-                                data.len(),
-                                torrent_id,
-                                file_id
-                            );
-                            Ok(TorrentReadOutcome::Ready(data))
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to read from torrent file (torrent_id={}, file_id={}): {}. \
-                                 The torrent may have no active peers/seeds. \
-                                 Check tracker health with `cat .stats`.",
-                                torrent_id, file_id, e
-                            );
-                            Err(EIO)
-                        }
-                    }
-                }
-                Ok(false) => {
-                    self.metrics.l2_miss();
-                    self.metrics.deferred_read();
-                    // Pieces need downloading.  Defer the whole read to a worker
-                    // thread that blocks until the pieces arrive, keeping the
-                    // FUSE dispatch loop free (TSI-2133).
-                    info!(
-                        "Deferring read for torrent file (torrent_id={}, file_id={}): \
-                         pieces not on disk, blocking in worker thread",
-                        torrent_id, file_id
-                    );
-                    Ok(TorrentReadOutcome::Deferred {
-                        info,
-                        file_index,
-                        offset: offset as u64,
-                        size: size as u32,
-                    })
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to check pieces on disk (torrent_id={}, file_id={}): {:?}",
-                        torrent_id, file_id, e
-                    );
-                    Err(EIO)
-                }
-            }
-        } else {
-            error!("Download manager not available");
-            Err(EIO)
-        }
+    /// Generate global stats (delegates to FsService).
+    pub fn generate_stats(&self) -> Vec<u8> {
+        self.service.read_stats(StatsKind::Global)
     }
 
-    fn get_torrent_raw_data(&self, torrent_id: i64) -> Result<Vec<u8>, i32> {
-        let db = DataResolver::get_db(&self.db)?;
-        let db_guard = db.lock().map_err(|_| {
-            error!("Database lock poisoned");
-            EIO
-        })?;
-
-        let torrent = db_guard
-            .get_torrent_by_id(torrent_id)
-            .map_err(|e| {
-                error!("Failed to get torrent: {:?}", e);
-                EIO
-            })?
-            .ok_or_else(|| {
-                error!("Torrent not found for id: {}", torrent_id);
-                ENOENT
-            })?;
-
-        if let Some(ref data) = torrent.torrent_data {
-            if !data.is_empty() {
-                return Ok(data.clone());
-            }
+    /// Convert a domain `Attr` into a `fuser::FileAttr`, filling the fields the
+    /// adapter owns: timestamps (from inode creation time) and uid/gid (process).
+    fn to_fuse_attr(&self, attr: &Attr) -> fuser::FileAttr {
+        let t = self.service.inode_mgr.creation_time;
+        fuser::FileAttr {
+            ino: attr.ino,
+            size: attr.size,
+            blocks: attr.size.div_ceil(512),
+            atime: UNIX_EPOCH + t,
+            mtime: UNIX_EPOCH + t,
+            ctime: UNIX_EPOCH + t,
+            crtime: UNIX_EPOCH + t,
+            kind: kind_to_fuse(attr.kind),
+            perm: attr.perm,
+            nlink: attr.nlink,
+            // SAFETY: libc::getuid() / libc::getgid() are always safe to call
+            // in POSIX environments — they simply return the current process's
+            // real user/group IDs and have no preconditions.
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
         }
+    }
+}
 
-        for data in self.inode_mgr.inodes.values() {
-            if let InodeData::File {
-                name,
-                data: file_data,
-                ..
-            } = data
-            {
-                if name.ends_with(".torrent") && !file_data.is_empty() {
-                    if let Ok(info) = TorrentInfo::from_bytes(file_data.clone()) {
-                        if let Ok(metadata) = info.metadata() {
-                            if hex::encode(metadata.info_hash) == torrent.info_hash {
-                                return Ok(file_data.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(ENOENT)
+fn kind_to_fuse(kind: FileKind) -> fuser::FileType {
+    match kind {
+        FileKind::Directory => fuser::FileType::Directory,
+        FileKind::RegularFile => fuser::FileType::RegularFile,
     }
 }
 
@@ -354,247 +135,19 @@ impl Filesystem for TorrentFs {
         }
         Ok(())
     }
+
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let name_str = name.to_string_lossy();
-
-        if parent == ROOT_INO {
-            match name_str.as_ref() {
-                "metadata" => {
-                    reply.entry(
-                        &Duration::from_secs(1),
-                        &self.inode_mgr.attr_for_dir(METADATA_INO, true),
-                        0,
-                    );
-                }
-                "data" => {
-                    reply.entry(
-                        &Duration::from_secs(1),
-                        &self.inode_mgr.attr_for_dir(DATA_INO, false),
-                        0,
-                    );
-                }
-                ".stats" => {
-                    let stats_size = self.generate_stats().len() as u64;
-                    reply.entry(
-                        &Duration::from_secs(1),
-                        &self.inode_mgr.attr_for_file(STATS_INO, stats_size),
-                        0,
-                    );
-                }
-                _ => reply.error(ENOENT),
-            }
-            return;
+        match self.service.lookup(parent, &name.to_string_lossy()) {
+            Ok(Some(entry)) => reply.entry(&TTL, &self.to_fuse_attr(&entry.attr), 0),
+            Ok(None) => reply.error(FsError::NotFound.into()),
+            Err(e) => reply.error(e.into()),
         }
-
-        // Handle .stats virtual file for data/ subtree directories.
-        // Must be intercepted before the normal data/ lookup so that
-        // .stats is not resolved as a torrent name or source path.
-        if name_str == ".stats" {
-            if parent == DATA_INO {
-                let stats_ino = InodeManager::make_stats_ino(parent);
-                let content = self.generate_dir_stats_content("");
-                reply.entry(
-                    &Duration::from_secs(1),
-                    &self
-                        .inode_mgr
-                        .attr_for_file(stats_ino, content.len() as u64),
-                    0,
-                );
-                return;
-            }
-
-            if let Some(data_inode) = self.inode_mgr.data_inodes.get(&parent) {
-                match data_inode {
-                    DataInode::SourcePathDir { path } => {
-                        let stats_ino = InodeManager::make_stats_ino(parent);
-                        let content = self.generate_dir_stats_content(path);
-                        reply.entry(
-                            &Duration::from_secs(1),
-                            &self
-                                .inode_mgr
-                                .attr_for_file(stats_ino, content.len() as u64),
-                            0,
-                        );
-                        return;
-                    }
-                    DataInode::TorrentRoot { torrent_id, .. } => {
-                        let stats_ino = InodeManager::make_stats_ino(parent);
-                        let content = self.generate_torrent_stats_for_id(*torrent_id);
-                        reply.entry(
-                            &Duration::from_secs(1),
-                            &self
-                                .inode_mgr
-                                .attr_for_file(stats_ino, content.len() as u64),
-                            0,
-                        );
-                        return;
-                    }
-                    _ => {
-                        reply.error(ENOENT);
-                        return;
-                    }
-                }
-            }
-            // Parent not yet cached in data_inodes — fall through to
-            // normal data/ lookup below.  If the parent doesn't exist,
-            // the lookup will return ENOENT as expected.
-        }
-
-        if parent == DATA_INO || InodeManager::is_data_ino(parent) {
-            if let Some(db) = &self.db {
-                if let Some((ino, kind, size)) =
-                    DataResolver::lookup_data_inode(&mut self.inode_mgr, db, parent, &name_str)
-                {
-                    match kind {
-                        fuser::FileType::Directory => {
-                            reply.entry(
-                                &Duration::from_secs(1),
-                                &self.inode_mgr.attr_for_dir(ino, false),
-                                0,
-                            );
-                        }
-                        fuser::FileType::RegularFile => {
-                            reply.entry(
-                                &Duration::from_secs(1),
-                                &self.inode_mgr.attr_for_file(ino, size),
-                                0,
-                            );
-                        }
-                        _ => reply.error(ENOENT),
-                    }
-                    return;
-                }
-            }
-            reply.error(ENOENT);
-            return;
-        }
-
-        if let Some(child_ino) = self.inode_mgr.find_child_by_name(parent, &name_str) {
-            if let Some(data) = self.inode_mgr.inodes.get(&child_ino) {
-                match data {
-                    InodeData::Directory { .. } => {
-                        reply.entry(
-                            &Duration::from_secs(1),
-                            &self.inode_mgr.attr_for_dir(child_ino, true),
-                            0,
-                        );
-                    }
-                    InodeData::File {
-                        data: file_data, ..
-                    } => {
-                        reply.entry(
-                            &Duration::from_secs(1),
-                            &self
-                                .inode_mgr
-                                .attr_for_file(child_ino, file_data.len() as u64),
-                            0,
-                        );
-                    }
-                }
-                return;
-            }
-        }
-
-        reply.error(ENOENT);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        match ino {
-            ROOT_INO => reply.attr(
-                &Duration::from_secs(1),
-                &self.inode_mgr.attr_for_dir(ino, false),
-            ),
-            METADATA_INO => reply.attr(
-                &Duration::from_secs(1),
-                &self.inode_mgr.attr_for_dir(ino, true),
-            ),
-            DATA_INO => reply.attr(
-                &Duration::from_secs(1),
-                &self.inode_mgr.attr_for_dir(ino, false),
-            ),
-            STATS_INO => {
-                let stats_size = self.generate_global_stats_content().len() as u64;
-                reply.attr(
-                    &Duration::from_secs(1),
-                    &self.inode_mgr.attr_for_file(ino, stats_size),
-                );
-            }
-            _ => {
-                if InodeManager::is_stats_ino(ino) {
-                    let content = self.generate_data_stats_for_ino(ino);
-                    reply.attr(
-                        &Duration::from_secs(1),
-                        &self.inode_mgr.attr_for_file(ino, content.len() as u64),
-                    );
-                    return;
-                }
-
-                if InodeManager::is_data_ino(ino) {
-                    if let Some(data_inode) = self.inode_mgr.data_inodes.get(&ino) {
-                        match data_inode {
-                            DataInode::SourcePathDir { .. }
-                            | DataInode::TorrentRoot { .. }
-                            | DataInode::TorrentDir { .. } => {
-                                reply.attr(
-                                    &Duration::from_secs(1),
-                                    &self.inode_mgr.attr_for_dir(ino, false),
-                                );
-                            }
-                            DataInode::TorrentFile { size, .. } => {
-                                reply.attr(
-                                    &Duration::from_secs(1),
-                                    &self.inode_mgr.attr_for_file(ino, *size as u64),
-                                );
-                            }
-                        }
-                        return;
-                    }
-
-                    let torrent_id = (ino - inodes::DATA_TORRENT_INO_BASE) as i64;
-                    if (inodes::DATA_TORRENT_INO_BASE..inodes::DATA_DIR_INO_BASE).contains(&ino) {
-                        if self
-                            .torrent_service
-                            .as_ref()
-                            .map(|ts| ts.torrent_exists_by_id(torrent_id))
-                            .unwrap_or(false)
-                        {
-                            reply.attr(
-                                &Duration::from_secs(1),
-                                &self.inode_mgr.attr_for_dir(ino, false),
-                            );
-                        } else {
-                            reply.error(ENOENT);
-                        }
-                        return;
-                    }
-
-                    reply.error(ENOENT);
-                    return;
-                }
-
-                if let Some(data) = &self.inode_mgr.inodes.get(&ino) {
-                    match data {
-                        InodeData::Directory { .. } => {
-                            reply.attr(
-                                &Duration::from_secs(1),
-                                &self
-                                    .inode_mgr
-                                    .attr_for_dir(ino, self.inode_mgr.is_metadata_child(ino)),
-                            );
-                        }
-                        InodeData::File {
-                            data: file_data, ..
-                        } => {
-                            reply.attr(
-                                &Duration::from_secs(1),
-                                &self.inode_mgr.attr_for_file(ino, file_data.len() as u64),
-                            );
-                        }
-                    }
-                } else {
-                    reply.error(ENOENT);
-                }
-            }
+        match self.service.getattr(ino) {
+            Ok(attr) => reply.attr(&TTL, &self.to_fuse_attr(&attr)),
+            Err(e) => reply.error(e.into()),
         }
     }
 
@@ -606,158 +159,36 @@ impl Filesystem for TorrentFs {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        if ino == DATA_INO || InodeManager::is_data_ino(ino) {
-            if let Some(db) = &self.db {
-                if let Some(entries) =
-                    DataResolver::readdir_data(&mut self.inode_mgr, db, ino, offset)
-                {
-                    for (entry_ino, entry_offset, kind, name) in entries {
-                        if reply.add(entry_ino, entry_offset, kind, &name) {
-                            break;
-                        }
+        match self.service.readdir(ino, offset) {
+            Ok(entries) => {
+                for entry in entries {
+                    if reply.add(
+                        entry.ino,
+                        entry.offset,
+                        kind_to_fuse(entry.kind),
+                        &entry.name,
+                    ) {
+                        break;
                     }
-                    reply.ok();
-                    return;
                 }
+                reply.ok();
             }
-            reply.error(ENOENT);
-            return;
+            Err(e) => reply.error(e.into()),
         }
-
-        let mut entries: Vec<(u64, i64, fuser::FileType, String)> =
-            vec![(ino, 1, fuser::FileType::Directory, ".".to_string())];
-
-        if ino == ROOT_INO {
-            entries.push((ROOT_INO, 2, fuser::FileType::Directory, "..".to_string()));
-            entries.push((
-                METADATA_INO,
-                3,
-                fuser::FileType::Directory,
-                "metadata".to_string(),
-            ));
-            entries.push((DATA_INO, 4, fuser::FileType::Directory, "data".to_string()));
-            entries.push((
-                STATS_INO,
-                5,
-                fuser::FileType::RegularFile,
-                ".stats".to_string(),
-            ));
-        } else if let Some(InodeData::Directory { parent, .. }) = self.inode_mgr.inodes.get(&ino) {
-            entries.push((*parent, 2, fuser::FileType::Directory, "..".to_string()));
-
-            let mut offset_counter = entries.len() as i64 + 1;
-            // Collect entries first to avoid borrowing issues
-            let children: Vec<(u64, fuser::FileType, String)> = self
-                .inode_mgr
-                .inodes
-                .iter()
-                .filter_map(|(child_ino, data)| match data {
-                    InodeData::Directory {
-                        parent: p, name, ..
-                    } if *p == ino && !name.is_empty() => {
-                        Some((*child_ino, fuser::FileType::Directory, name.clone()))
-                    }
-                    InodeData::File {
-                        parent: p, name, ..
-                    } if *p == ino => {
-                        Some((*child_ino, fuser::FileType::RegularFile, name.clone()))
-                    }
-                    _ => None,
-                })
-                .collect();
-
-            for (child_ino, kind, name) in children {
-                entries.push((child_ino, offset_counter, kind, name));
-                offset_counter += 1;
-            }
-        } else {
-            reply.error(ENOTDIR);
-            return;
-        }
-
-        for (ino_child, offset_child, kind, name) in entries.iter() {
-            if *offset_child <= offset {
-                continue;
-            }
-            if reply.add(*ino_child, *offset_child, *kind, name) {
-                break;
-            }
-        }
-        reply.ok();
     }
 
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        match ino {
-            ROOT_INO | METADATA_INO | DATA_INO => reply.opened(0, 0),
-            STATS_INO => {
-                let fh = inodes::NEXT_FH.fetch_add(1, Ordering::SeqCst);
-                self.inode_mgr.open_files.insert(fh, ino);
-                reply.opened(fh, 0);
-            }
-            _ => {
-                if InodeManager::is_stats_ino(ino) {
-                    let fh = inodes::NEXT_FH.fetch_add(1, Ordering::SeqCst);
-                    self.inode_mgr.open_files.insert(fh, ino);
-                    reply.opened(fh, 0);
-                    return;
-                }
-
-                if InodeManager::is_data_ino(ino) {
-                    if let Some(DataInode::TorrentFile { .. }) =
-                        self.inode_mgr.data_inodes.get(&ino)
-                    {
-                        let fh = inodes::NEXT_FH.fetch_add(1, Ordering::SeqCst);
-                        self.inode_mgr.open_files.insert(fh, ino);
-                        reply.opened(fh, 0);
-                    } else {
-                        reply.opened(0, 0);
-                    }
-                    return;
-                }
-
-                if self.inode_mgr.inodes.contains_key(&ino) {
-                    let fh = inodes::NEXT_FH.fetch_add(1, Ordering::SeqCst);
-                    self.inode_mgr.open_files.insert(fh, ino);
-                    reply.opened(fh, 0);
-                } else {
-                    reply.error(ENOENT);
-                }
-            }
+        match self.service.open(ino) {
+            Ok(fh) => reply.opened(fh, 0),
+            Err(e) => reply.error(e.into()),
         }
     }
 
     fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        if let Some(InodeData::File { data, name, .. }) = self.inode_mgr.inodes.get(&ino) {
-            if name.ends_with(".torrent") {
-                if data.is_empty() {
-                    warn!("Zero-byte torrent file {} rejected", name);
-                    reply.error(EINVAL);
-                    return;
-                }
-
-                if data.len() > inodes::MAX_TORRENT_SIZE {
-                    warn!(
-                        "Torrent file {} exceeds size limit ({} bytes)",
-                        name,
-                        data.len()
-                    );
-                    reply.error(EFBIG);
-                    return;
-                }
-
-                match TorrentInfo::from_bytes(data.clone()) {
-                    Ok(_) => {
-                        info!("Torrent {} validated successfully", name);
-                    }
-                    Err(e) => {
-                        warn!("Invalid torrent file {}: {:?}", name, e);
-                        reply.error(EINVAL);
-                        return;
-                    }
-                }
-            }
+        match self.service.flush(ino) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.into()),
         }
-        reply.ok();
     }
 
     fn release(
@@ -770,80 +201,10 @@ impl Filesystem for TorrentFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if let Some(ino) = self.inode_mgr.open_files.remove(&fh) {
-            if let Some(InodeData::File { data, name, parent }) =
-                self.inode_mgr.inodes.get(&ino).cloned()
-            {
-                if name.ends_with(".torrent") {
-                    if data.is_empty() {
-                        warn!("Zero-byte torrent file {} removed", name);
-                        self.inode_mgr.inodes.remove(&ino);
-                        reply.ok();
-                        return;
-                    }
-
-                    if data.len() > inodes::MAX_TORRENT_SIZE {
-                        self.inode_mgr.inodes.remove(&ino);
-                        reply.ok();
-                        return;
-                    }
-
-                    if TorrentInfo::from_bytes(data.clone()).is_err() {
-                        warn!("Torrent {} invalid, removing inode", name);
-                        self.inode_mgr.inodes.remove(&ino);
-                        reply.ok();
-                        return;
-                    }
-
-                    let source_path = self.inode_mgr.extract_source_path(parent);
-
-                    let mut processing = match self.processing_torrents.lock() {
-                        Ok(guard) => guard,
-                        Err(e) => {
-                            error!("Mutex poisoned in release(): {}", e);
-                            reply.error(EIO);
-                            return;
-                        }
-                    };
-
-                    if processing.contains_key(&source_path) {
-                        warn!(
-                            "Torrent at source_path '{}' already being processed, skipping",
-                            source_path
-                        );
-                        reply.ok();
-                        return;
-                    }
-                    processing.insert(source_path.clone(), ());
-
-                    // Keep the processing lock held during add_torrent to
-                    // prevent concurrent releases on the same source_path from
-                    // racing on the database insert, which could cause SQLite
-                    // constraint violations or double-inserts (TSI-2072).
-                    if let Some(ref ts) = self.torrent_service {
-                        match ts.add_torrent(&data, &source_path, &name) {
-                            Ok(()) => {
-                                info!("Successfully processed torrent: {}", name);
-                                processing.remove(&source_path);
-                            }
-                            Err(e) => {
-                                error!("Failed to process torrent {}: {}", name, e);
-                                processing.remove(&source_path);
-                            }
-                        }
-                    } else {
-                        // Fallback: no DB configured
-                        info!(
-                            "Torrent {} received (no DB configured, skipping insert)",
-                            name
-                        );
-                        processing.remove(&source_path);
-                    }
-                }
-            }
+        match self.service.release(fh) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.into()),
         }
-
-        reply.ok();
     }
 
     fn read(
@@ -857,141 +218,45 @@ impl Filesystem for TorrentFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        match ino {
-            ROOT_INO | METADATA_INO | DATA_INO => reply.error(EISDIR),
-            STATS_INO => {
-                let offset = offset as usize;
-                let stats = self.generate_global_stats_content();
-                if offset >= stats.len() {
-                    reply.data(&[]);
-                } else {
-                    let end = std::cmp::min(offset + size as usize, stats.len());
-                    reply.data(&stats[offset..end]);
-                }
-            }
-            _ => {
-                if InodeManager::is_stats_ino(ino) {
-                    let stats = self.generate_data_stats_for_ino(ino);
-                    let offset = offset as usize;
-                    if offset >= stats.len() {
-                        reply.data(&[]);
-                    } else {
-                        let end = std::cmp::min(offset + size as usize, stats.len());
-                        reply.data(&stats[offset..end]);
-                    }
-                    return;
-                }
-
-                if InodeManager::is_data_ino(ino) {
-                    if let Some(DataInode::TorrentFile {
-                        torrent_id,
-                        file_id,
-                        name,
-                        size: file_size,
-                    }) = self.inode_mgr.data_inodes.get(&ino)
-                    {
-                        let offset = offset as usize;
-                        let read_size = size as usize;
-
-                        info!("Read request for torrent file: {} (torrent_id={}, file_id={}, offset={}, size={})",
-                              name, torrent_id, file_id, offset, read_size);
-
-                        let actual_size = *file_size as usize;
-                        if offset >= actual_size {
-                            reply.data(&[]);
-                            return;
-                        }
-
-                        let end = std::cmp::min(offset + read_size, actual_size);
-                        let result_size = end - offset;
-
-                        match self.read_torrent_file_data(
-                            *torrent_id,
-                            *file_id,
-                            offset,
-                            result_size,
-                        ) {
-                            Ok(TorrentReadOutcome::Ready(data)) => {
-                                reply.data(&data);
-                            }
-                            Ok(TorrentReadOutcome::Deferred {
-                                info,
-                                file_index,
-                                offset: file_offset,
-                                size: read_len,
-                            }) => {
-                                // Complete the read on a worker thread and reply
-                                // asynchronously.  The worker blocks until the
-                                // requested pieces are downloaded, keeping the
-                                // FUSE dispatch loop free for readdir/.stats
-                                // (TSI-2114 / TSI-2133).
-                                match self.download_service.clone() {
-                                    Some(ds) => {
-                                        let metrics = self.metrics.clone();
-                                        std::thread::spawn(move || {
-                                            let _worker = metrics.worker_guard();
-                                            match ds.read_file_range_blocking(
-                                                &info,
-                                                file_index,
-                                                file_offset,
-                                                read_len,
-                                            ) {
-                                                Ok(data) => reply.data(&data),
-                                                Err(e) => {
-                                                    warn!(
-                                                        "Failed to read torrent file data \
-                                                         (async): {:?}",
-                                                        e
-                                                    );
-                                                    reply.error(EIO);
-                                                }
-                                            }
-                                        });
-                                    }
-                                    None => reply.error(EIO),
+        match self.service.read(ino, offset, size) {
+            Ok(ReadOutcome::Ready(data)) => reply.data(&data),
+            Ok(ReadOutcome::Deferred {
+                info,
+                file_index,
+                offset,
+                size,
+            }) => {
+                // Complete the read on a worker thread and reply asynchronously.
+                // The worker blocks until the requested pieces are downloaded,
+                // keeping the FUSE dispatch loop free for readdir/.stats
+                // (TSI-2114 / TSI-2133).
+                match self.service.download_service.clone() {
+                    Some(ds) => {
+                        let metrics = self.service.metrics.clone();
+                        std::thread::spawn(move || {
+                            let _worker = metrics.worker_guard();
+                            match ds.read_file_range_blocking(&info, file_index, offset, size) {
+                                Ok(data) => reply.data(&data),
+                                Err(e) => {
+                                    warn!("Failed to read torrent file data (async): {:?}", e);
+                                    reply.error(FsError::from(e).into());
                                 }
                             }
-                            Err(e) => {
-                                warn!("Failed to read torrent file data: {:?}", e);
-                                reply.error(e);
-                            }
-                        }
-                    } else {
-                        reply.error(ENOENT);
+                        });
                     }
-                    return;
-                }
-
-                if let Some(InodeData::File { data, .. }) = &self.inode_mgr.inodes.get(&ino) {
-                    let offset = offset as usize;
-                    let end = std::cmp::min(offset + size as usize, data.len());
-                    if offset < data.len() {
-                        reply.data(&data[offset..end]);
-                    } else {
-                        reply.data(&[]);
-                    }
-                } else {
-                    reply.error(ENOENT);
+                    None => reply.error(
+                        FsError::Internal("download manager not available".to_string()).into(),
+                    ),
                 }
             }
+            Err(e) => reply.error(e.into()),
         }
     }
 
     fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        match ino {
-            ROOT_INO | METADATA_INO | DATA_INO => reply.opened(0, 0),
-            _ => {
-                if InodeManager::is_data_ino(ino) {
-                    reply.opened(0, 0);
-                    return;
-                }
-
-                if self.inode_mgr.inodes.contains_key(&ino) {
-                    reply.opened(0, 0);
-                } else {
-                    reply.error(ENOENT);
-                }
-            }
+        match self.service.opendir(ino) {
+            Ok(()) => reply.opened(0, 0),
+            Err(e) => reply.error(e.into()),
         }
     }
 
@@ -1009,48 +274,10 @@ impl Filesystem for TorrentFs {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
-        if !self.inode_mgr.is_metadata_child(parent) {
-            reply.error(EACCES);
-            return;
+        match self.service.mknod(parent, &name.to_string_lossy()) {
+            Ok(entry) => reply.entry(&TTL, &self.to_fuse_attr(&entry.attr), 0),
+            Err(e) => reply.error(e.into()),
         }
-
-        let name_str = name.to_string_lossy();
-        if !name_str.ends_with(".torrent") {
-            reply.error(EACCES);
-            return;
-        }
-
-        if self
-            .inode_mgr
-            .find_child_by_name(parent, &name_str)
-            .is_some()
-        {
-            reply.error(EEXIST);
-            return;
-        }
-
-        let new_ino = inodes::NEXT_INO.fetch_add(1, Ordering::SeqCst);
-
-        self.inode_mgr.inodes.insert(
-            new_ino,
-            InodeData::File {
-                parent,
-                name: name_str.to_string(),
-                data: Vec::new(),
-            },
-        );
-
-        info!(
-            "Created file {} with inode {} in {}",
-            name_str,
-            new_ino,
-            self.inode_mgr.get_full_path(parent)
-        );
-        reply.entry(
-            &Duration::from_secs(1),
-            &self.inode_mgr.attr_for_file(new_ino, 0),
-            0,
-        );
     }
 
     fn create(
@@ -1063,53 +290,10 @@ impl Filesystem for TorrentFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        if !self.inode_mgr.is_metadata_child(parent) {
-            reply.error(EACCES);
-            return;
+        match self.service.create(parent, &name.to_string_lossy()) {
+            Ok(created) => reply.created(&TTL, &self.to_fuse_attr(&created.attr), 0, created.fh, 0),
+            Err(e) => reply.error(e.into()),
         }
-
-        let name_str = name.to_string_lossy();
-        if !name_str.ends_with(".torrent") {
-            reply.error(EACCES);
-            return;
-        }
-
-        if self
-            .inode_mgr
-            .find_child_by_name(parent, &name_str)
-            .is_some()
-        {
-            reply.error(EEXIST);
-            return;
-        }
-
-        let new_ino = inodes::NEXT_INO.fetch_add(1, Ordering::SeqCst);
-
-        self.inode_mgr.inodes.insert(
-            new_ino,
-            InodeData::File {
-                parent,
-                name: name_str.to_string(),
-                data: Vec::new(),
-            },
-        );
-
-        let fh = inodes::NEXT_FH.fetch_add(1, Ordering::SeqCst);
-        self.inode_mgr.open_files.insert(fh, new_ino);
-
-        info!(
-            "Created file {} with inode {} in {}",
-            name_str,
-            new_ino,
-            self.inode_mgr.get_full_path(parent)
-        );
-        reply.created(
-            &Duration::from_secs(1),
-            &self.inode_mgr.attr_for_file(new_ino, 0),
-            0,
-            fh,
-            0,
-        );
     }
 
     fn write(
@@ -1124,37 +308,9 @@ impl Filesystem for TorrentFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        if ino == STATS_INO || InodeManager::is_stats_ino(ino) {
-            reply.error(EROFS);
-            return;
-        }
-
-        if let Some(inode_data) = self.inode_mgr.inodes.get_mut(&ino) {
-            if let InodeData::File {
-                data: ref mut file_data,
-                name,
-                ..
-            } = inode_data
-            {
-                let offset = offset as usize;
-
-                if offset > file_data.len() {
-                    file_data.resize(offset, 0);
-                }
-
-                if offset + data.len() > file_data.len() {
-                    file_data.resize(offset + data.len(), 0);
-                }
-
-                file_data[offset..offset + data.len()].copy_from_slice(data);
-
-                info!("Wrote {} bytes to file {}", data.len(), name);
-                reply.written(data.len() as u32);
-            } else {
-                reply.error(EISDIR);
-            }
-        } else {
-            reply.error(ENOENT);
+        match self.service.write(ino, offset, data) {
+            Ok(n) => reply.written(n),
+            Err(e) => reply.error(e.into()),
         }
     }
 
@@ -1167,58 +323,10 @@ impl Filesystem for TorrentFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        if !self.inode_mgr.is_metadata_child(parent) {
-            reply.error(EACCES);
-            return;
+        match self.service.mkdir(parent, &name.to_string_lossy()) {
+            Ok(attr) => reply.entry(&TTL, &self.to_fuse_attr(&attr), 0),
+            Err(e) => reply.error(e.into()),
         }
-
-        let name_str = name.to_string_lossy();
-
-        if self
-            .inode_mgr
-            .find_child_by_name(parent, &name_str)
-            .is_some()
-        {
-            reply.error(EEXIST);
-            return;
-        }
-
-        let new_ino = inodes::NEXT_INO.fetch_add(1, Ordering::SeqCst);
-        self.inode_mgr.inodes.insert(
-            new_ino,
-            InodeData::Directory {
-                parent,
-                name: name_str.to_string(),
-            },
-        );
-
-        // Persist the directory to the database
-        let source_path = if parent == METADATA_INO {
-            name_str.to_string()
-        } else {
-            let parent_source_path = self.inode_mgr.extract_source_path(parent);
-            if parent_source_path.is_empty() {
-                name_str.to_string()
-            } else {
-                format!("{}/{}", parent_source_path, name_str)
-            }
-        };
-
-        if let Some(ref ts) = self.torrent_service {
-            let _ = ts.ensure_metadata_directories(&source_path);
-        }
-
-        info!(
-            "Created directory {} with inode {} in {}",
-            name_str,
-            new_ino,
-            self.inode_mgr.get_full_path(parent)
-        );
-        reply.entry(
-            &Duration::from_secs(1),
-            &self.inode_mgr.attr_for_dir(new_ino, true),
-            0,
-        );
     }
 
     fn setattr(
@@ -1239,27 +347,10 @@ impl Filesystem for TorrentFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        if let Some(data) = &self.inode_mgr.inodes.get(&ino) {
-            match data {
-                InodeData::Directory { .. } => {
-                    reply.attr(
-                        &Duration::from_secs(1),
-                        &self
-                            .inode_mgr
-                            .attr_for_dir(ino, self.inode_mgr.is_metadata_child(ino)),
-                    );
-                }
-                InodeData::File {
-                    data: file_data, ..
-                } => {
-                    reply.attr(
-                        &Duration::from_secs(1),
-                        &self.inode_mgr.attr_for_file(ino, file_data.len() as u64),
-                    );
-                }
-            }
-        } else {
-            reply.error(ENOENT);
+        // Attributes are virtual and immutable; return the current attributes.
+        match self.service.getattr(ino) {
+            Ok(attr) => reply.attr(&TTL, &self.to_fuse_attr(&attr)),
+            Err(e) => reply.error(e.into()),
         }
     }
 
@@ -1273,449 +364,28 @@ impl Filesystem for TorrentFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let name_str = name.to_string_lossy();
-        let newname_str = newname.to_string_lossy();
-
-        // Check parent existence in both inodes and data_inodes tables.
-        // data/ subdirectories (TorrentRoot, TorrentDir, etc.) live in data_inodes,
-        // not inodes, so searching only inodes produces a misleading ENOENT.
-        let parent_exists = self.inode_mgr.inodes.contains_key(&parent)
-            || self.inode_mgr.data_inodes.contains_key(&parent);
-        if !parent_exists {
-            warn!(
-                "Rename source parent inode {} not found",
-                parent
-            );
-            reply.error(ENOENT);
-            return;
-        }
-
-        let newparent_exists = self.inode_mgr.inodes.contains_key(&newparent)
-            || self.inode_mgr.data_inodes.contains_key(&newparent);
-        if !newparent_exists {
-            warn!(
-                "Rename target parent inode {} not found",
-                newparent
-            );
-            reply.error(ENOENT);
-            return;
-        }
-
-        if !self.inode_mgr.is_metadata_child(parent) || !self.inode_mgr.is_metadata_child(newparent)
-        {
-            error!("Rename only allowed within metadata/ directory");
-            reply.error(EPERM);
-            return;
-        }
-
-        let source_ino = match self.inode_mgr.find_child_by_name(parent, &name_str) {
-            Some(ino) => ino,
-            None => {
-                error!("Source file not found: {}", name_str);
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        if let Some(target_ino) = self.inode_mgr.find_child_by_name(newparent, &newname_str) {
-            if target_ino == source_ino {
-                info!(
-                    "Self-rename detected for '{}' (ino={}), treating as no-op",
-                    name_str, source_ino
-                );
-                reply.ok();
-                return;
-            }
-            error!("Target file already exists: {}", newname_str);
-            reply.error(EEXIST);
-            return;
-        }
-
-        let is_directory = matches!(
-            self.inode_mgr.inodes.get(&source_ino),
-            Some(InodeData::Directory { .. })
-        );
-
-        if is_directory {
-            // --- Directory rename ---
-            let old_source_path = self.inode_mgr.extract_source_path(source_ino);
-            let new_source_path = if newparent == METADATA_INO {
-                newname_str.to_string()
-            } else {
-                let parent_path = self.inode_mgr.extract_source_path(newparent);
-                if parent_path.is_empty() {
-                    newname_str.to_string()
-                } else {
-                    format!("{}/{}", parent_path, newname_str)
-                }
-            };
-
-            self.inode_mgr.inodes.insert(
-                source_ino,
-                InodeData::Directory {
-                    parent: newparent,
-                    name: newname_str.to_string(),
-                },
-            );
-
-            // Update data_inodes cache
-            let old_prefix = format!("{}/", old_source_path);
-            let new_prefix = format!("{}/", new_source_path);
-            for (_, data_inode) in self.inode_mgr.data_inodes.iter_mut() {
-                match data_inode {
-                    DataInode::SourcePathDir { path } => {
-                        if path == &old_source_path {
-                            *path = new_source_path.clone();
-                        } else if path.starts_with(&old_prefix) {
-                            *path = format!("{}{}", new_prefix, &path[old_prefix.len()..]);
-                        }
-                    }
-                    DataInode::TorrentRoot { source_path, .. } => {
-                        if source_path == &old_source_path {
-                            *source_path = new_source_path.clone();
-                        } else if source_path.starts_with(&old_prefix) {
-                            *source_path =
-                                format!("{}{}", new_prefix, &source_path[old_prefix.len()..]);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            // Persist to database
-            if let Some(ref ts) = self.torrent_service {
-                if let Err(e) =
-                    ts.rename_metadata_directory(&old_source_path, &newname_str, &new_source_path)
-                {
-                    error!("Failed to rename metadata directory in database: {:?}", e);
-                    reply.error(EIO);
-                    return;
-                }
-                info!(
-                    "Renamed metadata directory '{}' to '{}' (source_path: '{}' -> '{}')",
-                    name_str, newname_str, old_source_path, new_source_path
-                );
-            } else {
-                info!(
-                    "Renamed directory '{}' to '{}' (no database)",
-                    name_str, newname_str
-                );
-            }
-
-            reply.ok();
-        } else {
-            // --- File rename ---
-            if !name_str.ends_with(".torrent") || !newname_str.ends_with(".torrent") {
-                error!("Rename only allowed for .torrent files or directories");
-                reply.error(EACCES);
-                return;
-            }
-
-            let (file_data, old_name) = match self.inode_mgr.inodes.get(&source_ino) {
-                Some(InodeData::File { data, name, .. }) => (data.clone(), name.clone()),
-                None => {
-                    error!("Source inode not found: {}", source_ino);
-                    reply.error(ENOENT);
-                    return;
-                }
-                _ => unreachable!(),
-            };
-
-            self.inode_mgr.inodes.insert(
-                source_ino,
-                InodeData::File {
-                    parent: newparent,
-                    name: newname_str.to_string(),
-                    data: file_data,
-                },
-            );
-
-            if let Some(ref ts) = self.torrent_service {
-                let old_source_path = self.inode_mgr.extract_source_path(parent);
-                let new_source_path = self.inode_mgr.extract_source_path(newparent);
-
-                if let Err(e) =
-                    ts.rename_torrent(&old_name, &old_source_path, &newname_str, &new_source_path)
-                {
-                    error!("Failed to rename torrent in database: {:?}", e);
-                    reply.error(EIO);
-                    return;
-                }
-                info!(
-                    "Renamed torrent '{}' to '{}' (source_path: '{}' -> '{}')",
-                    old_name, newname_str, old_source_path, new_source_path
-                );
-            } else {
-                info!(
-                    "Renamed file '{}' to '{}' (no database)",
-                    old_name, newname_str
-                );
-            }
-
-            reply.ok();
+        match self.service.rename(
+            parent,
+            &name.to_string_lossy(),
+            newparent,
+            &newname.to_string_lossy(),
+        ) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.into()),
         }
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let name_str = name.to_string_lossy();
-
-        if !self.inode_mgr.is_metadata_child(parent) {
-            error!("Unlink only allowed within metadata/ directory");
-            reply.error(EACCES);
-            return;
-        }
-
-        if !name_str.ends_with(".torrent") {
-            error!("Unlink only allowed for .torrent files");
-            reply.error(EACCES);
-            return;
-        }
-
-        let ino = match self.inode_mgr.find_child_by_name(parent, &name_str) {
-            Some(ino) => ino,
-            None => {
-                error!("File not found: {}", name_str);
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        match self.inode_mgr.inodes.get(&ino) {
-            Some(InodeData::File {
-                name,
-                parent: file_parent,
-                ..
-            }) => {
-                let filename = name.clone();
-                let source_path = self.inode_mgr.extract_source_path(*file_parent);
-
-                if let Some(ref ts) = self.torrent_service {
-                    match ts.remove_torrent(&filename, &source_path) {
-                        Ok(Some(torrent_id)) => {
-                            // DB delete succeeded, clean up in-memory state
-                            self.inode_mgr.inodes.remove(&ino);
-                            self.inode_mgr
-                                .open_files
-                                .retain(|_, &mut open_ino| open_ino != ino);
-                            self.inode_mgr
-                                .data_inodes
-                                .retain(|_, data_inode| match data_inode {
-                                    DataInode::TorrentRoot {
-                                        torrent_id: tid, ..
-                                    } => *tid != torrent_id,
-                                    DataInode::TorrentDir {
-                                        torrent_id: tid, ..
-                                    } => *tid != torrent_id,
-                                    DataInode::TorrentFile {
-                                        torrent_id: tid, ..
-                                    } => *tid != torrent_id,
-                                    _ => true,
-                                });
-
-                            let mut processing = match self.processing_torrents.lock() {
-                                Ok(guard) => guard,
-                                Err(e) => {
-                                    error!("Mutex poisoned in unlink() processing_torrents: {}", e);
-                                    reply.error(EIO);
-                                    return;
-                                }
-                            };
-                            processing.remove(&source_path);
-                            drop(processing);
-
-                            let mut cache = match self.torrent_data_cache.lock() {
-                                Ok(guard) => guard,
-                                Err(e) => {
-                                    error!("Mutex poisoned in unlink() torrent_data_cache: {}", e);
-                                    reply.error(EIO);
-                                    return;
-                                }
-                            };
-                            cache.remove(&source_path);
-                            drop(cache);
-
-                            info!(
-                                "Deleted torrent '{}' (id={}, source_path='{}')",
-                                filename, torrent_id, source_path
-                            );
-                        }
-                        Ok(None) => {
-                            self.inode_mgr.inodes.remove(&ino);
-                            self.inode_mgr
-                                .open_files
-                                .retain(|_, &mut open_ino| open_ino != ino);
-                            info!("Deleted file '{}' (not yet in database)", filename);
-                        }
-                        Err(e) => {
-                            error!("Failed to delete torrent: {:?}", e);
-                            reply.error(EIO);
-                            return;
-                        }
-                    }
-                } else {
-                    self.inode_mgr.inodes.remove(&ino);
-                    self.inode_mgr
-                        .open_files
-                        .retain(|_, &mut open_ino| open_ino != ino);
-                    info!("Deleted file '{}' (no database)", filename);
-                }
-
-                reply.ok();
-            }
-            Some(InodeData::Directory { .. }) => {
-                error!("Cannot unlink directory: {}", name_str);
-                reply.error(EISDIR);
-            }
-            None => {
-                error!("Inode not found: {}", ino);
-                reply.error(ENOENT);
-            }
+        match self.service.unlink(parent, &name.to_string_lossy()) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.into()),
         }
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let name_str = name.to_string_lossy();
-
-        if !self.inode_mgr.is_metadata_child(parent) {
-            error!("Rmdir only allowed within metadata/ directory");
-            reply.error(EACCES);
-            return;
-        }
-
-        let ino = match self.inode_mgr.find_child_by_name(parent, &name_str) {
-            Some(ino) => ino,
-            None => {
-                error!("Directory not found: {}", name_str);
-                reply.error(ENOENT);
-                return;
-            }
-        };
-
-        match self.inode_mgr.inodes.get(&ino) {
-            Some(InodeData::Directory { .. }) => {
-                let has_children = self.inode_mgr.inodes.iter().any(|(_, data)| match data {
-                    InodeData::Directory { parent: p, .. } if *p == ino => true,
-                    InodeData::File { parent: p, .. } if *p == ino => true,
-                    _ => false,
-                });
-
-                if has_children {
-                    error!("Directory not empty: {}", name_str);
-                    reply.error(ENOTEMPTY);
-                    return;
-                }
-
-                let source_path = self.inode_mgr.extract_source_path(ino);
-
-                self.inode_mgr.inodes.remove(&ino);
-
-                // Clean up data_inodes cache
-                self.inode_mgr
-                    .data_inodes
-                    .retain(|_, data_inode| match data_inode {
-                        DataInode::SourcePathDir { path } => {
-                            if path == &source_path {
-                                false
-                            } else if source_path.is_empty() {
-                                true
-                            } else {
-                                !path.starts_with(&format!("{}/", source_path))
-                            }
-                        }
-                        _ => true,
-                    });
-
-                if let Some(ref ts) = self.torrent_service {
-                    let _ = ts.delete_metadata_directory(&source_path);
-                }
-
-                info!(
-                    "Deleted directory '{}' (source_path='{}')",
-                    name_str, source_path
-                );
-
-                reply.ok();
-            }
-            Some(InodeData::File { .. }) => {
-                error!("Cannot rmdir file: {}", name_str);
-                reply.error(ENOTDIR);
-            }
-            None => {
-                error!("Inode not found: {}", ino);
-                reply.error(ENOENT);
-            }
-        }
-    }
-}
-
-impl TorrentFs {
-    /// Generate global stats (delegates to StatsGenerator).
-    pub fn generate_stats(&self) -> Vec<u8> {
-        self.generate_global_stats_content()
-    }
-
-    /// Generate global stats content for root .stats file.
-    fn generate_global_stats_content(&self) -> Vec<u8> {
-        let get_cm = || self.get_cache_manager();
-        let session_stats = self.download_service.as_ref().map(|ds| ds.snapshot_stats());
-        generate_global_stats(
-            self.inode_mgr.creation_time,
-            &self.db,
-            session_stats,
-            get_cm,
-            &self.listen_addr,
-            Some(self.metrics.snapshot()),
-        )
-    }
-
-    /// Generate directory-aggregated stats for a source_path.
-    fn generate_dir_stats_content(&self, source_path: &str) -> Vec<u8> {
-        let get_cm = || self.get_cache_manager();
-        generate_directory_stats(source_path, &self.db, &self.download_service, get_cm)
-    }
-
-    /// Generate single-torrent stats for a torrent_id.
-    fn generate_torrent_stats_for_id(&self, torrent_id: i64) -> Vec<u8> {
-        // Extract info_hash inside a short-lived lock scope, then release before
-        // calling generate_torrent_stats() which acquires its own lock (avoids Mutex
-        // deadlock — std::sync::Mutex is not reentrant).
-        let info_hash = {
-            let db_guard = match self.db.as_ref().and_then(|db| db.lock().ok()) {
-                Some(g) => g,
-                None => return b"Database not available\n".to_vec(),
-            };
-            match db_guard.get_torrent_by_id(torrent_id).ok().flatten() {
-                Some(t) => t.info_hash,
-                None => return format!("Torrent not found (id={})\n", torrent_id).into_bytes(),
-            }
-        };
-        let get_cm = || self.get_cache_manager();
-        generate_torrent_stats(
-            torrent_id,
-            &info_hash,
-            &self.db,
-            &self.download_service,
-            get_cm,
-        )
-    }
-
-    /// Dispatch stats generation for a stats inode based on its parent directory inode.
-    fn generate_data_stats_for_ino(&self, ino: u64) -> Vec<u8> {
-        let dir_ino = match InodeManager::stats_ino_to_dir_ino(ino) {
-            Some(d) => d,
-            None => return b"Invalid stats inode\n".to_vec(),
-        };
-
-        if dir_ino == DATA_INO {
-            return self.generate_dir_stats_content("");
-        }
-
-        match self.inode_mgr.data_inodes.get(&dir_ino) {
-            Some(DataInode::SourcePathDir { path }) => self.generate_dir_stats_content(path),
-            Some(DataInode::TorrentRoot { torrent_id, .. }) => {
-                self.generate_torrent_stats_for_id(*torrent_id)
-            }
-            _ => b"Stats not available for this inode\n".to_vec(),
+        match self.service.rmdir(parent, &name.to_string_lossy()) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e.into()),
         }
     }
 }

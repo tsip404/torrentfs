@@ -5,10 +5,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::db;
 use tracing::info;
+
+use super::fs_types::{Attr, FileKind};
 
 // ── Inode constants ──
 pub const ROOT_INO: u64 = 1;
@@ -331,52 +333,27 @@ impl InodeManager {
             );
         }
     }
+    // ── Attribute helpers ──
 
-    // ── FUSE attribute helpers ──
-
-    pub fn attr_for_dir(&self, ino: u64, writable: bool) -> fuser::FileAttr {
-        fuser::FileAttr {
+    /// Directory attributes (uid/gid and timestamps are filled by the adapter).
+    pub fn attr_for_dir(&self, ino: u64, writable: bool) -> Attr {
+        Attr {
             ino,
             size: 0,
-            blocks: 0,
-            atime: UNIX_EPOCH + self.creation_time,
-            mtime: UNIX_EPOCH + self.creation_time,
-            ctime: UNIX_EPOCH + self.creation_time,
-            crtime: UNIX_EPOCH + self.creation_time,
-            kind: fuser::FileType::Directory,
+            kind: FileKind::Directory,
             perm: if writable { 0o755 } else { 0o555 },
             nlink: 2,
-            // SAFETY: libc::getuid() / libc::getgid() are always safe to call
-            // in POSIX environments — they simply return the current process's
-            // real user/group IDs and have no preconditions.
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
         }
     }
 
-    pub fn attr_for_file(&self, ino: u64, size: u64) -> fuser::FileAttr {
-        fuser::FileAttr {
+    /// File attributes (uid/gid and timestamps are filled by the adapter).
+    pub fn attr_for_file(&self, ino: u64, size: u64) -> Attr {
+        Attr {
             ino,
             size,
-            blocks: size.div_ceil(512),
-            atime: UNIX_EPOCH + self.creation_time,
-            mtime: UNIX_EPOCH + self.creation_time,
-            ctime: UNIX_EPOCH + self.creation_time,
-            crtime: UNIX_EPOCH + self.creation_time,
-            kind: fuser::FileType::RegularFile,
+            kind: FileKind::RegularFile,
             perm: 0o444,
             nlink: 1,
-            // SAFETY: libc::getuid() / libc::getgid() are always safe to call
-            // in POSIX environments — they simply return the current process's
-            // real user/group IDs and have no preconditions.
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: 0,
-            blksize: 512,
-            flags: 0,
         }
     }
 }

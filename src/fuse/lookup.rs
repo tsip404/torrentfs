@@ -4,8 +4,11 @@
 use std::sync::{Arc, Mutex};
 
 use crate::db::Database;
+use crate::domain::fs_error::{FsError, FsResult};
 use crate::fuse::inodes::{DataInode, InodeManager};
 use tracing::error;
+
+use super::fs_types::FileKind;
 
 pub struct DataResolver;
 
@@ -165,7 +168,7 @@ impl DataResolver {
         db: &Arc<Mutex<Database>>,
         parent: u64,
         name: &str,
-    ) -> Option<(u64, fuser::FileType, u64)> {
+    ) -> Option<(u64, FileKind, u64)> {
         let (ino, data_inode) = Self::resolve_data_lookup(inode_mgr, db, parent, name)?;
 
         inode_mgr.data_inodes.insert(ino, data_inode.clone());
@@ -173,10 +176,8 @@ impl DataResolver {
         match &data_inode {
             DataInode::SourcePathDir { .. }
             | DataInode::TorrentRoot { .. }
-            | DataInode::TorrentDir { .. } => Some((ino, fuser::FileType::Directory, 0)),
-            DataInode::TorrentFile { size, .. } => {
-                Some((ino, fuser::FileType::RegularFile, *size as u64))
-            }
+            | DataInode::TorrentDir { .. } => Some((ino, FileKind::Directory, 0)),
+            DataInode::TorrentFile { size, .. } => Some((ino, FileKind::RegularFile, *size as u64)),
         }
     }
 
@@ -186,15 +187,15 @@ impl DataResolver {
         db: &Arc<Mutex<Database>>,
         ino: u64,
         offset: i64,
-    ) -> Option<Vec<(u64, i64, fuser::FileType, String)>> {
+    ) -> Option<Vec<(u64, i64, FileKind, String)>> {
         use super::inodes::{DATA_INO, ROOT_INO};
 
-        let mut entries: Vec<(u64, i64, fuser::FileType, String)> = Vec::new();
+        let mut entries: Vec<(u64, i64, FileKind, String)> = Vec::new();
         let mut cache_entries: Vec<(u64, DataInode)> = Vec::new();
 
         if ino == DATA_INO {
-            entries.push((DATA_INO, 1, fuser::FileType::Directory, ".".to_string()));
-            entries.push((ROOT_INO, 2, fuser::FileType::Directory, "..".to_string()));
+            entries.push((DATA_INO, 1, FileKind::Directory, ".".to_string()));
+            entries.push((ROOT_INO, 2, FileKind::Directory, "..".to_string()));
 
             {
                 let db_guard = db.lock().ok()?;
@@ -214,12 +215,7 @@ impl DataResolver {
                             filename: torrent.filename.clone(),
                         },
                     ));
-                    entries.push((
-                        torrent_ino,
-                        offset_counter,
-                        fuser::FileType::Directory,
-                        name,
-                    ));
+                    entries.push((torrent_ino, offset_counter, FileKind::Directory, name));
                     offset_counter += 1;
                 }
 
@@ -233,12 +229,7 @@ impl DataResolver {
                             path: prefix.clone(),
                         },
                     ));
-                    entries.push((
-                        child_ino,
-                        offset_counter,
-                        fuser::FileType::Directory,
-                        prefix,
-                    ));
+                    entries.push((child_ino, offset_counter, FileKind::Directory, prefix));
                     offset_counter += 1;
                 }
 
@@ -247,7 +238,7 @@ impl DataResolver {
                 entries.push((
                     stats_ino,
                     offset_counter,
-                    fuser::FileType::RegularFile,
+                    FileKind::RegularFile,
                     ".stats".to_string(),
                 ));
             }
@@ -268,7 +259,7 @@ impl DataResolver {
 
         match data_inode {
             DataInode::SourcePathDir { path } => {
-                entries.push((ino, 1, fuser::FileType::Directory, ".".to_string()));
+                entries.push((ino, 1, FileKind::Directory, ".".to_string()));
 
                 let parent_ino = if path.is_empty() {
                     DATA_INO
@@ -281,7 +272,7 @@ impl DataResolver {
                         InodeManager::make_source_path_dir_ino(&parent_path)
                     }
                 };
-                entries.push((parent_ino, 2, fuser::FileType::Directory, "..".to_string()));
+                entries.push((parent_ino, 2, FileKind::Directory, "..".to_string()));
 
                 {
                     let db_guard = db.lock().ok()?;
@@ -302,7 +293,7 @@ impl DataResolver {
                                 path: new_path.clone(),
                             },
                         ));
-                        entries.push((child_ino, offset_counter, fuser::FileType::Directory, sub));
+                        entries.push((child_ino, offset_counter, FileKind::Directory, sub));
                         offset_counter += 1;
                     }
 
@@ -319,12 +310,7 @@ impl DataResolver {
                                 filename: torrent.filename.clone(),
                             },
                         ));
-                        entries.push((
-                            torrent_ino,
-                            offset_counter,
-                            fuser::FileType::Directory,
-                            name,
-                        ));
+                        entries.push((torrent_ino, offset_counter, FileKind::Directory, name));
                         offset_counter += 1;
                     }
 
@@ -333,7 +319,7 @@ impl DataResolver {
                     entries.push((
                         stats_ino,
                         offset_counter,
-                        fuser::FileType::RegularFile,
+                        FileKind::RegularFile,
                         ".stats".to_string(),
                     ));
                 }
@@ -347,7 +333,7 @@ impl DataResolver {
                 source_path,
                 ..
             } => {
-                entries.push((ino, 1, fuser::FileType::Directory, ".".to_string()));
+                entries.push((ino, 1, FileKind::Directory, ".".to_string()));
 
                 let parent_ino = if source_path.is_empty() {
                     DATA_INO
@@ -370,7 +356,7 @@ impl DataResolver {
                         }
                     }
                 };
-                entries.push((parent_ino, 2, fuser::FileType::Directory, "..".to_string()));
+                entries.push((parent_ino, 2, FileKind::Directory, "..".to_string()));
 
                 {
                     let db_guard = db.lock().ok()?;
@@ -390,12 +376,7 @@ impl DataResolver {
                                 name: dir.name.clone(),
                             },
                         ));
-                        entries.push((
-                            dir_ino,
-                            offset_counter,
-                            fuser::FileType::Directory,
-                            dir.name,
-                        ));
+                        entries.push((dir_ino, offset_counter, FileKind::Directory, dir.name));
                         offset_counter += 1;
                     }
 
@@ -411,12 +392,7 @@ impl DataResolver {
                                 size: file.size,
                             },
                         ));
-                        entries.push((
-                            file_ino,
-                            offset_counter,
-                            fuser::FileType::RegularFile,
-                            file.name,
-                        ));
+                        entries.push((file_ino, offset_counter, FileKind::RegularFile, file.name));
                         offset_counter += 1;
                     }
 
@@ -425,7 +401,7 @@ impl DataResolver {
                     entries.push((
                         stats_ino,
                         offset_counter,
-                        fuser::FileType::RegularFile,
+                        FileKind::RegularFile,
                         ".stats".to_string(),
                     ));
                 }
@@ -437,7 +413,7 @@ impl DataResolver {
             DataInode::TorrentDir {
                 torrent_id, dir_id, ..
             } => {
-                entries.push((ino, 1, fuser::FileType::Directory, ".".to_string()));
+                entries.push((ino, 1, FileKind::Directory, ".".to_string()));
 
                 {
                     let db_guard = db.lock().ok()?;
@@ -449,7 +425,7 @@ impl DataResolver {
                         .and_then(|d| d.parent_id)
                         .map(InodeManager::make_torrent_dir_ino)
                         .unwrap_or_else(|| InodeManager::make_torrent_root_ino(torrent_id));
-                    entries.push((parent_ino, 2, fuser::FileType::Directory, "..".to_string()));
+                    entries.push((parent_ino, 2, FileKind::Directory, "..".to_string()));
 
                     let mut offset_counter = 3i64;
 
@@ -466,12 +442,7 @@ impl DataResolver {
                                 name: dir.name.clone(),
                             },
                         ));
-                        entries.push((
-                            sub_dir_ino,
-                            offset_counter,
-                            fuser::FileType::Directory,
-                            dir.name,
-                        ));
+                        entries.push((sub_dir_ino, offset_counter, FileKind::Directory, dir.name));
                         offset_counter += 1;
                     }
 
@@ -487,12 +458,7 @@ impl DataResolver {
                                 size: file.size,
                             },
                         ));
-                        entries.push((
-                            file_ino,
-                            offset_counter,
-                            fuser::FileType::RegularFile,
-                            file.name,
-                        ));
+                        entries.push((file_ino, offset_counter, FileKind::RegularFile, file.name));
                         offset_counter += 1;
                     }
                 }
@@ -514,11 +480,11 @@ impl DataResolver {
         )
     }
 
-    /// Get the DB reference, returning an error code on failure.
-    pub fn get_db(db: &Option<Arc<Mutex<Database>>>) -> Result<&Arc<Mutex<Database>>, i32> {
+    /// Get the DB reference, returning a domain error on failure.
+    pub fn get_db(db: &Option<Arc<Mutex<Database>>>) -> FsResult<&Arc<Mutex<Database>>> {
         db.as_ref().ok_or_else(|| {
             error!("Database not available");
-            libc::EIO
+            FsError::Internal("database not available".to_string())
         })
     }
 }

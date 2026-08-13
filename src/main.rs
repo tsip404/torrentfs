@@ -67,12 +67,17 @@ fn user_in_fuse_group() -> bool {
 
 /// Spawn the background alert consumer thread if a session is available.
 fn spawn_alert_consumer(fs: &TorrentFs) -> Option<AlertConsumer> {
-    let ds = fs.download_service.as_ref()?;
+    let ds = fs.download_service()?;
     let session_ptr = ds.session_ptr()?;
     let stats = ds.cached_stats();
     let pending_reads = ds.pending_reads();
     let metrics = ds.metrics();
-    Some(AlertConsumer::spawn(session_ptr, stats, pending_reads, metrics))
+    Some(AlertConsumer::spawn(
+        session_ptr,
+        stats,
+        pending_reads,
+        metrics,
+    ))
 }
 
 fn main() {
