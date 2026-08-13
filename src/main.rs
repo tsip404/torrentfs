@@ -71,7 +71,8 @@ fn spawn_alert_consumer(fs: &TorrentFs) -> Option<AlertConsumer> {
     let session_ptr = ds.session_ptr()?;
     let stats = ds.cached_stats();
     let pending_reads = ds.pending_reads();
-    Some(AlertConsumer::spawn(session_ptr, stats, pending_reads))
+    let metrics = ds.metrics();
+    Some(AlertConsumer::spawn(session_ptr, stats, pending_reads, metrics))
 }
 
 fn main() {

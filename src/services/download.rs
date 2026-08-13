@@ -5,19 +5,21 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use hex;
 
 use crate::domain::pieces_manager::PieceStatus;
 use crate::error::{TorrentError, TorrentResult};
+use crate::infrastructure::alert::SharedSessionStats;
 use crate::infrastructure::cache::CacheManager;
 use crate::infrastructure::config::TorrentfsConfig;
 use crate::infrastructure::download::{
     DownloadManager, SessionStats, TorrentHandle, TorrentStatus,
 };
 use crate::infrastructure::metadata::TorrentInfo;
+use crate::infrastructure::metrics::Metrics;
 use crate::seeding::SeedingManager;
-use crate::infrastructure::alert::SharedSessionStats;
 
 pub struct DownloadService {
     download_manager: Arc<Mutex<DownloadManager>>,
@@ -25,20 +27,34 @@ pub struct DownloadService {
     /// download_manager for fast disk-cache checks.
     cache_manager: Arc<Mutex<CacheManager>>,
     cached_stats: SharedSessionStats,
+    metrics: Arc<Metrics>,
 }
-
 impl DownloadService {
 
     pub fn new(cache_dir: &Path, config: &TorrentfsConfig) -> TorrentResult<Self> {
-        let dm = DownloadManager::new(cache_dir, config)?;
+        Self::new_with_metrics(cache_dir, config, Arc::new(Metrics::new()))
+    }
+
+    pub fn new_with_metrics(
+        cache_dir: &Path,
+        config: &TorrentfsConfig,
+        metrics: Arc<Metrics>,
+    ) -> TorrentResult<Self> {
+        let dm = DownloadManager::new_with_metrics(cache_dir, config, metrics.clone())?;
         let cm = dm.get_cache_manager();
         Ok(Self {
             download_manager: Arc::new(Mutex::new(dm)),
             cache_manager: cm,
             cached_stats: SharedSessionStats::new(),
+            metrics,
         })
     }
-    /// Register a SeedingManager to receive eviction callbacks from the CacheManager.
+
+    /// Shared observability counters (TSI-2139).
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.metrics.clone()
+    }
+
     pub fn register_seeding_callback(&self, seeding: Arc<SeedingManager>) {
         let mut dm = self
             .download_manager
@@ -89,6 +105,7 @@ impl DownloadService {
         offset: u64,
         size: u32,
     ) -> TorrentResult<Vec<u8>> {
+        let lock_start = Instant::now();
         let mut dm = self
             .download_manager
             .lock()
@@ -96,6 +113,7 @@ impl DownloadService {
                 code: -1,
                 message: "DownloadManager lock poisoned".to_string(),
             })?;
+        self.metrics.record_lock_wait(lock_start.elapsed());
         dm.read_file_range(info, file_index, offset, size)
     }
 
@@ -308,10 +326,12 @@ impl DownloadService {
 
         // Phase 1: ensure handle + elevate selective priority (brief DM lock).
         let (handle, pm) = {
+            let lock_start = Instant::now();
             let mut mgr = dm.lock().map_err(|_| TorrentError::Unknown {
                 code: -1,
                 message: "DownloadManager lock poisoned".to_string(),
             })?;
+            self.metrics.record_lock_wait(lock_start.elapsed());
             let handle = mgr.ensure_handle_lightweight(info)?;
             let pm = mgr.pieces_manager_arc();
             {
@@ -328,12 +348,12 @@ impl DownloadService {
             }
             (handle, pm)
         }; // DM lock released here.
-
         // Phase 2: block until all needed pieces are on disk (no DM lock).
         DownloadManager::background_wait_for_pieces(
             &handle,
             &cm,
             &pm,
+            &self.metrics,
             &info_hash,
             start_piece,
             end_piece,
@@ -341,12 +361,13 @@ impl DownloadService {
             num_pieces,
             total_size,
         );
-
         // Phase 3: read the range (fast path — pieces are now on disk).
+        let lock_start = Instant::now();
         let mut mgr = dm.lock().map_err(|_| TorrentError::Unknown {
             code: -1,
             message: "DownloadManager lock poisoned".to_string(),
         })?;
+        self.metrics.record_lock_wait(lock_start.elapsed());
         mgr.read_file_range(info, file_index, offset, size)
     }
 

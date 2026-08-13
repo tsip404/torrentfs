@@ -15,6 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::infrastructure::download::SessionStats;
+use crate::infrastructure::metrics::Metrics;
 
 // ── Shared session stats ────────────────────────────────────
 
@@ -152,6 +153,7 @@ impl AlertConsumer {
         session: libtorrent_sys::lt_session_t,
         stats: SharedSessionStats,
         pending_reads: Option<Arc<Mutex<HashMap<String, SyncSender<Vec<u8>>>>>>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         let notify = Arc::new(NotifyState {
             flag: AtomicBool::new(false),
@@ -205,7 +207,7 @@ impl AlertConsumer {
                         for i in 0..count {
                             let alert = unsafe { &*alerts.add(i as usize) };
                             let alert_type = AlertType::from(alert.type_);
-                            Self::dispatch(alert_type, alert, &stats_clone, &pending_reads);
+                            Self::dispatch(alert_type, alert, &stats_clone, &pending_reads, &metrics);
                         }
                     }
 
@@ -240,6 +242,7 @@ impl AlertConsumer {
         alert: &libtorrent_sys::lt_alert_data_t,
         stats: &SharedSessionStats,
         pending_reads: &Option<Arc<Mutex<HashMap<String, SyncSender<Vec<u8>>>>>>,
+        metrics: &Metrics,
     ) {
         match alert_type {
             AlertType::ReadPiece => {
@@ -251,6 +254,7 @@ impl AlertConsumer {
                 let delivered = if let Some(ref pending) = pending_reads {
                     if let Ok(mut guard) = pending.lock() {
                         if let Some(tx) = guard.remove(&piece_key) {
+                            metrics.pending_reads_dec();
                             if error_code == 0
                                 && alert.piece_data_size > 0
                                 && !alert.piece_data.is_null()
