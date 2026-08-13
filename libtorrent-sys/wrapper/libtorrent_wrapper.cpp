@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <functional>
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
@@ -1059,6 +1060,25 @@ static void alert_fill_info_hash_from_handle(const lt::torrent_handle& h, char* 
     auto best = hashes.get_best();
     std::string hex = alert_info_hash_to_hex(best);
     std::memcpy(out, hex.c_str(), hex.size() + 1);
+}
+
+void lt_session_set_alert_notify(lt_session_t session, void (*callback)(void* user_data), void* user_data) {
+    if (!session) return;
+    auto wrapper = static_cast<lt_session_wrapper*>(session);
+
+    if (!callback) {
+        // Clear the notify hook.
+        wrapper->session->set_alert_notify(std::function<void()>());
+        return;
+    }
+
+    // `callback` is a plain C function pointer; capture `user_data` by value
+    // so the closure is copyable and the notify hook stays valid. The hook is
+    // invoked from libtorrent's internal thread(s) on the 0→1 alert-queue
+    // transition — it must not block, pop alerts, or re-enter the session.
+    wrapper->session->set_alert_notify([callback, user_data]() {
+        callback(user_data);
+    });
 }
 
 lt_alert_list_t* lt_session_pop_alerts(lt_session_t session) {

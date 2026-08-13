@@ -66,16 +66,12 @@ fn user_in_fuse_group() -> bool {
 }
 
 /// Spawn the background alert consumer thread if a session is available.
-fn spawn_alert_consumer(fs: &TorrentFs, config: &TorrentfsConfig) -> Option<AlertConsumer> {
-    let poll_ms = config.alert.alert_poll_interval_ms;
-    if poll_ms == 0 {
-        return None;
-    }
+fn spawn_alert_consumer(fs: &TorrentFs) -> Option<AlertConsumer> {
     let ds = fs.download_service.as_ref()?;
     let session_ptr = ds.session_ptr()?;
     let stats = ds.cached_stats();
     let pending_reads = ds.pending_reads();
-    Some(AlertConsumer::spawn(session_ptr, stats, pending_reads, poll_ms))
+    Some(AlertConsumer::spawn(session_ptr, stats, pending_reads))
 }
 
 fn main() {
@@ -186,7 +182,7 @@ fn main() {
             None => TorrentFs::new_with_cache_path(cache_path.clone(), &config),
         };
 
-        let alert_consumer = spawn_alert_consumer(&fs, &config);
+        let alert_consumer = spawn_alert_consumer(&fs);
 
         match fuser::spawn_mount2(fs, &args.mountpoint, &options) {
             Ok(bg) => {
@@ -237,7 +233,7 @@ fn main() {
         None => TorrentFs::new_with_cache_path(cache_path.clone(), &config),
     };
 
-    let alert_consumer = spawn_alert_consumer(&fs, &config);
+    let alert_consumer = spawn_alert_consumer(&fs);
 
     match fuser::spawn_mount2(fs, &args.mountpoint, &options) {
         Ok(bg) => {

@@ -126,6 +126,12 @@ int lt_session_get_bool_setting(lt_session_t session, const char* key, int* out)
 int lt_session_get_stats(lt_session_t session, lt_session_stats_t* stats, int32_t* error);
 lt_alert_list_t* lt_session_pop_alerts(lt_session_t session);
 void lt_alert_list_destroy(lt_alert_list_t* list);
+// Set (or clear) the alert notify callback. `callback` is invoked on one of
+// libtorrent's internal threads whenever the alert queue transitions from
+// empty to non-empty. It MUST be non-blocking and MUST NOT call back into
+// the session or pop alerts — it should only signal the waiting consumer.
+// Pass `callback == NULL` to clear.
+void lt_session_set_alert_notify(lt_session_t session, void (*callback)(void* user_data), void* user_data);
 
 #ifdef __cplusplus
 }
