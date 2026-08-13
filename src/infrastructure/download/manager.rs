@@ -1113,7 +1113,6 @@ impl DownloadManager {
         piece_length: u64,
         num_pieces: i32,
         total_size: u64,
-        timeout: std::time::Duration,
     ) {
         // Phase 1: set piece deadlines (brief handle lock only)
         {
@@ -1135,8 +1134,12 @@ impl DownloadManager {
             }
         }
 
-        // Phase 2: wait for each missing piece (handle + cache locks only, NO DM lock)
+        // Phase 2: wait for each missing piece (handle + cache locks only, NO
+        // DM lock).  Blocks until every requested piece is on disk — the FUSE
+        // read path relies on this to wait out slow peers / transient
+        // disconnects instead of returning a premature EIO (TSI-2133).
         let start = std::time::Instant::now();
+        let mut last_proactive_sweep = std::time::Instant::now();
         for piece_idx in start_piece..=end_piece {
             // Quick check: already have the piece?
             {
@@ -1173,15 +1176,6 @@ impl DownloadManager {
             let piece_start = std::time::Instant::now();
             let mut last_log = piece_start;
             loop {
-                if start.elapsed() >= timeout {
-                    tracing::warn!(
-                        "background_wait: timed out waiting for piece {} after {:.0}s",
-                        piece_idx,
-                        timeout.as_secs()
-                    );
-                    return;
-                }
-
                 std::thread::sleep(std::time::Duration::from_millis(200));
 
                 // Check have_piece (handle lock)
@@ -1224,6 +1218,17 @@ impl DownloadManager {
                     }
                 }
 
+                // Proactive registration: periodically sweep any other
+                // elevated piece that has finished downloading so `.stats`
+                // reflects progress without an additional read (TSI-2133).
+                if last_proactive_sweep.elapsed() >= std::time::Duration::from_secs(2) {
+                    Self::register_completed_pieces(
+                        pieces_manager, handle, info_hash,
+                        piece_length, num_pieces, total_size,
+                    );
+                    last_proactive_sweep = std::time::Instant::now();
+                }
+
                 // Periodic status log
                 if last_log.elapsed() >= std::time::Duration::from_secs(5) {
                     if let Ok(h) = handle.lock() {
@@ -1244,12 +1249,52 @@ impl DownloadManager {
             }
         }
 
+        // Final proactive sweep: register any remaining elevated pieces that
+        // completed while we waited (e.g. prefetch pieces beyond the read range).
+        Self::register_completed_pieces(
+            pieces_manager, handle, info_hash,
+            piece_length, num_pieces, total_size,
+        );
+
         tracing::debug!(
             "background_wait: complete (pieces {}-{}, elapsed {:.1}s)",
             start_piece,
             end_piece,
             start.elapsed().as_secs_f64()
         );
+    }
+
+    /// Proactively register every elevated piece that has finished
+    /// downloading (libtorrent `have_piece`) so `.stats` shows up-to-date
+    /// piece status without requiring an additional read (TSI-2133).
+    fn register_completed_pieces(
+        pieces_manager: &Arc<Mutex<PiecesManager>>,
+        handle: &Arc<Mutex<TorrentHandle>>,
+        info_hash: &str,
+        piece_length: u64,
+        num_pieces: i32,
+        total_size: u64,
+    ) {
+        // Collect elevated piece indices under a short PiecesManager lock.
+        let elevated: Vec<i32> = match pieces_manager.lock() {
+            Ok(pm) => pm.elevated_pieces(info_hash),
+            Err(_) => return,
+        };
+        if elevated.is_empty() {
+            return;
+        }
+        for piece_idx in elevated {
+            let done = match handle.lock() {
+                Ok(h) => h.have_piece(piece_idx),
+                Err(_) => return,
+            };
+            if done {
+                Self::register_piece_in_cache(
+                    pieces_manager, handle, info_hash, piece_idx,
+                    piece_length, num_pieces, total_size,
+                );
+            }
+        }
     }
 }
 
