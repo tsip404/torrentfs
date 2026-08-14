@@ -779,7 +779,8 @@ impl FsService {
         }
     }
 
-    pub fn unlink(&mut self, parent: u64, name: &str) -> FsResult<()> {
+    pub fn unlink(&mut self, parent: u64, name: &str) -> FsResult<Option<i64>> {
+        let mut removed_id = None;
         if !self.inode_mgr.is_metadata_child(parent) {
             return Err(FsError::PermissionDenied);
         }
@@ -807,6 +808,7 @@ impl FsService {
                 if let Some(ref ts) = self.torrent_service {
                     match ts.remove_torrent(&filename, &source_path) {
                         Ok(Some(torrent_id)) => {
+                            removed_id = Some(torrent_id);
                             self.inode_mgr.inodes.remove(&ino);
                             self.inode_mgr
                                 .open_files
@@ -865,7 +867,7 @@ impl FsService {
                     info!("Deleted file '{}' (no database)", filename);
                 }
 
-                Ok(())
+                Ok(removed_id)
             }
             Some(InodeData::Directory { .. }) => Err(FsError::IsDirectory),
             None => Err(FsError::NotFound),
@@ -1186,6 +1188,8 @@ impl FsService {
                         file_index,
                         offset,
                         size,
+                        info_hash: info_hash.clone(),
+                        torrent_id,
                     })
                 }
                 Err(e) => {
