@@ -20,14 +20,14 @@ pub use infrastructure::{
 pub use domain::{
     DbError as DomainDbError, FileEntry as DomainFileEntry, FileRepository,
     InsertTorrentResult as DomainInsertResult, PiecePriorityConfig, PiecesManager,
-    Torrent as DomainTorrent,
-    TorrentDirectory as DomainTorrentDirectory, TorrentFile as DomainTorrentFile,
-    TorrentRepository, TorrentStatus as DomainTorrentStatus,
+    Torrent as DomainTorrent, TorrentDirectory as DomainTorrentDirectory,
+    TorrentFile as DomainTorrentFile, TorrentRepository, TorrentStatus as DomainTorrentStatus,
 };
 
 // other re-exports
+pub use domain::fs_error::{FsError, FsResult};
 pub use error::{is_transient_read_error, TorrentError, TorrentResult};
-pub use fuse::TorrentFs;
+pub use fuse::{FsService, TorrentFs};
 pub use seeding::{SeedingInfo, SeedingManager, SeedingState};
 pub use services::download::DownloadService;
 pub use services::seeding::SeedingService;

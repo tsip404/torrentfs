@@ -1,9 +1,13 @@
 //! TorrentService — orchestrates torrent operations,
 //! cutting the direct FUSE→DB calls in favour of a service layer.
+//!
+//! Returns `FsError` (a domain error), never raw errno — the errno mapping is
+//! the FUSE adapter's job. This module does not import `libc`.
 
 use std::sync::{Arc, Mutex};
 
 use crate::db::{Database, FileEntry, InsertTorrentResult, TorrentFile};
+use crate::domain::fs_error::{FsError, FsResult};
 use crate::metadata::TorrentInfo;
 use tracing::{error, info, warn};
 
@@ -16,10 +20,7 @@ pub struct TorrentService {
 }
 
 impl TorrentService {
-    pub fn new(
-        db: Arc<Mutex<Database>>,
-        download_service: Option<Arc<DownloadService>>,
-    ) -> Self {
+    pub fn new(db: Arc<Mutex<Database>>, download_service: Option<Arc<DownloadService>>) -> Self {
         Self {
             db,
             download_service,
@@ -30,15 +31,18 @@ impl TorrentService {
     /// and persists everything atomically.  After persistence, creates an
     /// upload_mode libtorrent handle so peer/seed information is immediately
     /// available without downloading any data.
-    pub fn add_torrent(&self, data: &[u8], source_path: &str, filename: &str) -> Result<(), i32> {
+    pub fn add_torrent(&self, data: &[u8], source_path: &str, filename: &str) -> FsResult<()> {
         let info = TorrentInfo::from_bytes(data.to_vec()).map_err(|e| {
             warn!("Failed to parse torrent {}: {:?}", filename, e);
-            libc::EINVAL
+            FsError::CorruptTorrent(format!("Failed to parse torrent {}: {:?}", filename, e))
         })?;
 
         let metadata = info.metadata().map_err(|e| {
             error!("Failed to get torrent metadata {}: {:?}", filename, e);
-            libc::EIO
+            FsError::Internal(format!(
+                "Failed to get torrent metadata {}: {:?}",
+                filename, e
+            ))
         })?;
 
         let info_hash_hex = hex::encode(metadata.info_hash);
@@ -46,7 +50,7 @@ impl TorrentService {
         let is_new = {
             let mut db_guard = self.db.lock().map_err(|_| {
                 error!("Database lock poisoned");
-                libc::EIO
+                FsError::LockPoisoned
             })?;
 
             let files: Vec<FileEntry> = metadata
@@ -70,14 +74,14 @@ impl TorrentService {
                 )
                 .map_err(|e| {
                     error!("Failed to insert torrent with files {}: {:?}", filename, e);
-                    libc::EIO
+                    FsError::from(e)
                 })?;
 
             let is_new = match result {
                 InsertTorrentResult::Inserted(torrent_id) => {
                     db_guard.set_torrent_data(torrent_id, data).map_err(|e| {
                         error!("Failed to store torrent data for {}: {:?}", filename, e);
-                        libc::EIO
+                        FsError::from(e)
                     })?;
 
                     info!(
@@ -132,10 +136,10 @@ impl TorrentService {
     }
 
     /// Remove a torrent from the database by filename and source_path.
-    pub fn remove_torrent(&self, filename: &str, source_path: &str) -> Result<Option<i64>, i32> {
+    pub fn remove_torrent(&self, filename: &str, source_path: &str) -> FsResult<Option<i64>> {
         let mut db_guard = self.db.lock().map_err(|_| {
             error!("Database lock poisoned");
-            libc::EIO
+            FsError::LockPoisoned
         })?;
 
         match db_guard.get_torrent_by_filename_and_source_path(filename, source_path) {
@@ -143,7 +147,7 @@ impl TorrentService {
                 let torrent_id = torrent.id;
                 db_guard.delete_torrent(torrent_id).map_err(|e| {
                     error!("Failed to delete torrent from database: {:?}", e);
-                    libc::EIO
+                    FsError::from(e)
                 })?;
                 info!(
                     "Deleted torrent '{}' (id={}, source_path='{}')",
@@ -154,7 +158,7 @@ impl TorrentService {
             Ok(None) => Ok(None),
             Err(e) => {
                 error!("Database error during remove_torrent: {:?}", e);
-                Err(libc::EIO)
+                Err(FsError::from(e))
             }
         }
     }
@@ -166,10 +170,10 @@ impl TorrentService {
         old_source_path: &str,
         new_name: &str,
         new_source_path: &str,
-    ) -> Result<(), i32> {
+    ) -> FsResult<()> {
         let mut db_guard = self.db.lock().map_err(|_| {
             error!("Database lock poisoned");
-            libc::EIO
+            FsError::LockPoisoned
         })?;
 
         match db_guard.get_torrent_by_filename_and_source_path(old_name, old_source_path) {
@@ -178,45 +182,45 @@ impl TorrentService {
                     .rename_torrent(torrent.id, &torrent.name, new_name, new_source_path)
                     .map_err(|e| {
                         error!("Failed to rename torrent in database: {:?}", e);
-                        libc::EIO
+                        FsError::from(e)
                     })?;
                 Ok(())
             }
             Ok(None) => Ok(()),
             Err(e) => {
                 error!("Database error during rename_torrent: {:?}", e);
-                Err(libc::EIO)
+                Err(FsError::from(e))
             }
         }
     }
 
     /// Ensure metadata directories exist in the database for a given source_path.
-    pub fn ensure_metadata_directories(&self, source_path: &str) -> Result<(), i32> {
+    pub fn ensure_metadata_directories(&self, source_path: &str) -> FsResult<()> {
         let mut db_guard = self.db.lock().map_err(|_| {
             error!("Database lock poisoned");
-            libc::EIO
+            FsError::LockPoisoned
         })?;
 
         db_guard
             .ensure_metadata_directories(source_path)
             .map_err(|e| {
                 warn!("Failed to persist directory to database: {:?}", e);
-                libc::EIO
+                FsError::from(e)
             })
     }
 
     /// Delete a metadata directory from the database.
-    pub fn delete_metadata_directory(&self, source_path: &str) -> Result<(), i32> {
+    pub fn delete_metadata_directory(&self, source_path: &str) -> FsResult<()> {
         let mut db_guard = self.db.lock().map_err(|_| {
             error!("Database lock poisoned");
-            libc::EIO
+            FsError::LockPoisoned
         })?;
 
         db_guard
             .delete_metadata_directory(source_path)
             .map_err(|e| {
                 warn!("Failed to delete metadata directory from database: {:?}", e);
-                libc::EIO
+                FsError::from(e)
             })
     }
 
@@ -226,17 +230,17 @@ impl TorrentService {
         old_path: &str,
         new_name: &str,
         new_path: &str,
-    ) -> Result<(), i32> {
+    ) -> FsResult<()> {
         let mut db_guard = self.db.lock().map_err(|_| {
             error!("Database lock poisoned");
-            libc::EIO
+            FsError::LockPoisoned
         })?;
 
         db_guard
             .rename_metadata_directory(old_path, new_name, new_path)
             .map_err(|e| {
                 error!("Failed to rename metadata directory in database: {:?}", e);
-                libc::EIO
+                FsError::from(e)
             })
     }
 
@@ -254,15 +258,15 @@ impl TorrentService {
     pub fn get_torrent_with_files(
         &self,
         torrent_id: i64,
-    ) -> Result<Option<(String, String, Vec<TorrentFile>)>, i32> {
+    ) -> FsResult<Option<(String, String, Vec<TorrentFile>)>> {
         let db_guard = self.db.lock().map_err(|_| {
             error!("Database lock poisoned");
-            libc::EIO
+            FsError::LockPoisoned
         })?;
 
         let torrent = match db_guard.get_torrent_by_id(torrent_id).map_err(|e| {
             error!("Failed to get torrent by id: {:?}", e);
-            libc::EIO
+            FsError::from(e)
         })? {
             Some(t) => t,
             None => return Ok(None),
@@ -270,7 +274,7 @@ impl TorrentService {
 
         let files = db_guard.get_files_by_torrent_id(torrent_id).map_err(|e| {
             error!("Failed to get files for torrent: {:?}", e);
-            libc::EIO
+            FsError::from(e)
         })?;
 
         Ok(Some((torrent.info_hash, torrent.source_path, files)))
