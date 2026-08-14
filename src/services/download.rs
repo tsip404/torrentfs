@@ -4,6 +4,7 @@
 //! for the FUSE layer, hiding the lock management.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -310,6 +311,7 @@ impl DownloadService {
         file_index: i32,
         offset: u64,
         size: u32,
+        stopping: &AtomicBool,
     ) -> TorrentResult<Vec<u8>> {
         let dm = self.download_manager.clone();
         let cm = self.cache_manager.clone();
@@ -349,7 +351,9 @@ impl DownloadService {
             (handle, pm)
         }; // DM lock released here.
         // Phase 2: block until all needed pieces are on disk (no DM lock).
-        DownloadManager::background_wait_for_pieces(
+        // Returns false when shutdown interrupts the piece-wait; abort then so
+        // the worker pool's `shutdown` join is not blocked by an in-flight read.
+        let completed = DownloadManager::background_wait_for_pieces(
             &handle,
             &cm,
             &pm,
@@ -360,7 +364,13 @@ impl DownloadService {
             piece_length,
             num_pieces,
             total_size,
+            stopping,
         );
+        if !completed {
+            return Err(TorrentError::Timeout(
+                "shutdown requested, read aborted".to_string(),
+            ));
+        }
         // Phase 3: read the range (fast path — pieces are now on disk).
         let lock_start = Instant::now();
         let mut mgr = dm.lock().map_err(|_| TorrentError::Unknown {

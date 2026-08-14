@@ -5,14 +5,47 @@ use clap::Parser;
 use fuser::MountOption;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread::Thread;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use torrentfs::config::TorrentfsConfig;
 use torrentfs::db::Database;
-use torrentfs::fuse::TorrentFs;
+use torrentfs::fuse::{TorrentFs, WorkerPool};
 use torrentfs::infrastructure::alert::AlertConsumer;
+
+/// Set by the SIGINT/SIGTERM handler to request graceful shutdown; the handler
+/// also unparks the main thread so it can run the teardown sequence.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static MAIN_THREAD: OnceLock<Thread> = OnceLock::new();
+
+/// Async-signal-safe handler: only stores an atomic flag and unparks the main
+/// thread. All teardown runs on the main thread after `park` returns.
+extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+    if let Some(main) = MAIN_THREAD.get() {
+        main.unpark();
+    }
+}
+
+/// Install SIGINT/SIGTERM handlers so the main thread shuts down cleanly
+/// (drain workers, stop session) instead of terminating abruptly mid-read.
+fn install_shutdown_signal_handlers() {
+    let _ = MAIN_THREAD.set(std::thread::current());
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_shutdown_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_shutdown_signal as *const () as libc::sighandler_t,
+        );
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "torrentfs")]
@@ -80,6 +113,96 @@ fn spawn_alert_consumer(fs: &TorrentFs) -> Option<AlertConsumer> {
     ))
 }
 
+/// Explicitly unmount the FUSE filesystem before joining the session.
+///
+/// In `AutoUnmount` mode, `BackgroundSession::join()` only tears down the
+/// fusermount control socket when it drops the mount — the actual unmount is
+/// deferred to process exit.  The FUSE session thread therefore stays blocked
+/// in `fuse_dev_do_read` (the device is still open) and `guard.join()` never
+/// returns.  A lazy detach makes the device read return `ENODEV` so the
+/// session thread exits.
+///
+/// Strategy mirrors fuser's own `fuse_unmount_pure()`: try `umount2(MNT_DETACH)`
+/// first (root / rootful container), then fall back to the setuid `fusermount`
+/// helper when that returns `EPERM` (non-root mount owner).
+fn unmount_fuse(mountpoint: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = match std::ffi::CString::new(mountpoint.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => {
+            warn!(
+                "mountpoint {:?} contains a NUL byte; cannot unmount",
+                mountpoint
+            );
+            return;
+        }
+    };
+
+    let ret = unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) };
+    if ret == 0 {
+        info!("unmounted {} (umount2 MNT_DETACH)", mountpoint.display());
+        return;
+    }
+    warn!(
+        "umount2({}) failed ({}), falling back to fusermount",
+        mountpoint.display(),
+        std::io::Error::last_os_error()
+    );
+
+    // Non-root fallback: torrentfs mounts via the setuid fusermount helper
+    // (auto_unmount + allow_other), so unmount must go through `fusermount -u`.
+    for bin in ["fusermount3", "fusermount"] {
+        match std::process::Command::new(bin)
+            .arg("-u")
+            .arg("-q")
+            .arg("-z")
+            .arg("--")
+            .arg(mountpoint)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                info!("unmounted {} ({bin} -u)", mountpoint.display());
+                return;
+            }
+            Ok(output) => {
+                warn!(
+                    "{bin} -u failed with status {:?}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Err(e) => {
+                warn!("failed to run {bin}: {e}");
+            }
+        }
+    }
+    warn!("all unmount attempts failed for {}", mountpoint.display());
+}
+
+/// Park the main thread until SIGINT/SIGTERM, then run graceful shutdown:
+/// drain the download worker queue, stop the alert consumer, unmount, and
+/// join the FUSE session (which drops the libtorrent session).
+fn wait_for_shutdown(
+    worker_pool: Arc<WorkerPool>,
+    alert_consumer: Option<AlertConsumer>,
+    bg: fuser::BackgroundSession,
+    mountpoint: &Path,
+) {
+    while !SHUTDOWN.load(Ordering::SeqCst) {
+        std::thread::park();
+    }
+    info!("shutdown requested — draining download worker queue");
+    worker_pool.shutdown();
+    info!("stopping alert consumer");
+    alert_consumer.as_ref().map(|a| a.stop());
+    drop(alert_consumer);
+    info!("unmounting FUSE filesystem");
+    unmount_fuse(mountpoint);
+    info!("joining FUSE session");
+    bg.join();
+    info!("torrentfs unmounted successfully");
+}
+
 fn main() {
     let log_level = std::env::var("RUST_LOG")
         .ok()
@@ -97,6 +220,7 @@ fn main() {
     tracing::subscriber::set_global_default(subscriber).expect("Failed to set tracing subscriber");
 
     let args = Args::parse();
+    install_shutdown_signal_handlers();
 
     // Load configuration from TOML file if provided
     let config = match &args.config {
@@ -187,16 +311,14 @@ fn main() {
             Some(d) => TorrentFs::new_with_db_and_cache(d, cache_path.clone(), &config),
             None => TorrentFs::new_with_cache_path(cache_path.clone(), &config),
         };
+        let worker_pool = fs.worker_pool();
 
         let alert_consumer = spawn_alert_consumer(&fs);
 
         match fuser::spawn_mount2(fs, &args.mountpoint, &options) {
             Ok(bg) => {
                 info!("torrentfs mounted");
-                // Park to keep the process running until interrupted.
-                std::thread::park();
-                alert_consumer.as_ref().map(|a| a.stop());
-                drop(bg);
+                wait_for_shutdown(worker_pool, alert_consumer, bg, &args.mountpoint);
                 return;
             }
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
@@ -238,15 +360,14 @@ fn main() {
         Some(d) => TorrentFs::new_with_db_and_cache(d, cache_path.clone(), &config),
         None => TorrentFs::new_with_cache_path(cache_path.clone(), &config),
     };
+    let worker_pool = fs.worker_pool();
 
     let alert_consumer = spawn_alert_consumer(&fs);
 
     match fuser::spawn_mount2(fs, &args.mountpoint, &options) {
         Ok(bg) => {
             info!("torrentfs mounted");
-            std::thread::park();
-            alert_consumer.as_ref().map(|a| a.stop());
-            drop(bg);
+            wait_for_shutdown(worker_pool, alert_consumer, bg, &args.mountpoint);
             info!("torrentfs unmounted successfully");
         }
         Err(e) => {

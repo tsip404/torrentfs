@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -1142,14 +1143,15 @@ impl DownloadManager {
         piece_length: u64,
         num_pieces: i32,
         total_size: u64,
-    ) {
+        stopping: &AtomicBool,
+    ) -> bool {
         // Phase 1: set piece deadlines (brief handle lock only)
         {
             let h = match handle.lock() {
                 Ok(h) => h,
                 Err(_) => {
                     tracing::error!("background_wait: handle lock poisoned during deadline setup");
-                    return;
+                    return false;
                 }
             };
             for piece_idx in start_piece..=end_piece {
@@ -1205,6 +1207,13 @@ impl DownloadManager {
             let mut last_log = piece_start;
             let _queue_guard = metrics.download_queue_guard();
             loop {
+                if stopping.load(Ordering::Relaxed) {
+                    tracing::debug!(
+                        "background_wait: shutdown requested, aborting piece {} wait",
+                        piece_idx
+                    );
+                    return false;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(200));
 
                 // Check have_piece (handle lock)
@@ -1294,6 +1303,7 @@ impl DownloadManager {
             end_piece,
             start.elapsed().as_secs_f64()
         );
+        true
     }
 
     /// Proactively register every elevated piece that has finished

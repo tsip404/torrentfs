@@ -9,6 +9,7 @@ pub mod alert;
 pub mod algorithms;
 pub mod auto_manage;
 pub mod cache_config;
+pub mod concurrency;
 pub mod connections;
 pub mod dht;
 pub mod disk_io;
@@ -28,6 +29,7 @@ pub use alert::AlertConfig;
 pub use algorithms::AlgorithmsConfig;
 pub use auto_manage::AutoManageConfig;
 pub use cache_config::CacheConfig;
+pub use concurrency::ConcurrencyConfig;
 pub use connections::ConnectionsConfig;
 pub use dht::DhtConfig;
 pub use disk_io::DiskIoConfig;
@@ -63,6 +65,9 @@ pub struct TorrentfsConfig {
 
     #[serde(default)]
     pub cache: CacheConfig,
+
+    #[serde(default)]
+    pub concurrency: ConcurrencyConfig,
 
     #[serde(default)]
     pub pieces: PiecesConfig,
@@ -155,6 +160,7 @@ impl Default for TorrentfsConfig {
             rate_limits: RateLimitsConfig::default(),
             disk_io: DiskIoConfig::default(),
             cache: CacheConfig::default(),
+            concurrency: ConcurrencyConfig::default(),
             pieces: PiecesConfig::default(),
             timeouts: TimeoutsConfig::default(),
             tracker: TrackerConfig::default(),

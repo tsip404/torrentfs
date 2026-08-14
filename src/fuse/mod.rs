@@ -15,6 +15,7 @@ pub mod fs_types;
 pub mod inodes;
 pub mod lookup;
 pub mod stats;
+pub mod worker_pool;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -32,6 +33,7 @@ use tracing::warn;
 
 pub use self::fs_service::FsService;
 use self::fs_types::{Attr, FileKind, ReadOutcome, StatsKind};
+pub use self::worker_pool::WorkerPool;
 
 use crate::cache::CacheManager;
 use crate::config::TorrentfsConfig;
@@ -172,6 +174,7 @@ pub struct TorrentFs {
     service: FsService,
     pending_table: Arc<Mutex<PendingTable>>,
     read_timeout_secs: u64,
+    worker_pool: Arc<WorkerPool>,
 }
 impl TorrentFs {
     fn read_timeout(config: &TorrentfsConfig) -> u64 {
@@ -180,6 +183,29 @@ impl TorrentFs {
             .read_timeout_secs
             .map(|v| if v > 0 { v as u64 } else { 30 })
             .unwrap_or(30)
+    }
+
+    /// Number of download worker threads (bounded pool). Defaults to the
+    /// number of logical CPUs when the config leaves it unset.
+    fn download_workers(config: &TorrentfsConfig) -> usize {
+        config
+            .concurrency
+            .download_workers
+            .filter(|&v| v > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+            })
+    }
+
+    /// Capacity of the bounded download submission queue. Defaults to 256.
+    fn download_queue_depth(config: &TorrentfsConfig) -> usize {
+        config
+            .concurrency
+            .download_queue_depth
+            .filter(|&v| v > 0)
+            .unwrap_or(256)
     }
 
     /// Spawn a background thread that expires overdue pending replies every
@@ -212,10 +238,15 @@ impl TorrentFs {
         let pending_table = Arc::new(Mutex::new(PendingTable::new()));
         let metrics = service.metrics.clone();
         Self::spawn_deadline_checker(pending_table.clone(), metrics);
+        let worker_pool = WorkerPool::new(
+            Self::download_workers(config),
+            Self::download_queue_depth(config),
+        );
         Self {
             service,
             pending_table,
             read_timeout_secs: timeout,
+            worker_pool,
         }
     }
 
@@ -225,10 +256,15 @@ impl TorrentFs {
         let pending_table = Arc::new(Mutex::new(PendingTable::new()));
         let metrics = service.metrics.clone();
         Self::spawn_deadline_checker(pending_table.clone(), metrics);
+        let worker_pool = WorkerPool::new(
+            Self::download_workers(&TorrentfsConfig::default_config()),
+            Self::download_queue_depth(&TorrentfsConfig::default_config()),
+        );
         Self {
             service,
             pending_table,
             read_timeout_secs: 30,
+            worker_pool,
         }
     }
 
@@ -247,16 +283,26 @@ impl TorrentFs {
         let pending_table = Arc::new(Mutex::new(PendingTable::new()));
         let metrics = service.metrics.clone();
         Self::spawn_deadline_checker(pending_table.clone(), metrics);
+        let worker_pool = WorkerPool::new(
+            Self::download_workers(config),
+            Self::download_queue_depth(config),
+        );
         Self {
             service,
             pending_table,
             read_timeout_secs: timeout,
+            worker_pool,
         }
     }
 
     /// The download service, for the background alert consumer.
     pub fn download_service(&self) -> Option<&Arc<DownloadService>> {
         self.service.download_service.as_ref()
+    }
+
+    /// The bounded download worker pool, for graceful shutdown from `main`.
+    pub fn worker_pool(&self) -> Arc<WorkerPool> {
+        self.worker_pool.clone()
     }
 
     /// Get the CacheManager shared with DownloadService.
@@ -439,14 +485,18 @@ impl Filesystem for TorrentFs {
                         return reply.error(FsError::LockPoisoned.into());
                     }
                 };
-                // Complete the read on a worker thread and reply asynchronously.
+                // Dispatch the read to the bounded worker pool and reply
+                // asynchronously.
                 match self.service.download_service.clone() {
                     Some(ds) => {
                         let metrics = self.service.metrics.clone();
                         let pt = self.pending_table.clone();
-                        std::thread::spawn(move || {
+                        let stopping = self.worker_pool.stopping_flag();
+                        let job = Box::new(move || {
                             let _worker = metrics.worker_guard();
-                            match ds.read_file_range_blocking(&info, file_index, offset, size) {
+                            match ds.read_file_range_blocking(
+                                &info, file_index, offset, size, &stopping,
+                            ) {
                                 Ok(data) => {
                                     if let Ok(mut table) = pt.lock() {
                                         table.resolve(id, &data);
@@ -462,6 +512,22 @@ impl Filesystem for TorrentFs {
                                 }
                             }
                         });
+                        if let Err(_job) = self.worker_pool.try_submit(job) {
+                            // Worker queue full (or shutting down) — backpressure.
+                            // Resolve the pending ticket with EBUSY so the kernel
+                            // retries instead of getting EIO or truncated data.
+                            warn!("Download worker queue full, returning EBUSY");
+                            if let Ok(mut table) = self.pending_table.lock() {
+                                table.resolve_error(
+                                    id,
+                                    FsError::ResourceBusy(
+                                        "download worker queue full, retry".to_string(),
+                                    )
+                                    .into(),
+                                );
+                                self.service.metrics.pending_reads_dec();
+                            }
+                        }
                     }
                     None => {
                         if let Ok(mut table) = self.pending_table.lock() {
