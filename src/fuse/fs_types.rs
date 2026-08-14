@@ -65,6 +65,10 @@ pub enum ReadOutcome {
         file_index: i32,
         offset: u64,
         size: u32,
+        /// info_hash for cancellation on unlink/remove_torrent.
+        info_hash: String,
+        /// torrent_id for cancellation on unlink/remove_torrent.
+        torrent_id: i64,
     },
 }
 
