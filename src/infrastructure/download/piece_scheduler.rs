@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 
 use crate::error::TorrentResult;
+
 use crate::infrastructure::download::TorrentHandle;
 use crate::infrastructure::metadata::TorrentInfo;
 
@@ -63,7 +64,6 @@ pub struct PieceStatus {
 struct ReadRange {
     gradient: Vec<i32>,
 }
-
 /// Manages piece priority lifecycle across all active torrents.
 pub struct PieceScheduler {
     /// Per-info_hash priority vector: `elevated[info_hash][piece_idx]` = priority.
@@ -172,7 +172,6 @@ impl PieceScheduler {
     ) -> TorrentResult<()> {
         self.recompute(handle, info_hash, store)
     }
-
     // ── Status queries ────────────────────────────────────────────────
 
     /// The current priority vector for an info_hash.
