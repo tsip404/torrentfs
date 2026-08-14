@@ -4,8 +4,8 @@
 //! into an errno. See the architecture design doc §7.2 for the full table.
 
 use libc::{
-    EACCES, EBUSY, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOMEM, ENOSPC,
-    ENOTDIR, ENOTEMPTY, EPERM, EROFS, ESTALE,
+    EACCES, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENAMETOOLONG, ENOENT, ENOMEM, ENOSPC, ENOTDIR,
+    ENOTEMPTY, EPERM, EROFS, ESTALE,
 };
 
 use crate::domain::fs_error::FsError;
@@ -28,8 +28,6 @@ impl From<FsError> for libc::c_int {
             FsError::InvalidArgument => EINVAL,
             FsError::FileTooLarge(_) => EFBIG,
             FsError::NameTooLong => ENAMETOOLONG,
-            // ── backpressure ──
-            FsError::ResourceBusy(_) => EBUSY,
             // ── data integrity ──
             FsError::CorruptTorrent(_) => EINVAL,
             FsError::CorruptPiece(_) => EIO,

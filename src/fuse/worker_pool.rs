@@ -1,13 +1,14 @@
 //! Bounded download worker pool (TSI-2144).
 //!
 //! Replaces the unbounded per-read `thread::spawn` with a fixed pool of
-//! workers fed by a bounded `sync_channel`. `try_submit` is non-blocking:
-//! when the queue is full — or the pool is shutting down — the job is
-//! returned to the caller so the FUSE adapter can apply `EBUSY` backpressure
-//! instead of spawning an unbounded thread.
+//! workers fed by a bounded `sync_channel`. `submit` is blocking: when the
+//! queue is full the caller (the FUSE dispatch thread) blocks until a worker
+//! drains a slot — the design §9 backpressure model (block briefly, never
+//! error). `try_submit` is the non-blocking variant used by tests and fast
+//! shutdown rejection.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SendError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -22,7 +23,7 @@ pub type Job = Box<dyn FnOnce() + Send + 'static>;
 /// to drain the remaining queue and exit.
 pub struct WorkerPool {
     tx: Mutex<Option<SyncSender<Job>>>,
-    /// Set once `shutdown` begins so `try_submit` can reject new work fast.
+    /// Set once `shutdown` begins so `submit`/`try_submit` can reject new work.
     stopping: Arc<AtomicBool>,
     handles: Mutex<Vec<JoinHandle<()>>>,
     workers: usize,
@@ -75,6 +76,33 @@ impl WorkerPool {
     /// wait instead of blocking the `shutdown` join forever.
     pub fn stopping_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.stopping)
+    }
+
+    /// Enqueue a job, blocking while the queue is full (backpressure).
+    ///
+    /// Returns `Err(job)` only when the pool is shutting down (stopping flag
+    /// set or the sender dropped). A full queue blocks the caller until a
+    /// worker drains a slot — it never returns `Err` for backpressure.
+    pub fn submit(&self, job: Job) -> Result<(), Job> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(job);
+        }
+        // Hold the sender mutex across the (possibly blocking) `send`. Workers
+        // only use the receiver, so this does not serialize them; `shutdown`
+        // waits for this mutex, but a blocked `send` always unblocks once a
+        // worker drains a slot (workers keep draining until the sender drops).
+        let guard = match self.tx.lock() {
+            Ok(guard) => guard,
+            Err(_) => return Err(job),
+        };
+        let tx = match guard.as_ref() {
+            Some(tx) => tx,
+            None => return Err(job),
+        };
+        match tx.send(job) {
+            Ok(()) => Ok(()),
+            Err(SendError(job)) => Err(job),
+        }
     }
 
     /// Try to enqueue a job without blocking.
@@ -180,6 +208,45 @@ mod tests {
 
         // Release the blocked worker and shut down cleanly.
         let _ = release_tx.send(());
+        pool.shutdown();
+    }
+
+    #[test]
+    fn submit_blocks_when_queue_full_and_resumes() {
+        let pool = WorkerPool::new(1, 2);
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        // First job blocks the single worker.
+        assert!(pool
+            .submit(Box::new(move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+            }))
+            .is_ok());
+        started_rx.recv().unwrap();
+
+        // Fill the queue to capacity (2 queued).
+        for _ in 0..2 {
+            assert!(pool.submit(Box::new(|| {})).is_ok());
+        }
+
+        // A blocking submit must wait (not error) until a worker drains a slot.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let pool_clone = Arc::clone(&pool);
+        std::thread::spawn(move || {
+            assert!(pool_clone.submit(Box::new(|| {})).is_ok());
+            let _ = done_tx.send(());
+        });
+
+        // Let the submitter reach the blocking `send`, then release the worker.
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = release_tx.send(());
+
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocking submit should unblock once a worker drains the queue");
+
         pool.shutdown();
     }
 

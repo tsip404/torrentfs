@@ -41,8 +41,6 @@ pub enum FsError {
     // ── argument / input ──
     #[error("invalid argument")]
     InvalidArgument,
-    #[error("resource temporarily busy: {0}")]
-    ResourceBusy(String),
     #[error("file too large: {0}")]
     FileTooLarge(String),
     #[error("name too long")]

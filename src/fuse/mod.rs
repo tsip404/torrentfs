@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::raw::c_int;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -76,14 +76,23 @@ struct PendingEntry<R: PendingReply> {
 
 /// Bounded table of FUSE read replies that are waiting for pieces to download.
 ///
-/// * Capacity is bounded at `MAX_PENDING`; overflow returns `EBUSY` backpressure
-///   to the kernel (not EIO, not truncated data).
+/// * Capacity is bounded at `MAX_PENDING`.  When full, [`insert`](Self::insert)
+///   blocks the caller (the FUSE dispatch thread) on a condvar until a worker
+///   or the deadline checker removes an entry — the design §9 backpressure
+///   model: block briefly, never error and never return truncated data.
 /// * Each entry carries a deadline; a background thread expires overdue entries
 ///   with EIO.
 /// * `unlink` / `remove_torrent` cancels in-flight reads for the removed
 ///   torrent and resolves their tickets with EIO.
 /// * Every reply is consumed exactly once (ok or error), zero leak.
 struct PendingTable<R: PendingReply = ReplyData> {
+    inner: Mutex<Inner<R>>,
+    /// Signalled whenever an entry is removed, so a blocked `insert` can retry
+    /// once a slot frees up.
+    slot_freed: Condvar,
+}
+
+struct Inner<R: PendingReply> {
     entries: HashMap<u64, PendingEntry<R>>,
     next_id: u64,
 }
@@ -91,20 +100,30 @@ struct PendingTable<R: PendingReply = ReplyData> {
 impl<R: PendingReply> PendingTable<R> {
     fn new() -> Self {
         Self {
-            entries: HashMap::with_capacity(MAX_PENDING),
-            next_id: 0,
+            inner: Mutex::new(Inner {
+                entries: HashMap::with_capacity(MAX_PENDING),
+                next_id: 0,
+            }),
+            slot_freed: Condvar::new(),
         }
     }
 
-    /// Insert a pending reply.  Returns `Err(reply)` when the table is full
-    /// (backpressure) so the caller can consume the reply with EBUSY.
-    fn insert(&mut self, reply: R, torrent_id: i64, deadline: Instant) -> Result<u64, R> {
-        if self.entries.len() >= MAX_PENDING {
-            return Err(reply);
+    /// Insert a pending reply, blocking while the table is full (backpressure).
+    /// Returns the ticket id.
+    fn insert(&self, reply: R, torrent_id: i64, deadline: Instant) -> u64 {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while inner.entries.len() >= MAX_PENDING {
+            inner = self
+                .slot_freed
+                .wait(inner)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        self.entries.insert(
+        let id = inner.next_id;
+        inner.next_id = inner.next_id.wrapping_add(1);
+        inner.entries.insert(
             id,
             PendingEntry {
                 reply,
@@ -112,56 +131,92 @@ impl<R: PendingReply> PendingTable<R> {
                 deadline,
             },
         );
-        Ok(id)
+        id
     }
 
-    /// Resolve a pending entry with data.
-    fn resolve(&mut self, id: u64, data: &[u8]) {
-        if let Some(entry) = self.entries.remove(&id) {
-            entry.reply.resolve_data(data);
+    /// Resolve a pending entry with data.  Notifies a blocked insert.
+    fn resolve(&self, id: u64, data: &[u8]) {
+        let removed = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner.entries.remove(&id).map(|entry| entry.reply)
+        };
+        if let Some(reply) = removed {
+            reply.resolve_data(data);
+            self.slot_freed.notify_one();
         }
     }
 
-    /// Resolve a pending entry with an errno.
-    fn resolve_error(&mut self, id: u64, errno: libc::c_int) {
-        if let Some(entry) = self.entries.remove(&id) {
-            entry.reply.resolve_error(errno);
+    /// Resolve a pending entry with an errno.  Notifies a blocked insert.
+    fn resolve_error(&self, id: u64, errno: libc::c_int) {
+        let removed = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner.entries.remove(&id).map(|entry| entry.reply)
+        };
+        if let Some(reply) = removed {
+            reply.resolve_error(errno);
+            self.slot_freed.notify_one();
         }
     }
 
     /// Cancel all pending entries for a given `torrent_id` (unlink / remove_torrent).
     /// Returns the number of entries cancelled.
-    fn cancel_by_torrent_id(&mut self, torrent_id: i64) -> usize {
-        let ids: Vec<u64> = self
-            .entries
-            .iter()
-            .filter(|(_, e)| e.torrent_id == torrent_id)
-            .map(|(id, _)| *id)
-            .collect();
-        let count = ids.len();
-        for id in &ids {
-            if let Some(entry) = self.entries.remove(id) {
-                entry.reply.resolve_error(libc::EIO);
-            }
+    fn cancel_by_torrent_id(&self, torrent_id: i64) -> usize {
+        let removed: Vec<R> = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let ids: Vec<u64> = inner
+                .entries
+                .iter()
+                .filter(|(_, e)| e.torrent_id == torrent_id)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.iter()
+                .filter_map(|id| inner.entries.remove(id).map(|e| e.reply))
+                .collect()
+        };
+        let count = removed.len();
+        for reply in removed {
+            reply.resolve_error(libc::EIO);
+        }
+        if count > 0 {
+            self.slot_freed.notify_all();
         }
         count
     }
 
     /// Expire all entries whose deadline has passed.  Resolves them with EIO.
     /// Returns the number of entries expired.
-    fn expire(&mut self) -> usize {
+    fn expire(&self) -> usize {
         let now = Instant::now();
-        let ids: Vec<u64> = self
-            .entries
-            .iter()
-            .filter(|(_, e)| e.deadline <= now)
-            .map(|(id, _)| *id)
-            .collect();
-        let count = ids.len();
-        for id in &ids {
-            if let Some(entry) = self.entries.remove(id) {
-                entry.reply.resolve_error(libc::EIO);
-            }
+        let removed: Vec<R> = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let ids: Vec<u64> = inner
+                .entries
+                .iter()
+                .filter(|(_, e)| e.deadline <= now)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.iter()
+                .filter_map(|id| inner.entries.remove(id).map(|e| e.reply))
+                .collect()
+        };
+        let count = removed.len();
+        for reply in removed {
+            reply.resolve_error(libc::EIO);
+        }
+        if count > 0 {
+            self.slot_freed.notify_all();
         }
         count
     }
@@ -172,7 +227,7 @@ const TTL: Duration = Duration::from_secs(1);
 
 pub struct TorrentFs {
     service: FsService,
-    pending_table: Arc<Mutex<PendingTable>>,
+    pending_table: Arc<PendingTable>,
     read_timeout_secs: u64,
     worker_pool: Arc<WorkerPool>,
 }
@@ -211,22 +266,20 @@ impl TorrentFs {
     /// Spawn a background thread that expires overdue pending replies every
     /// second, resolving each with EIO and decrementing the pending-reads
     /// metric once per expired entry.
-    fn spawn_deadline_checker(pending_table: Arc<Mutex<PendingTable>>, metrics: Arc<Metrics>) {
+    fn spawn_deadline_checker(pending_table: Arc<PendingTable>, metrics: Arc<Metrics>) {
         std::thread::spawn(move || {
             let tick = Duration::from_secs(1);
             loop {
                 std::thread::sleep(tick);
-                if let Ok(mut table) = pending_table.lock() {
-                    let expired = table.expire();
-                    if expired > 0 {
-                        for _ in 0..expired {
-                            metrics.pending_reads_dec();
-                        }
-                        warn!(
-                            "Pending table: {} entries expired (deadline exceeded)",
-                            expired
-                        );
+                let expired = pending_table.expire();
+                if expired > 0 {
+                    for _ in 0..expired {
+                        metrics.pending_reads_dec();
                     }
+                    warn!(
+                        "Pending table: {} entries expired (deadline exceeded)",
+                        expired
+                    );
                 }
             }
         });
@@ -235,7 +288,7 @@ impl TorrentFs {
     pub fn new_with_cache_path(cache_path: PathBuf, config: &TorrentfsConfig) -> Self {
         let timeout = Self::read_timeout(config);
         let service = FsService::new_with_cache_path(cache_path, config);
-        let pending_table = Arc::new(Mutex::new(PendingTable::new()));
+        let pending_table = Arc::new(PendingTable::new());
         let metrics = service.metrics.clone();
         Self::spawn_deadline_checker(pending_table.clone(), metrics);
         let worker_pool = WorkerPool::new(
@@ -253,7 +306,7 @@ impl TorrentFs {
     #[allow(dead_code)]
     pub fn new() -> Self {
         let service = FsService::new();
-        let pending_table = Arc::new(Mutex::new(PendingTable::new()));
+        let pending_table = Arc::new(PendingTable::new());
         let metrics = service.metrics.clone();
         Self::spawn_deadline_checker(pending_table.clone(), metrics);
         let worker_pool = WorkerPool::new(
@@ -280,7 +333,7 @@ impl TorrentFs {
     ) -> Self {
         let timeout = Self::read_timeout(config);
         let service = FsService::new_with_db_and_cache(db, cache_path, config);
-        let pending_table = Arc::new(Mutex::new(PendingTable::new()));
+        let pending_table = Arc::new(PendingTable::new());
         let metrics = service.metrics.clone();
         Self::spawn_deadline_checker(pending_table.clone(), metrics);
         let worker_pool = WorkerPool::new(
@@ -455,36 +508,16 @@ impl Filesystem for TorrentFs {
                 info_hash,
                 torrent_id,
             }) => {
-                // Insert into the bounded pending table.
-                // Backpressure: if the table is full, reply EBUSY so the
-                // kernel retries instead of getting EIO or truncated data.
+                // Insert into the bounded pending table. `insert` blocks the
+                // FUSE dispatch thread while the table is full (design §9
+                // backpressure): never error, never return truncated data.
                 let deadline = Instant::now() + Duration::from_secs(self.read_timeout_secs + 5);
-                let id = match self.pending_table.lock() {
-                    Ok(mut table) => match table.insert(reply, torrent_id, deadline) {
-                        Ok(id) => {
-                            self.service.metrics.pending_reads_inc();
-                            warn!(
-                                "Deferred read queued (ticket={}, info_hash={}, torrent_id={})",
-                                id, info_hash, torrent_id
-                            );
-                            id
-                        }
-                        Err(reply) => {
-                            // Table full — backpressure.
-                            warn!(
-                                "Pending table full ({} entries), returning EBUSY",
-                                MAX_PENDING
-                            );
-                            return reply.error(
-                                FsError::ResourceBusy("too many pending reads, retry".to_string())
-                                    .into(),
-                            );
-                        }
-                    },
-                    Err(_) => {
-                        return reply.error(FsError::LockPoisoned.into());
-                    }
-                };
+                let id = self.pending_table.insert(reply, torrent_id, deadline);
+                self.service.metrics.pending_reads_inc();
+                warn!(
+                    "Deferred read queued (ticket={}, info_hash={}, torrent_id={})",
+                    id, info_hash, torrent_id
+                );
                 // Dispatch the read to the bounded worker pool and reply
                 // asynchronously.
                 match self.service.download_service.clone() {
@@ -493,50 +526,32 @@ impl Filesystem for TorrentFs {
                         let pt = self.pending_table.clone();
                         let job = Box::new(move || {
                             let _worker = metrics.worker_guard();
-                            match ds.read_file_range_blocking(
-                                info, file_index, offset, size,
-                            ) {
+                            match ds.read_file_range_blocking(info, file_index, offset, size) {
                                 Ok(data) => {
-                                    if let Ok(mut table) = pt.lock() {
-                                        table.resolve(id, &data);
-                                        metrics.pending_reads_dec();
-                                    }
+                                    pt.resolve(id, &data);
+                                    metrics.pending_reads_dec();
                                 }
                                 Err(e) => {
                                     warn!("Failed to read torrent file data (async): {:?}", e);
-                                    if let Ok(mut table) = pt.lock() {
-                                        table.resolve_error(id, FsError::from(e).into());
-                                        metrics.pending_reads_dec();
-                                    }
+                                    pt.resolve_error(id, FsError::from(e).into());
+                                    metrics.pending_reads_dec();
                                 }
                             }
                         });
-                        if let Err(_job) = self.worker_pool.try_submit(job) {
-                            // Worker queue full (or shutting down) — backpressure.
-                            // Resolve the pending ticket with EBUSY so the kernel
-                            // retries instead of getting EIO or truncated data.
-                            warn!("Download worker queue full, returning EBUSY");
-                            if let Ok(mut table) = self.pending_table.lock() {
-                                table.resolve_error(
-                                    id,
-                                    FsError::ResourceBusy(
-                                        "download worker queue full, retry".to_string(),
-                                    )
-                                    .into(),
-                                );
-                                self.service.metrics.pending_reads_dec();
-                            }
+                        // `submit` blocks while the queue is full (backpressure);
+                        // it only returns `Err` when the pool is shutting down.
+                        if let Err(_job) = self.worker_pool.submit(job) {
+                            warn!("Download worker pool shutting down, dropping read");
+                            self.pending_table.resolve_error(id, libc::EIO);
+                            self.service.metrics.pending_reads_dec();
                         }
                     }
                     None => {
-                        if let Ok(mut table) = self.pending_table.lock() {
-                            table.resolve_error(
-                                id,
-                                FsError::Internal("download manager not available".to_string())
-                                    .into(),
-                            );
-                            self.service.metrics.pending_reads_dec();
-                        }
+                        self.pending_table.resolve_error(
+                            id,
+                            FsError::Internal("download manager not available".to_string()).into(),
+                        );
+                        self.service.metrics.pending_reads_dec();
                     }
                 }
             }
@@ -624,16 +639,14 @@ impl Filesystem for TorrentFs {
         match self.service.unlink(parent, &name.to_string_lossy()) {
             Ok(Some(torrent_id)) => {
                 // Cancel any in-flight reads for the removed torrent.
-                if let Ok(mut table) = self.pending_table.lock() {
-                    let cancelled = table.cancel_by_torrent_id(torrent_id);
-                    if cancelled > 0 {
-                        warn!(
-                            "Cancelled {} pending read(s) for removed torrent_id={}",
-                            cancelled, torrent_id
-                        );
-                        for _ in 0..cancelled {
-                            self.service.metrics.pending_reads_dec();
-                        }
+                let cancelled = self.pending_table.cancel_by_torrent_id(torrent_id);
+                if cancelled > 0 {
+                    warn!(
+                        "Cancelled {} pending read(s) for removed torrent_id={}",
+                        cancelled, torrent_id
+                    );
+                    for _ in 0..cancelled {
+                        self.service.metrics.pending_reads_dec();
                     }
                 }
                 reply.ok();
@@ -723,66 +736,71 @@ mod pending_tests {
     }
 
     #[test]
-    fn capacity_is_bounded_with_backpressure() {
-        let mut table: PendingTable<MockReply> = PendingTable::new();
+    fn insert_blocks_when_full_and_resumes_after_slot_frees() {
+        let table = Arc::new(PendingTable::<MockReply>::new());
         let resolves = Arc::new(AtomicUsize::new(0));
 
         for i in 0..MAX_PENDING {
-            let r = table.insert(
+            let id = table.insert(
                 MockReply {
                     resolves: resolves.clone(),
                 },
                 i as i64,
                 deadline_in(std::time::Duration::from_secs(60)),
             );
-            assert!(r.is_ok(), "insert {i} should succeed");
+            assert_eq!(id, i as u64, "insert {i} should succeed");
         }
 
-        // The (MAX_PENDING + 1)-th insert must be rejected: backpressure.
-        let r = table.insert(
-            MockReply {
-                resolves: resolves.clone(),
-            },
-            MAX_PENDING as i64,
-            deadline_in(std::time::Duration::from_secs(60)),
-        );
-        assert!(r.is_err(), "insert at capacity must fail");
-        // The returned reply was not consumed.
-        assert_eq!(resolves.load(Ordering::Relaxed), 0);
+        // The (MAX_PENDING + 1)-th insert blocks instead of failing: it waits
+        // for a free slot (backpressure, no error).
+        let table_clone = Arc::clone(&table);
+        let resolves_clone = Arc::clone(&resolves);
+        let blocker = std::thread::spawn(move || {
+            table_clone.insert(
+                MockReply {
+                    resolves: resolves_clone,
+                },
+                MAX_PENDING as i64,
+                deadline_in(std::time::Duration::from_secs(60)),
+            )
+        });
+
+        // Let the blocker reach the condvar wait, then free one slot.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        table.resolve(0, b"ok");
+
+        let new_id = blocker.join().unwrap();
+        assert_eq!(new_id, MAX_PENDING as u64);
+        // Only the resolved entry (id 0) was consumed.
+        assert_eq!(resolves.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn cancel_by_torrent_id_resolves_only_matching_tickets() {
-        let mut table: PendingTable<MockReply> = PendingTable::new();
+        let table: PendingTable<MockReply> = PendingTable::new();
         let resolves = Arc::new(AtomicUsize::new(0));
 
-        let a1 = table
-            .insert(
-                MockReply {
-                    resolves: resolves.clone(),
-                },
-                1,
-                deadline_in(std::time::Duration::from_secs(60)),
-            )
-            .unwrap();
-        let a2 = table
-            .insert(
-                MockReply {
-                    resolves: resolves.clone(),
-                },
-                1,
-                deadline_in(std::time::Duration::from_secs(60)),
-            )
-            .unwrap();
-        let b1 = table
-            .insert(
-                MockReply {
-                    resolves: resolves.clone(),
-                },
-                2,
-                deadline_in(std::time::Duration::from_secs(60)),
-            )
-            .unwrap();
+        let a1 = table.insert(
+            MockReply {
+                resolves: resolves.clone(),
+            },
+            1,
+            deadline_in(std::time::Duration::from_secs(60)),
+        );
+        let a2 = table.insert(
+            MockReply {
+                resolves: resolves.clone(),
+            },
+            1,
+            deadline_in(std::time::Duration::from_secs(60)),
+        );
+        let b1 = table.insert(
+            MockReply {
+                resolves: resolves.clone(),
+            },
+            2,
+            deadline_in(std::time::Duration::from_secs(60)),
+        );
 
         let cancelled = table.cancel_by_torrent_id(1);
         assert_eq!(cancelled, 2);
@@ -800,27 +818,23 @@ mod pending_tests {
 
     #[test]
     fn expire_resolves_overdue_tickets_only() {
-        let mut table: PendingTable<MockReply> = PendingTable::new();
+        let table: PendingTable<MockReply> = PendingTable::new();
         let resolves = Arc::new(AtomicUsize::new(0));
 
-        let overdue = table
-            .insert(
-                MockReply {
-                    resolves: resolves.clone(),
-                },
-                7,
-                deadline_in(std::time::Duration::from_secs(0)),
-            )
-            .unwrap();
-        let future = table
-            .insert(
-                MockReply {
-                    resolves: resolves.clone(),
-                },
-                7,
-                deadline_in(std::time::Duration::from_secs(60)),
-            )
-            .unwrap();
+        let overdue = table.insert(
+            MockReply {
+                resolves: resolves.clone(),
+            },
+            7,
+            deadline_in(std::time::Duration::from_secs(0)),
+        );
+        let future = table.insert(
+            MockReply {
+                resolves: resolves.clone(),
+            },
+            7,
+            deadline_in(std::time::Duration::from_secs(60)),
+        );
 
         let expired = table.expire();
         assert_eq!(expired, 1);

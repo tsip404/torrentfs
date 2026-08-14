@@ -20,7 +20,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::error::{TorrentError, TorrentResult};
-use crate::infrastructure::alert::{self, SharedSessionStats};
+use crate::infrastructure::alert::{AlertConsumer, SharedSessionStats};
 use crate::infrastructure::cache::CacheManager;
 use crate::infrastructure::config::TorrentfsConfig;
 use crate::infrastructure::metadata::TorrentInfo;
@@ -97,11 +97,10 @@ struct EngineState {
     cache_dir: String,
     read_timeout_secs: u64,
     seeding: Option<Arc<SeedingManager>>,
-    shared_stats: SharedSessionStats,
     metrics: Arc<Metrics>,
     snapshot: Arc<Mutex<DownloadSnapshot>>,
     stopping: Arc<AtomicBool>,
-    last_snapshot: Instant,
+    alert_consumer: Option<AlertConsumer>,
 }
 
 impl DownloadEngine {
@@ -161,6 +160,21 @@ impl DownloadEngine {
                         return;
                     }
                 };
+                // Spawn the dedicated alert consumer (design §4.2): it drains
+                // libtorrent alerts event-driven via `set_alert_notify`, so the
+                // engine loop no longer polls. `pop_alerts` is mutex-serialized
+                // and thread-safe on the C++ side, so only the raw session
+                // pointer crosses this thread boundary.
+                // SAFETY: `session` outlives the consumer — `engine_loop` calls
+                // `consumer.stop()` (unregistering the notify hook) before the
+                // session is dropped.
+                let alert_consumer = unsafe {
+                    AlertConsumer::spawn(
+                        session.inner(),
+                        thread_shared_stats.clone(),
+                        thread_metrics.clone(),
+                    )
+                };
                 let state = EngineState {
                     session,
                     handles: HashMap::new(),
@@ -169,11 +183,10 @@ impl DownloadEngine {
                     cache_dir: cache_dir_str,
                     read_timeout_secs,
                     seeding: None,
-                    shared_stats: thread_shared_stats,
                     metrics: thread_metrics,
                     snapshot: thread_snapshot,
                     stopping: thread_stopping,
-                    last_snapshot: Instant::now(),
+                    alert_consumer: Some(alert_consumer),
                 };
                 let _ = init_tx.send(Ok(()));
                 engine_loop(state, rx);
@@ -328,19 +341,17 @@ impl Drop for DownloadEngine {
 
 // ── Engine loop ────────────────────────────────────────────────────────────
 
+/// Snapshot refresh interval. Alerts are no longer drained here — a dedicated
+/// consumer thread handles them event-driven via `set_alert_notify` — so this
+/// interval only bounds `.stats` staleness for per-torrent status/pieces.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
+
 fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
     tracing::info!("Download engine started");
     loop {
-        // Drain libtorrent alerts (session stats + logging).
-        alert::drain_alerts(state.session.inner(), &state.shared_stats, &state.metrics);
-
-        // Refresh the shared snapshot (throttled to 1s).
-        if state.last_snapshot.elapsed() >= Duration::from_secs(1) {
-            state.publish_snapshot();
-            state.last_snapshot = Instant::now();
-        }
-
-        match rx.recv_timeout(Duration::from_millis(100)) {
+        // Block on commands; wake every `SNAPSHOT_INTERVAL` to refresh the
+        // non-blocking `.stats` snapshot (design §4.2: no alert polling here).
+        match rx.recv_timeout(SNAPSHOT_INTERVAL) {
             Ok(cmd) => {
                 let stop = state.handle_command(cmd);
                 state.publish_snapshot();
@@ -348,9 +359,15 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
                     break;
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                state.publish_snapshot();
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
+    }
+    // Unregister the alert-notify hook before the session is dropped.
+    if let Some(consumer) = state.alert_consumer.take() {
+        consumer.stop();
     }
     tracing::info!("Download engine stopped");
 }
@@ -563,7 +580,6 @@ impl EngineState {
                         break;
                     }
                     std::thread::sleep(Duration::from_millis(500));
-                    alert::drain_alerts(self.session.inner(), &self.shared_stats, &self.metrics);
                     match handle.status() {
                         Ok(s) => {
                             status = s;
@@ -653,7 +669,6 @@ impl EngineState {
                 }
 
                 std::thread::sleep(Duration::from_millis(200));
-                alert::drain_alerts(self.session.inner(), &self.shared_stats, &self.metrics);
             }
         }
 
