@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use hex;
 
-use crate::domain::pieces_manager::PieceStatus;
+use crate::infrastructure::download::PieceStatus;
 use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::alert::SharedSessionStats;
 use crate::infrastructure::cache::CacheManager;
@@ -165,47 +165,28 @@ impl DownloadService {
 
     /// Get piece status vector `PieceStatus` for all pieces of a torrent.
     /// Used by `.stats` to render the piece markers.
-    ///
-    /// Clones the PiecesManager Arc under a brief DM lock, then releases the DM lock
-    /// before calling PiecesManager to avoid ABBA deadlock with read_file_range.
     pub fn get_pieces_status(
         &self,
         info_hash: &str,
         num_pieces: i32,
     ) -> TorrentResult<Vec<PieceStatus>> {
-        let pm = {
-            let dm = self
-                .download_manager
-                .lock()
-                .map_err(|_| TorrentError::Unknown {
-                    code: -1,
-                    message: "DownloadManager lock poisoned".to_string(),
-                })?;
-            dm.pieces_manager_arc()
-        };
-        let pm_guard = pm
+        let dm = self
+            .download_manager
             .lock()
             .map_err(|_| TorrentError::Unknown {
                 code: -1,
-                message: "PiecesManager lock poisoned".to_string(),
+                message: "DownloadManager lock poisoned".to_string(),
             })?;
-        pm_guard.get_pieces_status(info_hash, num_pieces)
+        dm.get_pieces_status(info_hash, num_pieces)
     }
 
     /// Non-blocking piece status for `.stats`: returns `(piece_length, statuses)`,
-    /// or `None` when the DownloadManager / PiecesManager / cache locks are
+    /// or `None` when the DownloadManager / scheduler / cache locks are
     /// contended (an in-flight read is downloading).  `.stats` must never block
     /// on the download path (TSI-2119).
     pub fn try_get_pieces_status(&self, info_hash: &str) -> Option<(u64, Vec<PieceStatus>)> {
-        let pm = {
-            let dm = self.download_manager.try_lock().ok()?;
-            dm.pieces_manager_arc()
-        };
-        let pm_guard = pm.try_lock().ok()?;
-        let num_pieces = pm_guard.num_pieces(info_hash)?;
-        let piece_length = pm_guard.piece_length(info_hash).unwrap_or(0);
-        let statuses = pm_guard.get_pieces_status(info_hash, num_pieces).ok()?;
-        Some((piece_length, statuses))
+        let dm = self.download_manager.try_lock().ok()?;
+        dm.try_get_pieces_status(info_hash)
     }
 
     /// Non-blocking torrent status: returns `None` when the DownloadManager or
@@ -327,7 +308,7 @@ impl DownloadService {
             ))?;
 
         // Phase 1: ensure handle + elevate selective priority (brief DM lock).
-        let (handle, pm) = {
+        let (handle, store, scheduler) = {
             let lock_start = Instant::now();
             let mut mgr = dm.lock().map_err(|_| TorrentError::Unknown {
                 code: -1,
@@ -335,7 +316,8 @@ impl DownloadService {
             })?;
             self.metrics.record_lock_wait(lock_start.elapsed());
             let handle = mgr.ensure_handle_lightweight(info)?;
-            let pm = mgr.pieces_manager_arc();
+            let store = mgr.piece_store.clone();
+            let scheduler = mgr.piece_scheduler.clone();
             {
                 let h = handle.lock().map_err(|_| TorrentError::Unknown {
                     code: -1,
@@ -348,7 +330,7 @@ impl DownloadService {
                     );
                 }
             }
-            (handle, pm)
+            (handle, store, scheduler)
         }; // DM lock released here.
         // Phase 2: block until all needed pieces are on disk (no DM lock).
         // Returns false when shutdown interrupts the piece-wait; abort then so
@@ -356,7 +338,8 @@ impl DownloadService {
         let completed = DownloadManager::background_wait_for_pieces(
             &handle,
             &cm,
-            &pm,
+            &store,
+            &scheduler,
             &self.metrics,
             &info_hash,
             start_piece,

@@ -21,8 +21,8 @@ pub use db::{
     TorrentStatus,
 };
 pub use download::{
-    DownloadManager, FilePieceInfo, Session, TorrentHandle, TorrentState,
-    TorrentStatus as DownloadTorrentStatus,
+    DownloadManager, FilePieceInfo, PiecePriorityConfig, PieceScheduler, PieceStatus, PieceStore,
+    Session, TorrentHandle, TorrentState, TorrentStatus as DownloadTorrentStatus,
 };
 pub use metadata::TorrentInfo;
 pub use metrics::{Metrics, MetricsSnapshot};

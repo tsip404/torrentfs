@@ -12,16 +12,16 @@ pub use infrastructure::db::{
 };
 pub use infrastructure::{
     cache, config, db, download, metadata, CacheManager, Database, DownloadManager,
-    DownloadTorrentStatus, FilePieceInfo, PieceMetadata, Session, TorrentHandle, TorrentInfo,
-    TorrentState, TorrentfsConfig,
+    DownloadTorrentStatus, FilePieceInfo, PieceMetadata, PiecePriorityConfig, PieceScheduler,
+    PieceStatus, PieceStore, Session, TorrentHandle, TorrentInfo, TorrentState, TorrentfsConfig,
 };
 
 // domain layer re-exports
 pub use domain::{
     DbError as DomainDbError, FileEntry as DomainFileEntry, FileRepository,
-    InsertTorrentResult as DomainInsertResult, PiecePriorityConfig, PiecesManager,
-    Torrent as DomainTorrent, TorrentDirectory as DomainTorrentDirectory,
-    TorrentFile as DomainTorrentFile, TorrentRepository, TorrentStatus as DomainTorrentStatus,
+    InsertTorrentResult as DomainInsertResult, Torrent as DomainTorrent,
+    TorrentDirectory as DomainTorrentDirectory, TorrentFile as DomainTorrentFile,
+    TorrentRepository, TorrentStatus as DomainTorrentStatus,
 };
 
 // other re-exports
