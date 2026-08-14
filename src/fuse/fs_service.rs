@@ -41,6 +41,7 @@ pub struct FsService {
     pub processing_torrents: Arc<Mutex<HashMap<String, ()>>>,
     pub download_service: Option<Arc<DownloadService>>,
     pub torrent_data_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    pub torrent_info_cache: Arc<Mutex<HashMap<String, Arc<TorrentInfo>>>>,
     pub listen_addr: String,
     pub metrics: Arc<Metrics>,
 }
@@ -87,6 +88,7 @@ impl FsService {
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             download_service,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
+            torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
             listen_addr,
             metrics,
         }
@@ -1141,18 +1143,9 @@ impl FsService {
         self.metrics.l1_miss();
 
         if let Some(ds) = &self.download_service {
-            // Parse the torrent info for the download/read path.
-            // L3 (metadata) cache: no parsed-TorrentInfo cache exists yet,
-            // so every parse is a miss until the L3 cache lands (Stage 3).
-            self.metrics.l3_miss();
-            let info =
-                TorrentInfo::from_bytes(self.get_torrent_raw_data(torrent_id)?).map_err(|e| {
-                    error!("Failed to parse torrent info for download: {:?}", e);
-                    FsError::Internal(format!(
-                        "failed to parse torrent info for download: {:?}",
-                        e
-                    ))
-                })?;
+            // L3 (metadata) cache: parsed `TorrentInfo` keyed by info_hash,
+            // avoiding a DB re-read + bencode re-parse on every read.
+            let info = self.get_or_parse_torrent_info(&info_hash, torrent_id)?;
 
             // Fast pre-check: are all needed pieces already on disk?
             match ds.pieces_on_disk(&info, file_index, offset, size) {
@@ -1188,7 +1181,7 @@ impl FsService {
                          pieces not on disk, blocking in worker thread",
                         torrent_id, file_id
                     );
-                    Ok(ReadOutcome::Deferred {
+                    Ok(ReadOutcome::Pending {
                         info,
                         file_index,
                         offset,
@@ -1209,6 +1202,51 @@ impl FsService {
                 "download manager not available".to_string(),
             ))
         }
+    }
+
+    /// Return the parsed `TorrentInfo` for `info_hash`, hitting the L3
+    /// (metadata) cache when possible.
+    ///
+    /// On a miss this reads the raw `.torrent` bytes from the DB once and
+    /// parses them once; subsequent reads for the same torrent reuse the
+    /// cached `Arc<TorrentInfo>` and skip both the DB re-read and the
+    /// bencode re-parse.
+    fn get_or_parse_torrent_info(
+        &self,
+        info_hash: &str,
+        torrent_id: i64,
+    ) -> FsResult<Arc<TorrentInfo>> {
+        {
+            let cache = self
+                .torrent_info_cache
+                .lock()
+                .map_err(|_| FsError::LockPoisoned)?;
+            if let Some(info) = cache.get(info_hash) {
+                self.metrics.l3_hit();
+                return Ok(info.clone());
+            }
+        }
+
+        self.metrics.l3_miss();
+        let info = Arc::new(
+            TorrentInfo::from_bytes(self.get_torrent_raw_data(torrent_id)?).map_err(|e| {
+                error!("Failed to parse torrent info for download: {:?}", e);
+                FsError::Internal(format!(
+                    "failed to parse torrent info for download: {:?}",
+                    e
+                ))
+            })?,
+        );
+
+        {
+            let mut cache = self
+                .torrent_info_cache
+                .lock()
+                .map_err(|_| FsError::LockPoisoned)?;
+            cache.insert(info_hash.to_string(), info.clone());
+        }
+
+        Ok(info)
     }
 
     fn get_torrent_raw_data(&self, torrent_id: i64) -> FsResult<Vec<u8>> {
@@ -1325,5 +1363,87 @@ impl FsService {
             }
             _ => b"Stats not available for this inode\n".to_vec(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use crate::db::{Database, InsertTorrentResult};
+    use crate::infrastructure::metrics::Metrics;
+    use crate::metadata::TorrentInfo;
+    use crate::services::torrent::TorrentService;
+
+    use crate::fuse::inodes::InodeManager;
+
+    /// Minimal single-file bencode so `TorrentInfo::from_bytes` parses.
+    fn minimal_torrent_bytes() -> Vec<u8> {
+        let mut t = Vec::new();
+        t.push(b'd');
+        t.extend_from_slice(b"4:infod");
+        t.extend_from_slice(b"6:lengthi16e");
+        t.extend_from_slice(b"4:name3:foo");
+        t.extend_from_slice(b"12:piece lengthi16384e");
+        t.extend_from_slice(b"6:pieces20:");
+        t.extend_from_slice(&[0u8; 20]);
+        t.extend_from_slice(b"ee");
+        t
+    }
+
+    fn service_with_torrent(torrent_bytes: &[u8]) -> (FsService, String, i64, Arc<Metrics>) {
+        let info = TorrentInfo::from_bytes(torrent_bytes.to_vec()).expect("parse torrent");
+        let info_hash = hex::encode(info.info_hash().expect("info hash"));
+        drop(info);
+
+        let mut db = Database::open_in_memory().expect("in-memory db");
+        let torrent_id = match db
+            .insert_torrent("src", "foo", "foo.torrent", 16, &info_hash, 1)
+            .expect("insert torrent")
+        {
+            InsertTorrentResult::Inserted(id) => id,
+            other => panic!("unexpected insert result: {:?}", other),
+        };
+        db.set_torrent_data(torrent_id, torrent_bytes)
+            .expect("set torrent data");
+
+        let db_arc = Arc::new(Mutex::new(db));
+        let metrics = Arc::new(Metrics::new());
+        let svc = FsService {
+            inode_mgr: InodeManager::new(Duration::from_secs(0)),
+            db: Some(db_arc.clone()),
+            torrent_service: Some(TorrentService::new(db_arc, None)),
+            processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            download_service: None,
+            torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
+            torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
+            listen_addr: String::new(),
+            metrics: metrics.clone(),
+        };
+        (svc, info_hash, torrent_id, metrics)
+    }
+
+    #[test]
+    fn torrent_info_cached_by_info_hash() {
+        let torrent_bytes = minimal_torrent_bytes();
+        let (svc, info_hash, torrent_id, metrics) = service_with_torrent(&torrent_bytes);
+
+        // First lookup: miss → parse + insert.
+        let first = svc
+            .get_or_parse_torrent_info(&info_hash, torrent_id)
+            .unwrap();
+        assert_eq!(metrics.snapshot().l3_misses, 1);
+        assert_eq!(metrics.snapshot().l3_hits, 0);
+
+        // Second lookup: hit → same Arc, no re-parse.
+        let second = svc
+            .get_or_parse_torrent_info(&info_hash, torrent_id)
+            .unwrap();
+        assert_eq!(metrics.snapshot().l3_misses, 1);
+        assert_eq!(metrics.snapshot().l3_hits, 1);
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }
