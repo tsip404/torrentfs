@@ -1,7 +1,7 @@
 //! SeedingService — orchestrates seeding operations through SeedingManager.
 //!
 //! Wraps `Arc<SeedingManager>` and exposes a clean API
-//! for the FUSE layer, hiding the internal lock management.
+//! for the FUSE layer, hiding the internal command/thread management.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ impl SeedingService {
     }
 
     /// Add a torrent for seeding.
-    pub fn add_seed(&self, info: &TorrentInfo) -> TorrentResult<()> {
+    pub fn add_seed(&self, info: Arc<TorrentInfo>) -> TorrentResult<()> {
         self.seeding_manager.add_seed(info)
     }
 
