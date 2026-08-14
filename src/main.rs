@@ -15,7 +15,7 @@ use tracing_subscriber::FmtSubscriber;
 use torrentfs::config::TorrentfsConfig;
 use torrentfs::db::Database;
 use torrentfs::fuse::{TorrentFs, WorkerPool};
-use torrentfs::infrastructure::alert::AlertConsumer;
+use torrentfs::DownloadService;
 
 /// Set by the SIGINT/SIGTERM handler to request graceful shutdown; the handler
 /// also unparks the main thread so it can run the teardown sequence.
@@ -98,21 +98,6 @@ fn user_in_fuse_group() -> bool {
     false
 }
 
-/// Spawn the background alert consumer thread if a session is available.
-fn spawn_alert_consumer(fs: &TorrentFs) -> Option<AlertConsumer> {
-    let ds = fs.download_service()?;
-    let session_ptr = ds.session_ptr()?;
-    let stats = ds.cached_stats();
-    let pending_reads = ds.pending_reads();
-    let metrics = ds.metrics();
-    Some(AlertConsumer::spawn(
-        session_ptr,
-        stats,
-        pending_reads,
-        metrics,
-    ))
-}
-
 /// Explicitly unmount the FUSE filesystem before joining the session.
 ///
 /// In `AutoUnmount` mode, `BackgroundSession::join()` only tears down the
@@ -180,22 +165,23 @@ fn unmount_fuse(mountpoint: &Path) {
 }
 
 /// Park the main thread until SIGINT/SIGTERM, then run graceful shutdown:
-/// drain the download worker queue, stop the alert consumer, unmount, and
+/// stop the download engine, drain the download worker queue, unmount, and
 /// join the FUSE session (which drops the libtorrent session).
 fn wait_for_shutdown(
     worker_pool: Arc<WorkerPool>,
-    alert_consumer: Option<AlertConsumer>,
+    download_service: Option<Arc<DownloadService>>,
     bg: fuser::BackgroundSession,
     mountpoint: &Path,
 ) {
     while !SHUTDOWN.load(Ordering::SeqCst) {
         std::thread::park();
     }
-    info!("shutdown requested — draining download worker queue");
+    info!("shutdown requested — stopping download engine");
+    if let Some(ds) = &download_service {
+        ds.shutdown();
+    }
+    info!("draining download worker queue");
     worker_pool.shutdown();
-    info!("stopping alert consumer");
-    alert_consumer.as_ref().map(|a| a.stop());
-    drop(alert_consumer);
     info!("unmounting FUSE filesystem");
     unmount_fuse(mountpoint);
     info!("joining FUSE session");
@@ -312,13 +298,12 @@ fn main() {
             None => TorrentFs::new_with_cache_path(cache_path.clone(), &config),
         };
         let worker_pool = fs.worker_pool();
-
-        let alert_consumer = spawn_alert_consumer(&fs);
+        let download_service = fs.download_service().cloned();
 
         match fuser::spawn_mount2(fs, &args.mountpoint, &options) {
             Ok(bg) => {
                 info!("torrentfs mounted");
-                wait_for_shutdown(worker_pool, alert_consumer, bg, &args.mountpoint);
+                wait_for_shutdown(worker_pool, download_service, bg, &args.mountpoint);
                 return;
             }
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
@@ -361,13 +346,12 @@ fn main() {
         None => TorrentFs::new_with_cache_path(cache_path.clone(), &config),
     };
     let worker_pool = fs.worker_pool();
-
-    let alert_consumer = spawn_alert_consumer(&fs);
+    let download_service = fs.download_service().cloned();
 
     match fuser::spawn_mount2(fs, &args.mountpoint, &options) {
         Ok(bg) => {
             info!("torrentfs mounted");
-            wait_for_shutdown(worker_pool, alert_consumer, bg, &args.mountpoint);
+            wait_for_shutdown(worker_pool, download_service, bg, &args.mountpoint);
             info!("torrentfs unmounted successfully");
         }
         Err(e) => {

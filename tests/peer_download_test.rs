@@ -12,6 +12,7 @@ mod common;
 use common::{local_test_config, TestHarness};
 use std::thread;
 use std::time::Duration;
+use std::sync::Arc;
 
 /// Verify that two libtorrent sessions can discover each other via
 /// the local HTTP tracker and establish peer connections.
@@ -119,21 +120,13 @@ fn test_peer_discovery_via_tracker() {
         );
     }
 
-    // ── If peers found, verify we can enqueue a piece read ─────────────────────
-    println!("\n--- Testing piece read enqueue ---");
-    match handle.enqueue_read_piece(0) {
-        Ok(()) => {
-            println!("Enqueued read for piece 0 successfully");
-        }
-        Err(e) => {
-            // PieceNotReady or other errors are expected in test environments
-            // where the AlertConsumer is not running.
-            println!(
-                "Enqueue read piece returned: {:?} (expected without alert consumer)",
-                e
-            );
-        }
-    }
+    // ── Verify peer connectivity is established ────────────────────────
+    println!("\n--- Peer discovery verified ---");
+    println!(
+        "Discovered {} peers via tracker in {:.1}s",
+        peers_found,
+        start.elapsed().as_secs_f64()
+    );
 
     println!("\n=== Peer discovery test passed! ===");
 }
@@ -157,12 +150,12 @@ fn test_transient_peer_fast_exit() {
 
     // ── Create torrent data ────────────────────────────────────────────
     let (torrent_data, file_content) = create_test_torrent_with_tracker(&announce_url);
-    let info =
-        torrentfs::TorrentInfo::from_bytes(torrent_data.clone()).expect("Failed to parse torrent");
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(torrent_data.clone()).expect("Failed to parse torrent"),
+    );
 
     let info_hash = hex::encode(info.info_hash().expect("Failed to get info hash"));
     println!("Info hash: {}", info_hash);
-
     // ── Start a transient seeder: announces then immediately exits ─────
     // The seeder creates a libtorrent session, adds the torrent with the
     // complete file data, waits for it to check and announce to the
@@ -256,11 +249,11 @@ fn test_transient_peer_fast_exit() {
     // ~peer_wait + piece_wait_grace. Use a short timeout to keep total <10s.
     config.timeouts.read_timeout_secs = Some(3);
 
-    let mut dm = torrentfs::download::DownloadManager::new(cache_dir.path(), &config)
-        .expect("Failed to create DownloadManager");
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
 
     let read_start = std::time::Instant::now();
-    let result = dm.read_file_range(&info, 0, 0, 50);
+    let result = engine.read_file_range(info, 0, 0, 50);
     let elapsed = read_start.elapsed();
 
     match &result {

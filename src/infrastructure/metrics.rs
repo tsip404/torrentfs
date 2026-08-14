@@ -134,13 +134,12 @@ impl Metrics {
 
     // ── Pending reads table ───────────────────────────────────────────
 
-    /// Record insertion of a pending `read_piece` request.
+    /// Record insertion of a pending read (FUSE deferred-read ticket).
     pub fn pending_reads_inc(&self) {
         let cur = self.pending_reads_current.fetch_add(1, Ordering::Relaxed) + 1;
         self.pending_reads_peak.fetch_max(cur, Ordering::Relaxed);
     }
-
-    /// Record removal of a pending `read_piece` request.
+    /// Record removal of a pending read (FUSE deferred-read ticket).
     pub fn pending_reads_dec(&self) {
         self.pending_reads_current.fetch_sub(1, Ordering::Relaxed);
     }

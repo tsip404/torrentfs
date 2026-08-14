@@ -113,7 +113,7 @@ impl TorrentService {
         // without triggering any data download (all pieces at priority 0).
         if is_new {
             if let Some(ref ds) = self.download_service {
-                match ds.ensure_handle_lightweight(&info) {
+                match ds.ensure_handle_lightweight(Arc::new(info)) {
                     Ok(_) => {
                         info!(
                             "Created lightweight handle for torrent '{}' (upload_mode)",

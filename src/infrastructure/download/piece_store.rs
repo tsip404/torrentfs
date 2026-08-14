@@ -1,10 +1,15 @@
 //! `PieceStore` — the piece data plane.
 //!
 //! Owns all access to the on-disk piece cache ([`CacheManager`]) and exposes
-//! the data operations the download path needs: piece presence checks,
+//! the data operations the download engine needs: piece presence checks,
 //! byte-range reads, and piece registration (metadata + verification).  It is
 //! deliberately free of any *control* logic (priority, scheduling); that lives
 //! in [`super::piece_scheduler::PieceScheduler`].
+//!
+//! `PieceStore` is owned by the download engine actor thread and is the only
+//! writer of piece data during a download.  The underlying [`CacheManager`]
+//! remains a shared `Arc<Mutex<_>>` so the FUSE layer can still read cache
+//! summary / on-disk presence non-blockingly (`.stats`, `pieces_on_disk`).
 
 use std::sync::{Arc, Mutex};
 
@@ -12,7 +17,7 @@ use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::cache::CacheManager;
 use crate::infrastructure::metadata::TorrentInfo;
 
-#[derive(Clone)]
+
 pub struct PieceStore {
     cache: Arc<Mutex<CacheManager>>,
 }
@@ -81,7 +86,9 @@ impl PieceStore {
     }
 
     /// Register a newly-downloaded piece in the cache: records its size in
-    /// metadata and marks it verified.
+    /// metadata and marks it verified.  libtorrent's custom storage has
+    /// already written the piece bytes to disk; this only makes the cache
+    /// aware of them.
     pub fn register_piece(&self, info_hash: &str, piece_index: i32, size: u64) -> TorrentResult<()> {
         let key = Self::piece_key(info_hash, piece_index);
         let mut cache = self.cache.lock().map_err(|_| Self::poisoned())?;
@@ -130,6 +137,9 @@ impl PieceStore {
 
     /// Non-blocking pre-check used by the FUSE read path: are all pieces
     /// needed for a file range already on disk (verified + complete)?
+    ///
+    /// Uses only the shared cache — no engine round-trip — so it stays fast
+    /// and never blocks on an active download.
     pub fn pieces_on_disk(
         cache: &CacheManager,
         info: &TorrentInfo,

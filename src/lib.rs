@@ -11,7 +11,7 @@ pub use infrastructure::db::{
     DbError, FileEntry, InsertTorrentResult, Torrent, TorrentDirectory, TorrentFile, TorrentStatus,
 };
 pub use infrastructure::{
-    cache, config, db, download, metadata, CacheManager, Database, DownloadManager,
+    cache, config, db, download, metadata, CacheManager, Database, DownloadEngine,
     DownloadTorrentStatus, FilePieceInfo, PieceMetadata, PiecePriorityConfig, PieceScheduler,
     PieceStatus, PieceStore, Session, TorrentHandle, TorrentInfo, TorrentState, TorrentfsConfig,
 };
