@@ -220,7 +220,7 @@ impl Filesystem for TorrentFs {
     ) {
         match self.service.read(ino, offset, size) {
             Ok(ReadOutcome::Ready(data)) => reply.data(&data),
-            Ok(ReadOutcome::Deferred {
+            Ok(ReadOutcome::Pending {
                 info,
                 file_index,
                 offset,

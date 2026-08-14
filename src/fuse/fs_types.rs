@@ -5,6 +5,8 @@
 //! converts them into `fuser` reply types and fills in the process-specific
 //! fields (uid/gid, timestamps) it owns.
 
+use std::sync::Arc;
+
 use crate::metadata::TorrentInfo;
 
 /// The subset of file kinds the filesystem exposes.
@@ -58,8 +60,8 @@ pub enum ReadOutcome {
     Ready(Vec<u8>),
     /// The requested pieces still need downloading. The adapter parks the
     /// reply and completes it from a worker thread.
-    Deferred {
-        info: TorrentInfo,
+    Pending {
+        info: Arc<TorrentInfo>,
         file_index: i32,
         offset: u64,
         size: u32,
