@@ -1,4 +1,4 @@
-//! End-to-end test: validate file read via DownloadManager::read_file_range
+//! End-to-end test: validate file read via DownloadEngine::read_file_range
 //! using a local tracker + seeder (TestHarness).
 //!
 //! This test addresses TSI-1947 (Gap1): scenario 4 file reading fails when
@@ -8,10 +8,11 @@
 mod common;
 
 use common::{local_test_config, TestHarness};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-/// Test that DownloadManager::read_file_range can download and return
+/// Test that DownloadEngine::read_file_range can download and return
 /// correct file data when a local seeder is available via tracker.
 ///
 /// This is the exact code path exercised in the QA test scenario 4,
@@ -33,26 +34,28 @@ fn test_read_file_range_with_local_seeder() {
         harness.tracker.announce_count()
     );
 
-    // ── Create DownloadManager pointing at the tracker ─────────────────
+    // ── Create DownloadEngine pointing at the tracker ──────────────────
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
     let config = local_test_config();
 
-    let mut dm = torrentfs::download::DownloadManager::new(cache_dir.path(), &config)
-        .expect("Failed to create DownloadManager");
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
 
-    // ── Re-parse torrent data (raw pointer can't cross into DM) ────────
-    let info = torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
-        .expect("Failed to parse torrent for downloader");
+    // ── Re-parse torrent data (raw pointer can't cross into the engine) ─
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
+            .expect("Failed to parse torrent for downloader"),
+    );
 
     // ── Read file range (file_index=0, offset=0, size=50) ──────────────
-    // This goes through read_file_range → get_or_create_handle →
+    // This goes through read_file_range → ensure handle →
     // piece download → cache → return data.
     let start = std::time::Instant::now();
     let timeout = Duration::from_secs(60);
 
     let mut last_error: Option<torrentfs::TorrentError> = None;
     loop {
-        match dm.read_file_range(&info, 0, 0, 50) {
+        match engine.read_file_range(info.clone(), 0, 0, 50) {
             Ok(data) => {
                 println!(
                     "Successfully read {} bytes after {:.1}s",
@@ -110,18 +113,20 @@ fn test_read_file_range_boundaries() {
     // IP:port and returns 0 peers, causing a 30s timeout.
     config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
 
-    let mut dm = torrentfs::download::DownloadManager::new(cache_dir.path(), &config)
-        .expect("Failed to create DownloadManager");
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
 
-    let info = torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
-        .expect("Failed to parse torrent");
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
+            .expect("Failed to parse torrent"),
+    );
 
     // Helper: retry read until success or timeout
-    let mut retry_read = |offset: u64, size: u32| -> Vec<u8> {
+    let retry_read = |offset: u64, size: u32| -> Vec<u8> {
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(60);
         loop {
-            match dm.read_file_range(&info, 0, offset, size) {
+            match engine.read_file_range(info.clone(), 0, offset, size) {
                 Ok(data) => return data,
                 Err(e) => {
                     if start.elapsed() > timeout {
@@ -157,7 +162,7 @@ fn test_read_file_range_boundaries() {
     assert_eq!(&data, &harness.file_content[16378..16384]);
 }
 
-/// Test that read_file_range correctly returns NoPeers error when no
+/// Test that read_file_range correctly returns an error when no
 /// peers/seeds are available AND no cached pieces exist.
 #[test]
 fn test_read_file_range_no_peers_error() {
@@ -169,24 +174,26 @@ fn test_read_file_range_no_peers_error() {
     config.local_discovery.lsd_enabled = Some(false);
     config.timeouts.read_timeout_secs = Some(2); // Short timeout for test
 
-    let mut dm = torrentfs::download::DownloadManager::new(cache_dir.path(), &config)
-        .expect("Failed to create DownloadManager");
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
 
     // Create a test torrent with a fake tracker URL (no real tracker running)
     let (torrent_data, _file_content) =
         common::create_test_torrent_with_tracker("http://127.0.0.1:19999/announce");
 
-    let info = torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent");
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(torrent_data).expect("Failed to parse torrent"),
+    );
 
-    // This should fail with NoPeers since the tracker doesn't exist
-    let result = dm.read_file_range(&info, 0, 0, 50);
+    // This should fail since the tracker doesn't exist
+    let result = engine.read_file_range(info, 0, 0, 50);
 
     match result {
         Err(torrentfs::TorrentError::NoPeers(_)) => {
             println!("Correctly got NoPeers error as expected");
         }
         Err(e) => {
-            // Could also be InvalidFile if timeout occurs in state checking
+            // Could also be a Timeout if the state check or piece wait expires.
             println!(
                 "Got error: {:?} (NoPeers expected but other error acceptable)",
                 e

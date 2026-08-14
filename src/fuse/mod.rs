@@ -491,11 +491,10 @@ impl Filesystem for TorrentFs {
                     Some(ds) => {
                         let metrics = self.service.metrics.clone();
                         let pt = self.pending_table.clone();
-                        let stopping = self.worker_pool.stopping_flag();
                         let job = Box::new(move || {
                             let _worker = metrics.worker_guard();
                             match ds.read_file_range_blocking(
-                                &info, file_index, offset, size, &stopping,
+                                info, file_index, offset, size,
                             ) {
                                 Ok(data) => {
                                     if let Ok(mut table) = pt.lock() {

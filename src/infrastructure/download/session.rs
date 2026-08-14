@@ -257,7 +257,6 @@ impl Drop for Session {
     }
 }
 
-unsafe impl Send for Session {}
 
 impl TorrentHandle {
     pub fn is_valid(&self) -> bool {
@@ -313,36 +312,6 @@ impl TorrentHandle {
         }
     }
 
-    /// Enqueue a read_piece request.  The data will arrive later via
-    /// `read_piece_alert`, consumed by the background AlertConsumer thread.
-    /// This call returns immediately — the C++ side just calls
-    /// `h->read_piece()` without the old inline pop_alerts loop.
-    pub fn enqueue_read_piece(&self, piece_index: i32) -> TorrentResult<()> {
-        let mut data_out: *mut u8 = ptr::null_mut();
-        let mut size_out: usize = 0;
-
-        let mut error = libtorrent_sys::lt_error_t {
-            message: ptr::null(),
-            code: 0,
-        };
-
-        let result = unsafe {
-            libtorrent_sys::lt_torrent_handle_read_piece(
-                self.session,
-                self.inner,
-                piece_index,
-                &mut data_out,
-                &mut size_out,
-                &mut error,
-            )
-        };
-
-        if result != 0 {
-            Err(unsafe { error_from_c(&error) })
-        } else {
-            Ok(())
-        }
-    }
 
     pub fn get_file_piece_info(&self, file_index: i32) -> TorrentResult<FilePieceInfo> {
         let mut first_piece: i64 = 0;
@@ -432,5 +401,3 @@ impl Drop for TorrentHandle {
         }
     }
 }
-
-unsafe impl Send for TorrentHandle {}

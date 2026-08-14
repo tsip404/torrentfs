@@ -7,7 +7,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use crate::cache::CacheManager;
 use crate::db::{Database, TorrentStatus};
-use crate::domain::pieces_manager::PieceStatus;
+use crate::infrastructure::download::PieceStatus;
 use crate::services::download::DownloadService;
 use crate::infrastructure::download::SessionStats;
 use crate::infrastructure::metrics::MetricsSnapshot;

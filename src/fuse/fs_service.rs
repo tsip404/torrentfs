@@ -135,10 +135,11 @@ impl FsService {
             for data in torrent_datas {
                 match TorrentInfo::from_bytes(data) {
                     Ok(info) => {
-                        if let Err(e) = ds.ensure_handle_lightweight(&info) {
+                        let name = info.name();
+                        if let Err(e) = ds.ensure_handle_lightweight(Arc::new(info)) {
                             warn!(
                                 "Failed to restore lightweight handle for torrent '{}': {:?}",
-                                info.name(),
+                                name,
                                 e
                             );
                         }
@@ -1153,7 +1154,7 @@ impl FsService {
             match ds.pieces_on_disk(&info, file_index, offset, size) {
                 Ok(true) => {
                     self.metrics.l2_hit();
-                    match ds.read_file_range(&info, file_index, offset, size) {
+                    match ds.read_file_range(info.clone(), file_index, offset, size) {
                         Ok(data) => {
                             info!(
                                 "Successfully read {} bytes from torrent file \

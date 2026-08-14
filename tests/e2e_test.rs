@@ -1,5 +1,6 @@
 use std::thread;
 use std::time::Duration;
+use std::sync::Arc;
 use torrentfs::TorrentInfo;
 
 mod common;
@@ -57,8 +58,7 @@ fn test_read_file_range_with_local_seed() {
     let _session_guard = common::acquire_session_lock();
 
     use std::fs;
-    use torrentfs::download::DownloadManager;
-
+    use torrentfs::download::DownloadEngine;
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
     let cache_dir = temp_dir.path().join("cache");
     let seed_dir = temp_dir.path().join("seed");
@@ -68,7 +68,7 @@ fn test_read_file_range_with_local_seed() {
 
     let (torrent_data, file_content) = create_test_torrent();
 
-    let info = TorrentInfo::from_bytes(torrent_data.clone()).expect("Failed to parse torrent");
+    let info = Arc::new(TorrentInfo::from_bytes(torrent_data.clone()).expect("Failed to parse torrent"));
 
     println!("Torrent info:");
     println!("  Name: {}", info.name());
@@ -78,8 +78,8 @@ fn test_read_file_range_with_local_seed() {
 
     // Use test config with thread limits to avoid resource contention
     let config = common::local_test_config();
-    let mut dm =
-        DownloadManager::new(&cache_dir, &config).expect("Failed to create download manager");
+    let engine =
+        DownloadEngine::new(&cache_dir, &config).expect("Failed to create download manager");
 
     let info_hash = hex::encode(info.info_hash().expect("Failed to get info hash"));
     let torrent_cache_dir = cache_dir.join(&info_hash);
@@ -92,7 +92,7 @@ fn test_read_file_range_with_local_seed() {
     println!("Info hash: {}", info_hash);
     println!("Seed file path: {:?}", seed_file_path);
 
-    let result = dm.read_file_range(&info, 0, 0, 50);
+    let result = engine.read_file_range(info.clone(), 0, 0, 50);
 
     match result {
         Ok(data) => {
@@ -142,12 +142,14 @@ fn test_read_file_range_with_test_harness() {
     let config = common::local_test_config();
     let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
 
-    let mut dm = torrentfs::download::DownloadManager::new(cache_dir.path(), &config)
-        .expect("Failed to create DownloadManager");
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
 
     // Re-parse torrent data (raw pointer in TorrentInfo can't be shared)
-    let dl_info = torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
-        .expect("Failed to parse torrent for downloader");
+    let dl_info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
+            .expect("Failed to parse torrent for downloader"),
+    );
 
     // Brief settle — the TestHarness seeder has announced,
     // but on slow CI the tracker's peer list may still be stale.
@@ -160,7 +162,7 @@ fn test_read_file_range_with_test_harness() {
     let mut last_error: Option<torrentfs::TorrentError> = None;
 
     let result = loop {
-        match dm.read_file_range(&dl_info, 0, 0, 16384) {
+        match engine.read_file_range(dl_info.clone(), 0, 0, 16384) {
             Ok(data) => break Ok(data),
             Err(e) => {
                 last_error = Some(e);
