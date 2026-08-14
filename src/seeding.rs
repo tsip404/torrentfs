@@ -1,17 +1,26 @@
+//! SeedingManager — peer seeding state + cache eviction callbacks.
+//!
+//! Owns its libtorrent `Session` + torrent handles on a dedicated thread (the
+//! same single-owner pattern as the download engine), so the raw pointers never
+//! cross a thread boundary and the old `unsafe impl Send/Sync` are gone.  All
+//! public methods send a command to that thread and wait for the reply.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Mutex;
+use std::thread::JoinHandle;
 
 use crate::cache::CacheManager;
 use crate::config::TorrentfsConfig;
 use crate::download::{Session, TorrentHandle, TorrentState};
 use crate::error::{TorrentError, TorrentResult};
+use crate::metadata::TorrentInfo;
+use std::sync::Arc;
 
 pub struct SeedingManager {
-    session: Arc<Mutex<Session>>,
-    handles: Arc<Mutex<HashMap<String, TorrentHandle>>>,
-    seeding_info: Arc<Mutex<HashMap<String, SeedingInfo>>>,
-    cache_dir: PathBuf,
+    tx: mpsc::Sender<SeedingCommand>,
+    join: Mutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,303 +41,422 @@ pub enum SeedingState {
     Error,
 }
 
+enum SeedingCommand {
+    AddSeed {
+        info: Arc<TorrentInfo>,
+        reply: SyncSender<TorrentResult<()>>,
+    },
+    RemoveSeed {
+        info_hash: String,
+        reply: SyncSender<TorrentResult<()>>,
+    },
+    MarkPieceAvailable {
+        info_hash: String,
+        piece_index: i32,
+        reply: SyncSender<TorrentResult<()>>,
+    },
+    MarkPieceUnavailable {
+        info_hash: String,
+        piece_index: i32,
+        reply: SyncSender<TorrentResult<()>>,
+    },
+    HandleEviction {
+        info_hash: String,
+        piece_index: i32,
+    },
+    UpdateStatus {
+        reply: SyncSender<TorrentResult<Vec<SeedingInfo>>>,
+    },
+    GetSeedingInfo {
+        info_hash: String,
+        reply: SyncSender<Option<SeedingInfo>>,
+    },
+    HasHandle {
+        info_hash: String,
+        reply: SyncSender<bool>,
+    },
+    IsSeeding {
+        info_hash: String,
+        reply: SyncSender<bool>,
+    },
+    GetAllSeeds {
+        reply: SyncSender<Vec<SeedingInfo>>,
+    },
+    GetTotalUploaded {
+        reply: SyncSender<u64>,
+    },
+    Shutdown,
+}
+
 impl SeedingManager {
     pub fn new(cache_dir: &Path, config: &TorrentfsConfig) -> TorrentResult<Self> {
-        // Create pieces directory for custom piece storage
         let pieces_dir = cache_dir.join("pieces");
-        std::fs::create_dir_all(&pieces_dir).map_err(|e| TorrentError::IoError(e.to_string()))?;
+        std::fs::create_dir_all(&pieces_dir)
+            .map_err(|e| TorrentError::IoError(e.to_string()))?;
 
-        // Create session with custom piece storage from the start
-        let session = Session::new_with_custom_storage(config, &pieces_dir)?;
+        let (init_tx, init_rx) = mpsc::sync_channel::<TorrentResult<()>>(1);
+        let (tx, rx) = mpsc::channel::<SeedingCommand>();
+        let cache_dir = cache_dir.to_path_buf();
+        let config = config.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("seeding-manager".into())
+            .spawn(move || {
+                // The session must be created on this thread: `Session` owns a
+                // raw libtorrent pointer and is no longer `Send`.
+                match Session::new_with_custom_storage(&config, &pieces_dir) {
+                    Ok(session) => {
+                        let _ = init_tx.send(Ok(()));
+                        seeding_loop(session, rx, cache_dir);
+                    }
+                    Err(e) => {
+                        let _ = init_tx.send(Err(e));
+                    }
+                }
+            })
+            .map_err(|e| TorrentError::Unknown {
+                code: -1,
+                message: format!("Failed to spawn seeding thread: {}", e),
+            })?;
+
+        init_rx
+            .recv()
+            .map_err(|_| TorrentError::Unknown {
+                code: -1,
+                message: "Seeding thread disconnected before init".to_string(),
+            })??;
 
         Ok(Self {
-            session: Arc::new(Mutex::new(session)),
-            handles: Arc::new(Mutex::new(HashMap::new())),
-            seeding_info: Arc::new(Mutex::new(HashMap::new())),
-            cache_dir: cache_dir.to_path_buf(),
+            tx,
+            join: Mutex::new(Some(handle)),
         })
     }
 
-    pub fn add_seed(&self, info: &crate::TorrentInfo) -> TorrentResult<()> {
-        let info_hash = hex::encode(info.info_hash()?);
-
-        {
-            let handles = self.handles.lock().map_err(|_| TorrentError::Unknown {
-                code: -1,
-                message: "Handles lock poisoned".to_string(),
-            })?;
-
-            if handles.contains_key(&info_hash) {
-                return Ok(());
-            }
-        }
-
-        // Use cache/pieces/ as the piece storage directory.
-        // Note: the C++ PieceStorageDiskIO creates a "pieces/" subdirectory
-        // under the given path, so we pass the base cache_dir (not cache/pieces/).
-        let pieces_dir = self.cache_dir.join("pieces");
-        if !pieces_dir.exists() {
-            std::fs::create_dir_all(&pieces_dir)
-                .map_err(|e| TorrentError::IoError(e.to_string()))?;
-        }
-
-        let handle = {
-            let mut session = self.session.lock().map_err(|_| TorrentError::Unknown {
-                code: -1,
-                message: "Session lock poisoned".to_string(),
-            })?;
-
-            // Custom storage already active from session creation
-            session.add_torrent(info, &pieces_dir)?
-        };
-
-        let name = info.name();
-        let total_size = info.total_size();
-
-        {
-            let mut handles = self.handles.lock().map_err(|_| TorrentError::Unknown {
-                code: -1,
-                message: "Handles lock poisoned".to_string(),
-            })?;
-
-            handles.insert(info_hash.clone(), handle);
-        }
-
-        {
-            let mut info_map = self
-                .seeding_info
-                .lock()
-                .map_err(|_| TorrentError::Unknown {
-                    code: -1,
-                    message: "Seeding info lock poisoned".to_string(),
-                })?;
-
-            info_map.insert(
-                info_hash.clone(),
-                SeedingInfo {
-                    info_hash: info_hash.clone(),
-                    name,
-                    total_size,
-                    uploaded: 0,
-                    state: SeedingState::Checking,
-                },
-            );
-        }
-
-        Ok(())
+    pub fn add_seed(&self, info: Arc<TorrentInfo>) -> TorrentResult<()> {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(SeedingCommand::AddSeed { info, reply })?;
+        rx.recv().map_err(|_| Self::disconnected())?
     }
 
     pub fn remove_seed(&self, info_hash: &str) -> TorrentResult<()> {
-        let handle = {
-            let mut handles = self.handles.lock().map_err(|_| TorrentError::Unknown {
-                code: -1,
-                message: "Handles lock poisoned".to_string(),
-            })?;
-            handles.remove(info_hash)
-        };
-
-        if let Some(handle) = handle {
-            let mut session = self.session.lock().map_err(|_| TorrentError::Unknown {
-                code: -1,
-                message: "Session lock poisoned".to_string(),
-            })?;
-            session.remove_torrent(handle, false);
-        }
-
-        {
-            let mut info_map = self
-                .seeding_info
-                .lock()
-                .map_err(|_| TorrentError::Unknown {
-                    code: -1,
-                    message: "Seeding info lock poisoned".to_string(),
-                })?;
-            info_map.remove(info_hash);
-        }
-
-        Ok(())
-    }
-
-    /// Handle piece eviction notification from CacheManager.
-    /// Marks the evicted piece as unavailable for seeding (priority 0)
-    /// instead of removing the entire torrent from seeding.
-    pub fn handle_eviction(&self, info_hash: &str, piece_index: i32) {
-        tracing::info!(
-            "Eviction-triggered: marking piece {} unavailable for seeding info_hash={}",
-            piece_index,
-            info_hash
-        );
-        match self.mark_piece_unavailable(info_hash, piece_index) {
-            Ok(()) => {
-                tracing::info!(
-                    "Successfully marked piece {} unavailable for info_hash={}",
-                    piece_index,
-                    info_hash
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to mark piece {} unavailable for info_hash={}: {:?}",
-                    piece_index,
-                    info_hash,
-                    e
-                );
-            }
-        }
-    }
-
-    /// Mark a piece as unavailable for seeding by setting its priority to 0.
-    /// When priority is 0, libtorrent will not announce this piece to peers.
-    pub fn mark_piece_unavailable(&self, info_hash: &str, piece_index: i32) -> TorrentResult<()> {
-        let handles = self.handles.lock().map_err(|_| TorrentError::Unknown {
-            code: -1,
-            message: "Handles lock poisoned".to_string(),
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(SeedingCommand::RemoveSeed {
+            info_hash: info_hash.to_string(),
+            reply,
         })?;
-
-        if let Some(handle) = handles.get(info_hash) {
-            if !handle.set_piece_priority(piece_index, 0) {
-                tracing::warn!(
-                    "set_piece_priority(0) returned false for info_hash={}, piece_index={}",
-                    info_hash,
-                    piece_index
-                );
-            }
-        } else {
-            tracing::debug!(
-                "No seeding handle found for info_hash={}, skipping mark_piece_unavailable",
-                info_hash
-            );
-        }
-
-        Ok(())
+        rx.recv().map_err(|_| Self::disconnected())?
     }
 
-    /// Mark a piece as available for seeding by restoring its priority to default (7).
-    /// Called after a previously-evicted piece has been re-downloaded by DownloadManager.
+    /// Mark a piece as available for seeding (priority 7).
     pub fn mark_piece_available(&self, info_hash: &str, piece_index: i32) -> TorrentResult<()> {
-        let handles = self.handles.lock().map_err(|_| TorrentError::Unknown {
-            code: -1,
-            message: "Handles lock poisoned".to_string(),
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(SeedingCommand::MarkPieceAvailable {
+            info_hash: info_hash.to_string(),
+            piece_index,
+            reply,
         })?;
-
-        if let Some(handle) = handles.get(info_hash) {
-            if !handle.set_piece_priority(piece_index, 7) {
-                tracing::warn!(
-                    "set_piece_priority(7) returned false for info_hash={}, piece_index={}",
-                    info_hash,
-                    piece_index
-                );
-            }
-        } else {
-            tracing::debug!(
-                "No seeding handle found for info_hash={}, skipping mark_piece_available",
-                info_hash
-            );
-        }
-
-        Ok(())
+        rx.recv().map_err(|_| Self::disconnected())?
     }
 
-    /// Register this SeedingManager as an eviction callback on the given CacheManager.
-    /// When CacheManager evicts pieces, handle_eviction will be called with info_hash and piece_index.
-    pub fn register_eviction_callback(self: &Arc<Self>, cache: &mut CacheManager) {
-        let this = Arc::clone(self);
+    /// Mark a piece as unavailable for seeding (priority 0).
+    pub fn mark_piece_unavailable(&self, info_hash: &str, piece_index: i32) -> TorrentResult<()> {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(SeedingCommand::MarkPieceUnavailable {
+            info_hash: info_hash.to_string(),
+            piece_index,
+            reply,
+        })?;
+        rx.recv().map_err(|_| Self::disconnected())?
+    }
+
+    /// Register this manager as an eviction callback on the given CacheManager.
+    pub fn register_eviction_callback(&self, cache: &mut CacheManager) {
+        let tx = self.tx.clone();
         cache.on_evict(Box::new(move |info_hash: String, piece_index: i32| {
-            this.handle_eviction(&info_hash, piece_index);
+            let _ = tx.send(SeedingCommand::HandleEviction {
+                info_hash,
+                piece_index,
+            });
         }));
     }
 
     pub fn update_seeding_status(&self) -> TorrentResult<Vec<SeedingInfo>> {
-        let handles = self.handles.lock().map_err(|_| TorrentError::Unknown {
-            code: -1,
-            message: "Handles lock poisoned".to_string(),
-        })?;
-
-        let mut info_map = self
-            .seeding_info
-            .lock()
-            .map_err(|_| TorrentError::Unknown {
-                code: -1,
-                message: "Seeding info lock poisoned".to_string(),
-            })?;
-
-        for (info_hash, handle) in handles.iter() {
-            if let Ok(status) = handle.status() {
-                if let Some(info) = info_map.get_mut(info_hash) {
-                    info.uploaded = status.total_done;
-
-                    info.state = match status.state {
-                        TorrentState::Seeding => SeedingState::Seeding,
-                        TorrentState::Finished => SeedingState::Seeding,
-                        TorrentState::CheckingFiles
-                        | TorrentState::CheckingResumeData
-                        | TorrentState::QueuedForChecking => SeedingState::Checking,
-                        TorrentState::Downloading | TorrentState::DownloadingMetadata => {
-                            SeedingState::Checking
-                        }
-                        TorrentState::Allocating => SeedingState::Checking,
-                        TorrentState::Unknown => SeedingState::Error,
-                    };
-                }
-            }
-        }
-
-        Ok(info_map.values().cloned().collect())
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.send(SeedingCommand::UpdateStatus { reply })?;
+        rx.recv().map_err(|_| Self::disconnected())?
     }
 
     pub fn get_seeding_info(&self, info_hash: &str) -> Option<SeedingInfo> {
-        if let Err(e) = self.update_seeding_status() {
-            eprintln!("[WARN] Failed to update seeding status: {}", e);
+        let (reply, rx) = mpsc::sync_channel(1);
+        if self
+            .send(SeedingCommand::GetSeedingInfo {
+                info_hash: info_hash.to_string(),
+                reply,
+            })
+            .is_err()
+        {
+            return None;
         }
-        let info_map = self.seeding_info.lock().ok()?;
-        info_map.get(info_hash).cloned()
+        rx.recv().ok().flatten()
     }
 
     pub fn has_handle(&self, info_hash: &str) -> bool {
-        self.handles
-            .lock()
-            .ok()
-            .map(|h| h.contains_key(info_hash))
-            .unwrap_or(false)
+        let (reply, rx) = mpsc::sync_channel(1);
+        if self
+            .send(SeedingCommand::HasHandle {
+                info_hash: info_hash.to_string(),
+                reply,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        rx.recv().unwrap_or(false)
     }
 
     pub fn is_seeding(&self, info_hash: &str) -> bool {
-        if let Err(e) = self.update_seeding_status() {
-            eprintln!("[WARN] Failed to update seeding status: {}", e);
+        let (reply, rx) = mpsc::sync_channel(1);
+        if self
+            .send(SeedingCommand::IsSeeding {
+                info_hash: info_hash.to_string(),
+                reply,
+            })
+            .is_err()
+        {
+            return false;
         }
-        let info_map = match self.seeding_info.lock().ok() {
-            Some(m) => m,
-            None => return false,
-        };
-        match info_map.get(info_hash) {
-            Some(info) => info.state == SeedingState::Seeding,
-            None => false,
-        }
+        rx.recv().unwrap_or(false)
     }
 
     pub fn get_all_seeds(&self) -> Vec<SeedingInfo> {
-        if let Err(e) = self.update_seeding_status() {
-            eprintln!("[WARN] Failed to update seeding status: {}", e);
+        let (reply, rx) = mpsc::sync_channel(1);
+        if self.send(SeedingCommand::GetAllSeeds { reply }).is_err() {
+            return vec![];
         }
-        let info_map = self.seeding_info.lock().ok();
-        info_map
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
+        rx.recv().unwrap_or_default()
     }
 
     pub fn get_total_uploaded(&self) -> u64 {
-        if let Err(e) = self.update_seeding_status() {
-            eprintln!("[WARN] Failed to update seeding status: {}", e);
+        let (reply, rx) = mpsc::sync_channel(1);
+        if self.send(SeedingCommand::GetTotalUploaded { reply }).is_err() {
+            return 0;
         }
-        let info_map = self.seeding_info.lock().ok();
-        info_map
-            .map(|m| m.values().map(|s| s.uploaded).sum())
-            .unwrap_or(0)
+        rx.recv().unwrap_or(0)
+    }
+
+
+    fn send(&self, cmd: SeedingCommand) -> TorrentResult<()> {
+        self.tx.send(cmd).map_err(|_| TorrentError::Unknown {
+            code: -1,
+            message: "Seeding manager has shut down".to_string(),
+        })
+    }
+
+    fn disconnected() -> TorrentError {
+        TorrentError::Unknown {
+            code: -1,
+            message: "Seeding manager thread disconnected".to_string(),
+        }
     }
 }
 
-unsafe impl Send for SeedingManager {}
-unsafe impl Sync for SeedingManager {}
+impl Drop for SeedingManager {
+    fn drop(&mut self) {
+        let _ = self.tx.send(SeedingCommand::Shutdown);
+        if let Some(handle) = self.join.lock().ok().and_then(|mut g| g.take()) {
+            let _ = handle.join();
+        }
+    }
+}
+
+// ── Thread body ─────────────────────────────────────────────────────────────
+
+fn seeding_loop(
+    mut session: Session,
+    rx: Receiver<SeedingCommand>,
+    cache_dir: PathBuf,
+) {
+    let mut handles: HashMap<String, TorrentHandle> = HashMap::new();
+    let mut seeding_info: HashMap<String, SeedingInfo> = HashMap::new();
+
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            SeedingCommand::AddSeed { info, reply } => {
+                let _ = reply.send(add_seed_impl(
+                    &mut session,
+                    &mut handles,
+                    &mut seeding_info,
+                    &cache_dir,
+                    &info,
+                ));
+            }
+            SeedingCommand::RemoveSeed { info_hash, reply } => {
+                let _ = reply.send(remove_seed_impl(
+                    &mut session,
+                    &mut handles,
+                    &mut seeding_info,
+                    &info_hash,
+                ));
+            }
+            SeedingCommand::MarkPieceAvailable {
+                info_hash,
+                piece_index,
+                reply,
+            } => {
+                let _ = reply.send(mark_piece(&handles, &info_hash, piece_index, 7));
+            }
+            SeedingCommand::MarkPieceUnavailable {
+                info_hash,
+                piece_index,
+                reply,
+            } => {
+                let _ = reply.send(mark_piece(&handles, &info_hash, piece_index, 0));
+            }
+            SeedingCommand::HandleEviction {
+                info_hash,
+                piece_index,
+            } => {
+                tracing::info!(
+                    "Eviction-triggered: marking piece {} unavailable for seeding info_hash={}",
+                    piece_index,
+                    info_hash
+                );
+                let _ = mark_piece(&handles, &info_hash, piece_index, 0);
+            }
+            SeedingCommand::UpdateStatus { reply } => {
+                let _ = reply.send(update_status_impl(&handles, &mut seeding_info));
+            }
+            SeedingCommand::GetSeedingInfo { info_hash, reply } => {
+                let _ = update_status_impl(&handles, &mut seeding_info);
+                let _ = reply.send(seeding_info.get(&info_hash).cloned());
+            }
+            SeedingCommand::HasHandle { info_hash, reply } => {
+                let _ = reply.send(handles.contains_key(&info_hash));
+            }
+            SeedingCommand::IsSeeding { info_hash, reply } => {
+                let _ = update_status_impl(&handles, &mut seeding_info);
+                let _ = reply.send(
+                    seeding_info
+                        .get(&info_hash)
+                        .map(|i| i.state == SeedingState::Seeding)
+                        .unwrap_or(false),
+                );
+            }
+            SeedingCommand::GetAllSeeds { reply } => {
+                let _ = update_status_impl(&handles, &mut seeding_info);
+                let _ = reply.send(seeding_info.values().cloned().collect());
+            }
+            SeedingCommand::GetTotalUploaded { reply } => {
+                let _ = update_status_impl(&handles, &mut seeding_info);
+                let _ = reply.send(seeding_info.values().map(|s| s.uploaded).sum());
+            }
+            SeedingCommand::Shutdown => break,
+        }
+    }
+}
+
+fn add_seed_impl(
+    session: &mut Session,
+    handles: &mut HashMap<String, TorrentHandle>,
+    seeding_info: &mut HashMap<String, SeedingInfo>,
+    cache_dir: &Path,
+    info: &TorrentInfo,
+) -> TorrentResult<()> {
+    let info_hash = hex::encode(info.info_hash()?);
+    if handles.contains_key(&info_hash) {
+        return Ok(());
+    }
+
+    let pieces_dir = cache_dir.join("pieces");
+    if !pieces_dir.exists() {
+        std::fs::create_dir_all(&pieces_dir)
+            .map_err(|e| TorrentError::IoError(e.to_string()))?;
+    }
+
+    let handle = session.add_torrent(info, &pieces_dir)?;
+    let name = info.name();
+    let total_size = info.total_size();
+
+    handles.insert(info_hash.clone(), handle);
+    seeding_info.insert(
+        info_hash.clone(),
+        SeedingInfo {
+            info_hash,
+            name,
+            total_size,
+            uploaded: 0,
+            state: SeedingState::Checking,
+        },
+    );
+    Ok(())
+}
+
+fn remove_seed_impl(
+    session: &mut Session,
+    handles: &mut HashMap<String, TorrentHandle>,
+    seeding_info: &mut HashMap<String, SeedingInfo>,
+    info_hash: &str,
+) -> TorrentResult<()> {
+    if let Some(handle) = handles.remove(info_hash) {
+        session.remove_torrent(handle, false);
+    }
+    seeding_info.remove(info_hash);
+    Ok(())
+}
+
+fn mark_piece(
+    handles: &HashMap<String, TorrentHandle>,
+    info_hash: &str,
+    piece_index: i32,
+    priority: i32,
+) -> TorrentResult<()> {
+    match handles.get(info_hash) {
+        Some(handle) => {
+            if !handle.set_piece_priority(piece_index, priority) {
+                tracing::warn!(
+                    "set_piece_priority({}) returned false for info_hash={}, piece_index={}",
+                    priority,
+                    info_hash,
+                    piece_index
+                );
+            }
+        }
+        None => {
+            tracing::debug!(
+                "No seeding handle found for info_hash={}, skipping mark_piece priority={}",
+                info_hash,
+                priority
+            );
+        }
+    }
+    Ok(())
+}
+
+fn update_status_impl(
+    handles: &HashMap<String, TorrentHandle>,
+    seeding_info: &mut HashMap<String, SeedingInfo>,
+) -> TorrentResult<Vec<SeedingInfo>> {
+    for (info_hash, handle) in handles.iter() {
+        if let Ok(status) = handle.status() {
+            if let Some(info) = seeding_info.get_mut(info_hash) {
+                info.uploaded = status.total_done;
+                info.state = match status.state {
+                    TorrentState::Seeding => SeedingState::Seeding,
+                    TorrentState::Finished => SeedingState::Seeding,
+                    TorrentState::CheckingFiles
+                    | TorrentState::CheckingResumeData
+                    | TorrentState::QueuedForChecking => SeedingState::Checking,
+                    TorrentState::Downloading | TorrentState::DownloadingMetadata => {
+                        SeedingState::Checking
+                    }
+                    TorrentState::Allocating => SeedingState::Checking,
+                    TorrentState::Unknown => SeedingState::Error,
+                };
+            }
+        }
+    }
+    Ok(seeding_info.values().cloned().collect())
+}
 
 #[cfg(test)]
 mod tests {
@@ -342,32 +470,29 @@ mod tests {
     #[test]
     fn test_seeding_manager_new() {
         let temp_dir = TempDir::new().unwrap();
-        let manager = SeedingManager::new(temp_dir.path(), &default_config());
-        assert!(manager.is_ok());
-    }
-
-    #[test]
-    fn test_has_handle() {
-        let temp_dir = TempDir::new().unwrap();
         let manager = SeedingManager::new(temp_dir.path(), &default_config()).unwrap();
-
-        assert!(!manager.has_handle("nonexistent"));
-    }
-
-    #[test]
-    fn test_is_seeding() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager = SeedingManager::new(temp_dir.path(), &default_config()).unwrap();
-
-        assert!(!manager.is_seeding("nonexistent"));
+        assert!(manager.get_all_seeds().is_empty());
     }
 
     #[test]
     fn test_get_all_seeds() {
         let temp_dir = TempDir::new().unwrap();
         let manager = SeedingManager::new(temp_dir.path(), &default_config()).unwrap();
-
         let seeds = manager.get_all_seeds();
         assert!(seeds.is_empty());
+    }
+
+    #[test]
+    fn test_has_handle() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = SeedingManager::new(temp_dir.path(), &default_config()).unwrap();
+        assert!(!manager.has_handle("deadbeef"));
+    }
+
+    #[test]
+    fn test_is_seeding() {
+        let temp_dir = TempDir::new().unwrap();
+        let manager = SeedingManager::new(temp_dir.path(), &default_config()).unwrap();
+        assert!(!manager.is_seeding("deadbeef"));
     }
 }
