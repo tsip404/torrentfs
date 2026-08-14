@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use crate::cache::CacheManager;
 use crate::config::TorrentfsConfig;
-use crate::domain::PiecesManager;
+use super::piece_scheduler::{PiecePriorityConfig, PieceScheduler, PieceStatus};
+use super::piece_store::PieceStore;
 use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::metrics::Metrics;
 use crate::seeding::SeedingManager;
@@ -28,7 +29,8 @@ pub struct DownloadManager {
     pub(crate) read_timeout_secs: u64,
     pub(crate) seeding_manager: Option<Arc<SeedingManager>>,
     pub(crate) pending_reads: PendingReads,
-    pub(crate) pieces_manager: Arc<Mutex<PiecesManager>>,
+    pub(crate) piece_store: PieceStore,
+    pub(crate) piece_scheduler: Arc<Mutex<PieceScheduler>>,
     pub(crate) metrics: Arc<Metrics>,
 }
 
@@ -54,10 +56,9 @@ impl DownloadManager {
         let cache_manager = CacheManager::new(cache_dir, 1024 * 1024 * 1024)?;
         let cache_manager = Arc::new(Mutex::new(cache_manager));
 
-        let pieces_manager = Arc::new(Mutex::new(PiecesManager::new(
-            cache_manager.clone(),
-            crate::domain::PiecePriorityConfig::default(),
-        )));
+        let piece_store = PieceStore::new(cache_manager.clone());
+        let piece_scheduler =
+            Arc::new(Mutex::new(PieceScheduler::new(PiecePriorityConfig::default())));
 
         let read_timeout_secs = config
             .timeouts
@@ -73,7 +74,8 @@ impl DownloadManager {
             read_timeout_secs,
             seeding_manager: None,
             pending_reads: Arc::new(Mutex::new(HashMap::new())),
-            pieces_manager,
+            piece_store,
+            piece_scheduler,
             metrics,
         })
     }
@@ -129,7 +131,7 @@ impl DownloadManager {
     }
 
     /// Ensure a lightweight handle exists for the given torrent info.
-    /// Initializes the PiecesManager tracking for this torrent so that
+    /// Initializes the PieceScheduler tracking for this torrent so that
     /// all pieces start at priority 0.  Uses normal add_torrent (not
     /// upload_mode) so that piece priority elevations actually trigger
     /// downloading; all pieces are set to priority 0 immediately to
@@ -171,14 +173,14 @@ impl DownloadManager {
                 libtorrent_sys::lt_torrent_handle_set_all_piece_priorities(handle.inner, 0);
             }
         }
-        // Initialize PiecesManager tracking for this torrent.
-        self.pieces_manager
+        // Initialize PieceScheduler tracking for this torrent.
+        self.piece_scheduler
             .lock()
             .map_err(|_| TorrentError::Unknown {
                 code: -1,
-                message: "PiecesManager lock poisoned".to_string(),
+                message: "PieceScheduler lock poisoned".to_string(),
             })?
-            .init_upload_mode(&handle, &info_hash, num_pieces as i32, piece_length)?;
+            .init_torrent(&info_hash, num_pieces as i32, piece_length)?;
 
         let handle = Arc::new(Mutex::new(handle));
         self.handles.insert(info_hash.clone(), handle.clone());
@@ -186,13 +188,37 @@ impl DownloadManager {
         Ok(handle)
     }
 
-    /// Get a shared reference to the PiecesManager for cross-thread access.
-    pub fn pieces_manager_arc(&self) -> Arc<Mutex<PiecesManager>> {
-        self.pieces_manager.clone()
+    /// Get the piece status vector for a torrent, joining PieceScheduler
+    /// priorities with cache presence.
+    pub fn get_pieces_status(
+        &self,
+        info_hash: &str,
+        num_pieces: i32,
+    ) -> TorrentResult<Vec<PieceStatus>> {
+        let scheduler = self.piece_scheduler.lock().map_err(|_| TorrentError::Unknown {
+            code: -1,
+            message: "PieceScheduler lock poisoned".to_string(),
+        })?;
+        let cache = self.cache_manager.lock().map_err(|_| TorrentError::Unknown {
+            code: -1,
+            message: "Cache lock poisoned".to_string(),
+        })?;
+        scheduler.get_pieces_status(info_hash, num_pieces, &cache)
+    }
+
+    /// Non-blocking piece status for `.stats`: `(piece_length, statuses)` or
+    /// `None` when the scheduler / cache locks are contended.
+    pub fn try_get_pieces_status(&self, info_hash: &str) -> Option<(u64, Vec<PieceStatus>)> {
+        let scheduler = self.piece_scheduler.try_lock().ok()?;
+        let num_pieces = scheduler.num_pieces(info_hash)?;
+        let piece_length = scheduler.piece_length(info_hash).unwrap_or(0);
+        let cache = self.cache_manager.try_lock().ok()?;
+        let statuses = scheduler.get_pieces_status(info_hash, num_pieces, &cache).ok()?;
+        Some((piece_length, statuses))
     }
 
     /// Apply selective piece priority for a file read range.
-    /// Delegates to PiecesManager::apply_read_priority.
+    /// Delegates to PieceScheduler::apply_read_priority.
     pub fn apply_read_priority(
         &self,
         handle: &TorrentHandle,
@@ -201,13 +227,13 @@ impl DownloadManager {
         offset: u64,
         size: u32,
     ) -> TorrentResult<()> {
-        self.pieces_manager
+        self.piece_scheduler
             .lock()
             .map_err(|_| TorrentError::Unknown {
                 code: -1,
-                message: "PiecesManager lock poisoned".to_string(),
+                message: "PieceScheduler lock poisoned".to_string(),
             })?
-            .apply_read_priority(handle, info, file_index, offset, size)
+            .apply_read_priority(handle, info, file_index, offset, size, &self.piece_store)
     }
 
     /// Query torrent status for a given info_hash without triggering downloads.
@@ -1022,7 +1048,7 @@ impl DownloadManager {
         match rx.recv_timeout(std::time::Duration::from_secs(self.read_timeout_secs)) {
             Ok(data) => {
                 // Cache the result for future reads, then deprioritize the piece
-                // via PiecesManager so the elevated priority table is updated.
+                // via PieceScheduler so the elevated priority table is updated.
                 if !data.is_empty() {
                     let info_hash = piece_key
                         .split(':')
@@ -1030,7 +1056,7 @@ impl DownloadManager {
                         .unwrap_or("unknown");
                     // Write piece data to disk via CacheManager.
                     {
-                        let mut cache = self.cache_manager.lock().map_err(|_| {
+                        let cache = self.cache_manager.lock().map_err(|_| {
                             TorrentError::Unknown {
                                 code: -1,
                                 message: "Cache lock poisoned".to_string(),
@@ -1041,16 +1067,17 @@ impl DownloadManager {
                             tracing::warn!("Failed to write cache piece {}: {:?}", piece_key, e);
                         }
                     }
-                    // Register in PiecesManager (cache + deprioritize).
-                    if let Ok(mut pm) = self.pieces_manager.lock() {
-                        if let Err(e) = pm.add_piece(
-                            handle_guard, info_hash, piece_idx, data.len() as u64,
-                        ) {
-                            tracing::warn!(
-                                "fetch_piece_data: PiecesManager::add_piece failed for {}: {:?}",
-                                piece_key, e
-                            );
-                        }
+                    // Register in PieceStore (cache) + deprioritize via PieceScheduler.
+                    if let Err(e) =
+                        self.piece_store.register_piece(info_hash, piece_idx, data.len() as u64)
+                    {
+                        tracing::warn!(
+                            "fetch_piece_data: PieceStore::register_piece failed for {}: {:?}",
+                            piece_key, e
+                        );
+                    }
+                    if let Ok(mut ps) = self.piece_scheduler.lock() {
+                        ps.piece_ready(handle_guard, info_hash, piece_idx);
                     }
                 }
                 Ok(data)
@@ -1093,14 +1120,15 @@ impl DownloadManager {
 
     /// Background piece download — waits for pieces to become available
     /// without holding `&mut self` (only uses the provided handle, cache,
-    /// and pieces_manager).  The DownloadManager lock is NOT held during
+    /// and piece_store/piece_scheduler).  The DownloadManager lock is NOT held during
     /// the piece-wait loop, so other FUSE operations (stats, cached reads)
     /// remain responsive.
 
-    /// Register a newly downloaded piece via PiecesManager so the elevated
-    /// priority table is updated and the piece is deprioritized to 0.
+    /// Register a newly downloaded piece via PieceStore + PieceScheduler so
+    /// the elevated priority table is updated and the piece is deprioritized.
     fn register_piece_in_cache(
-        pieces_manager: &Arc<Mutex<PiecesManager>>,
+        piece_store: &PieceStore,
+        piece_scheduler: &Arc<Mutex<PieceScheduler>>,
         handle: &Arc<Mutex<TorrentHandle>>,
         info_hash: &str,
         piece_idx: i32,
@@ -1116,18 +1144,16 @@ impl DownloadManager {
             piece_length
         };
 
-        // Use PiecesManager::add_piece which registers in cache AND deprioritizes.
-        if let Ok(mut pm) = pieces_manager.lock() {
+        if let Err(e) = piece_store.register_piece(info_hash, piece_idx, expected_size) {
+            tracing::warn!(
+                "register_piece_in_cache: register_piece failed for {}:piece:{}: {:?}",
+                info_hash, piece_idx, e
+            );
+        }
+        if let Ok(mut ps) = piece_scheduler.lock() {
             if let Ok(h) = handle.lock() {
-                if let Err(e) = pm.add_piece(&h, info_hash, piece_idx, expected_size) {
-                    tracing::warn!(
-                        "register_piece_in_cache: add_piece via PiecesManager failed for {}:piece:{}: {:?}",
-                        info_hash, piece_idx, e
-                    );
-                }
+                ps.piece_ready(&h, info_hash, piece_idx);
             }
-        } else {
-            tracing::error!("register_piece_in_cache: PiecesManager lock poisoned");
         }
     }
 
@@ -1135,7 +1161,8 @@ impl DownloadManager {
     pub fn background_wait_for_pieces(
         handle: &Arc<Mutex<TorrentHandle>>,
         cache: &Arc<Mutex<CacheManager>>,
-        pieces_manager: &Arc<Mutex<PiecesManager>>,
+        piece_store: &PieceStore,
+        piece_scheduler: &Arc<Mutex<PieceScheduler>>,
         metrics: &Arc<Metrics>,
         info_hash: &str,
         start_piece: i32,
@@ -1180,7 +1207,7 @@ impl DownloadManager {
                 };
                 if h.have_piece(piece_idx) {
                     Self::register_piece_in_cache(
-                        pieces_manager, handle, info_hash, piece_idx,
+                        piece_store, piece_scheduler, handle, info_hash, piece_idx,
                         piece_length, num_pieces, total_size,
                     );
                     continue;
@@ -1232,7 +1259,7 @@ impl DownloadManager {
                         piece_start.elapsed().as_secs_f64()
                     );
                     Self::register_piece_in_cache(
-                        pieces_manager, handle, info_hash, piece_idx,
+                        piece_store, piece_scheduler, handle, info_hash, piece_idx,
                         piece_length, num_pieces, total_size,
                     );
                     break;
@@ -1264,7 +1291,7 @@ impl DownloadManager {
                 // reflects progress without an additional read (TSI-2133).
                 if last_proactive_sweep.elapsed() >= std::time::Duration::from_secs(2) {
                     Self::register_completed_pieces(
-                        pieces_manager, handle, info_hash,
+                        piece_store, piece_scheduler, handle, info_hash,
                         piece_length, num_pieces, total_size,
                     );
                     last_proactive_sweep = std::time::Instant::now();
@@ -1293,7 +1320,7 @@ impl DownloadManager {
         // Final proactive sweep: register any remaining elevated pieces that
         // completed while we waited (e.g. prefetch pieces beyond the read range).
         Self::register_completed_pieces(
-            pieces_manager, handle, info_hash,
+            piece_store, piece_scheduler, handle, info_hash,
             piece_length, num_pieces, total_size,
         );
 
@@ -1310,16 +1337,17 @@ impl DownloadManager {
     /// downloading (libtorrent `have_piece`) so `.stats` shows up-to-date
     /// piece status without requiring an additional read (TSI-2133).
     fn register_completed_pieces(
-        pieces_manager: &Arc<Mutex<PiecesManager>>,
+        piece_store: &PieceStore,
+        piece_scheduler: &Arc<Mutex<PieceScheduler>>,
         handle: &Arc<Mutex<TorrentHandle>>,
         info_hash: &str,
         piece_length: u64,
         num_pieces: i32,
         total_size: u64,
     ) {
-        // Collect elevated piece indices under a short PiecesManager lock.
-        let elevated: Vec<i32> = match pieces_manager.lock() {
-            Ok(pm) => pm.elevated_pieces(info_hash),
+        // Collect elevated piece indices under a short PieceScheduler lock.
+        let elevated: Vec<i32> = match piece_scheduler.lock() {
+            Ok(ps) => ps.elevated_pieces(info_hash),
             Err(_) => return,
         };
         if elevated.is_empty() {
@@ -1332,7 +1360,7 @@ impl DownloadManager {
             };
             if done {
                 Self::register_piece_in_cache(
-                    pieces_manager, handle, info_hash, piece_idx,
+                    piece_store, piece_scheduler, handle, info_hash, piece_idx,
                     piece_length, num_pieces, total_size,
                 );
             }
