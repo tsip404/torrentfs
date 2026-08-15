@@ -341,10 +341,14 @@ impl Drop for DownloadEngine {
 
 // ── Engine loop ────────────────────────────────────────────────────────────
 
+/// libtorrent `torrent_flags::upload_mode` numeric value (`1 << 1`).
+const UPLOAD_MODE_FLAG: u64 = 1 << 1;
+
 /// Snapshot refresh interval. Alerts are no longer drained here — a dedicated
 /// consumer thread handles them event-driven via `set_alert_notify` — so this
 /// interval only bounds `.stats` staleness for per-torrent status/pieces.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
+
 
 fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
     tracing::info!("Download engine started");
@@ -407,7 +411,13 @@ impl EngineState {
         false
     }
 
-    /// Ensure a lightweight handle exists for the torrent (all pieces priority 0).
+    /// Ensure a lightweight handle exists for the torrent.
+    ///
+    /// The handle is added in upload_mode: it connects to trackers and peers
+    /// (so peer/seed info is visible immediately) but never requests pieces,
+    /// so nothing is downloaded until the first read that needs data.  On that
+    /// read, [`Self::read_file_range`] clears the upload_mode flag to switch
+    /// the torrent into download mode.
     fn ensure_handle(&mut self, info: &TorrentInfo) -> TorrentResult<()> {
         let info_hash = hex::encode(info.info_hash()?);
         if self.handles.contains_key(&info_hash) {
@@ -421,16 +431,9 @@ impl EngineState {
         std::fs::create_dir_all(&torrent_save_dir)
             .map_err(|e| TorrentError::IoError(e.to_string()))?;
 
-        let handle = self.session.add_torrent(info, &torrent_save_dir)?;
+        let handle = self.session.add_torrent_upload_mode(info, &torrent_save_dir)?;
 
         let (piece_length, num_pieces) = handle.get_torrent_info()?;
-        if num_pieces > 0 {
-            // SAFETY: handle.inner is a valid lt_torrent_handle_t returned by
-            // session.add_torrent, valid for the session's lifetime.
-            unsafe {
-                libtorrent_sys::lt_torrent_handle_set_all_piece_priorities(handle.inner, 0);
-            }
-        }
         self.scheduler
             .init_torrent(&info_hash, num_pieces as i32, piece_length)?;
         self.handles.insert(info_hash, handle);
@@ -563,6 +566,21 @@ impl EngineState {
             );
             self.release_reader(&info_hash);
             return result;
+        }
+
+        // ── Switch to download mode ────────────────────────────────────
+        // The handle was created in upload_mode (connect, never request). The
+        // reader_added call above has already applied the piece priority
+        // gradient; clearing upload_mode now lets libtorrent start requesting
+        // those pieces from the peers it is already connected to.
+        {
+            let handle = self.handles.get(&info_hash).ok_or_else(|| Self::missing())?;
+            if !handle.unset_flags(UPLOAD_MODE_FLAG) {
+                tracing::warn!(
+                    "read_file_range: failed to clear upload_mode for {}",
+                    info_hash
+                );
+            }
         }
 
         // Settle sleep for libtorrent state transitions.
@@ -821,6 +839,14 @@ impl EngineState {
 
     fn release_reader(&mut self, info_hash: &str) {
         if let Some(handle) = self.handles.get(info_hash) {
+            // Return to idle upload_mode first so no eager piece requests leak
+            // out before the priority gradient is reset below.
+            if !handle.set_flags(UPLOAD_MODE_FLAG) {
+                tracing::warn!(
+                    "release_reader: failed to re-enable upload_mode for {}",
+                    info_hash
+                );
+            }
             if let Err(e) = self
                 .scheduler
                 .reader_released(handle, info_hash, &self.store)
