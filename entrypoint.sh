@@ -170,11 +170,11 @@ start_torrentfs_rootless() {
     local torrentfs_pid=""
     cleanup() {
         echo "[entrypoint] shutting down" >&2
-        if [ -n "$torrentfs_pid" ]; then
+        if [ -n "${torrentfs_pid:-}" ]; then
             kill "$torrentfs_pid" 2>/dev/null || true
             wait "$torrentfs_pid" 2>/dev/null || true
         fi
-        umount "$mountpoint" 2>/dev/null || true
+        umount "${mountpoint:-}" 2>/dev/null || true
     }
     trap cleanup EXIT INT TERM
 
@@ -217,11 +217,11 @@ start_torrentfs_rootful() {
     local torrentfs_pid=""
     cleanup() {
         echo "[entrypoint] shutting down" >&2
-        if [ -n "$torrentfs_pid" ]; then
+        if [ -n "${torrentfs_pid:-}" ]; then
             kill "$torrentfs_pid" 2>/dev/null || true
             wait "$torrentfs_pid" 2>/dev/null || true
         fi
-        umount "$mountpoint" 2>/dev/null || true
+        umount "${mountpoint:-}" 2>/dev/null || true
     }
     trap cleanup EXIT INT TERM
 
