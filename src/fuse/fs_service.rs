@@ -814,6 +814,16 @@ impl FsService {
                             self.inode_mgr
                                 .open_files
                                 .retain(|_, &mut open_ino| open_ino != ino);
+
+                            // Clean up metadata directories left empty by this
+                            // deletion so the data/ mirror no longer exposes
+                            // orphaned directories. A cleanup failure is
+                            // non-fatal: the dirs stay in the DB, so the
+                            // cached SourcePathDir entries remain valid.
+                            let cleaned = ts
+                                .cleanup_orphaned_metadata_directories(&source_path)
+                                .unwrap_or_default();
+
                             self.inode_mgr
                                 .data_inodes
                                 .retain(|_, data_inode| match data_inode {
@@ -826,7 +836,7 @@ impl FsService {
                                     DataInode::TorrentFile {
                                         torrent_id: tid, ..
                                     } => *tid != torrent_id,
-                                    _ => true,
+                                    DataInode::SourcePathDir { path } => !cleaned.contains(path),
                                 });
 
                             let mut processing = self.processing_torrents.lock().map_err(|e| {
