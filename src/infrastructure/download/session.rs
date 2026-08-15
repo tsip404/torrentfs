@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::ptr;
 
@@ -404,6 +404,54 @@ impl TorrentHandle {
 
     pub fn info_hash(&self) -> &str {
         &self.info_hash
+    }
+
+    /// Return the torrent's current tracker URLs. Reflects the list libtorrent
+    /// will announce to after `add_torrent`/`add_torrent_upload_mode` (the
+    /// TSI-2171 hostname-tracker filter runs on the C++ side during add).
+    /// Primarily used by tests to assert the filter behaviour.
+    pub fn trackers(&self) -> TorrentResult<Vec<String>> {
+        let mut urls: *mut *mut libc::c_char = ptr::null_mut();
+        let mut count: libc::c_int = 0;
+
+        // SAFETY: `self.inner` is a valid handle; `urls` and `count` are
+        // stack-allocated and populated by the FFI call.
+        let result = unsafe {
+            libtorrent_sys::lt_torrent_handle_trackers(self.inner, &mut urls, &mut count)
+        };
+
+        if result != 0 {
+            return Err(TorrentError::Unknown {
+                code: result,
+                message: "Failed to get torrent trackers".to_string(),
+            });
+        }
+
+        let trackers = if count <= 0 || urls.is_null() {
+            Vec::new()
+        } else {
+            // SAFETY: `urls` points to `count` valid `*mut c_char` entries
+            // populated by the successful FFI call above.
+            let slice = unsafe { std::slice::from_raw_parts(urls, count as usize) };
+            slice
+                .iter()
+                .map(|p| {
+                    if p.is_null() {
+                        String::new()
+                    } else {
+                        // SAFETY: `p` is non-null and points to a NUL-terminated
+                        // C string owned by the C++ side.
+                        unsafe { CStr::from_ptr(*p) }.to_string_lossy().into_owned()
+                    }
+                })
+                .collect()
+        };
+
+        // SAFETY: `urls` was allocated by `lt_torrent_handle_trackers` and must
+        // be freed exactly once via `lt_tracker_list_free`.
+        unsafe { libtorrent_sys::lt_tracker_list_free(urls) };
+
+        Ok(trackers)
     }
 }
 
