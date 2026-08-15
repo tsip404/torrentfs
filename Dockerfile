@@ -44,8 +44,12 @@ RUN apt-get update && \
     fuse3 \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-# Enable allow_other so containers without --privileged can mount FUSE
-RUN echo "user_allow_other" >> /etc/fuse.conf
+# Enable allow_other so non-root users can access the shared mount.
+# fuse3 ships /etc/fuse.conf with `#user_allow_other` commented out; uncomment
+# it (falling back to appending) so torrentfs detects user_allow_other at startup.
+RUN touch /etc/fuse.conf \
+    && sed -i 's/^#\s*user_allow_other\s*$/user_allow_other/' /etc/fuse.conf \
+    && (grep -q '^user_allow_other$' /etc/fuse.conf || echo 'user_allow_other' >> /etc/fuse.conf)
 
 COPY --from=builder /torrentfs /usr/local/bin/torrentfs
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
