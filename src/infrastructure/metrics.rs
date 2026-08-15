@@ -140,8 +140,17 @@ impl Metrics {
         self.pending_reads_peak.fetch_max(cur, Ordering::Relaxed);
     }
     /// Record removal of a pending read (FUSE deferred-read ticket).
+    ///
+    /// Saturating: a double-resolution race (e.g. the deadline checker expiring
+    /// a ticket that a worker also resolves) can decrement past zero, which
+    /// previously wrapped the u64 gauge and surfaced as a huge value in
+    /// `.stats`. Clamp at zero instead.
     pub fn pending_reads_dec(&self) {
-        self.pending_reads_current.fetch_sub(1, Ordering::Relaxed);
+        let _ =
+            self.pending_reads_current
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(1))
+                });
     }
 
     // ── Poll hit rate ─────────────────────────────────────────────────
@@ -297,6 +306,18 @@ mod tests {
         let s = m.snapshot();
         assert_eq!(s.pending_reads_current, 1);
         assert_eq!(s.pending_reads_peak, 2);
+    }
+
+    #[test]
+    fn pending_reads_dec_saturates_at_zero() {
+        let m = Metrics::new();
+        // A double-resolution race would previously wrap the u64 gauge.
+        m.pending_reads_dec();
+        m.pending_reads_dec();
+        assert_eq!(m.snapshot().pending_reads_current, 0);
+        // A subsequent legitimate increment still works after clamping.
+        m.pending_reads_inc();
+        assert_eq!(m.snapshot().pending_reads_current, 1);
     }
 
     #[test]
