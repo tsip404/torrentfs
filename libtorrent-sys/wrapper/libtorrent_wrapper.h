@@ -118,6 +118,8 @@ int lt_torrent_handle_have_piece(lt_torrent_handle_t handle, int piece_index);
 int lt_torrent_handle_set_piece_deadline(lt_torrent_handle_t handle, int piece_index, int deadline_ms);
 int lt_torrent_handle_set_piece_priority(lt_torrent_handle_t handle, int piece_index, int priority);
 int lt_torrent_handle_set_all_piece_priorities(lt_torrent_handle_t handle, int priority);
+int lt_torrent_handle_set_flags(lt_torrent_handle_t handle, uint64_t flags);
+int lt_torrent_handle_unset_flags(lt_torrent_handle_t handle, uint64_t flags);
 
 void lt_session_apply_settings(lt_session_t session, const char* settings_json);
 

@@ -387,6 +387,21 @@ impl TorrentHandle {
         }
     }
 
+    /// Set one or more `torrent_flags_t` bits on the underlying handle.
+    ///
+    /// Used to return a download handle to idle upload_mode after a read.
+    pub fn set_flags(&self, flags: u64) -> bool {
+        unsafe { libtorrent_sys::lt_torrent_handle_set_flags(self.inner, flags) == 0 }
+    }
+
+    /// Clear one or more `torrent_flags_t` bits on the underlying handle.
+    ///
+    /// Used to switch a lightweight upload_mode handle into download mode by
+    /// clearing `torrent_flags::upload_mode` (numeric value `1 << 1`).
+    pub fn unset_flags(&self, flags: u64) -> bool {
+        unsafe { libtorrent_sys::lt_torrent_handle_unset_flags(self.inner, flags) == 0 }
+    }
+
     pub fn info_hash(&self) -> &str {
         &self.info_hash
     }

@@ -94,6 +94,72 @@ fn test_read_file_range_with_local_seeder() {
     }
 }
 
+/// Regression test (TSI-2151 P0): a lightweight handle created at torrent-add
+/// time (upload_mode, no pieces downloaded) must switch to download mode and
+/// fetch data from a tracker-only peer when a read arrives later — not stay
+/// stuck in a "Finished" state with no peer connections.
+#[test]
+fn test_read_file_range_after_idle_handle() {
+    // Serialize libtorrent session creation to avoid resource contention.
+    let _session_guard = common::acquire_session_lock();
+
+    let harness = TestHarness::new();
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    // TSI-2068: force the downloader onto a distinct listen port so the
+    // MiniTracker can distinguish it from the seeder (which defaults to
+    // 6881 via Session::new with NULL listen_interfaces).  When both
+    // sessions collide on the same port the tracker deduplicates by
+    // IP:port and returns 0 peers, causing a 30s timeout.
+    config.connections.listen_interfaces = Some("0.0.0.0:16881".to_string());
+
+    let engine = torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+        .expect("Failed to create DownloadEngine");
+
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(harness.torrent_data.clone())
+            .expect("Failed to parse torrent for downloader"),
+    );
+
+    // Mirror the FUSE "torrent added" path: create the lightweight handle
+    // first, then leave it idle long enough to settle into upload_mode.
+    engine
+        .ensure_handle(info.clone())
+        .expect("Failed to ensure lightweight handle");
+    thread::sleep(Duration::from_secs(3));
+
+    // Now read — the idle handle must switch to download mode and fetch the
+    // piece from the seeder over the tracker (peer-to-peer path).
+    let start = std::time::Instant::now();
+    let timeout = Duration::from_secs(60);
+    let mut last_error: Option<torrentfs::TorrentError> = None;
+    loop {
+        match engine.read_file_range(info.clone(), 0, 0, 50) {
+            Ok(data) => {
+                assert!(!data.is_empty(), "Expected non-empty data");
+                assert_eq!(
+                    &data[..50.min(data.len())],
+                    &harness.file_content[..50.min(data.len())],
+                    "Downloaded data doesn't match seed content"
+                );
+                return;
+            }
+            Err(e) => {
+                last_error = Some(e);
+            }
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "Timed out after {:.0}s waiting for file read after idle. Last error: {:?}",
+                timeout.as_secs(),
+                last_error
+            );
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
 /// Test that read_file_range returns correct data for different offset/size
 /// combinations, validating boundary handling.
 #[test]

@@ -20,6 +20,12 @@ use crate::infrastructure::metadata::TorrentInfo;
 use super::piece_store::PieceStore;
 use super::types::FilePieceInfo;
 
+/// libtorrent `download_priority_t::default_priority` (4).  This is the
+/// baseline priority a torrent uses while idle in upload_mode: pieces are
+/// "wanted" (so the torrent stays connected and is not treated as Finished)
+/// but upload_mode suppresses any piece requests.
+const DEFAULT_PRIORITY: i32 = 4;
+
 /// Priority gradient configuration for selective piece download.
 #[derive(Debug, Clone)]
 pub struct PiecePriorityConfig {
@@ -97,8 +103,10 @@ impl PieceScheduler {
         if num_pieces <= 0 {
             return Ok(());
         }
-        self.elevated
-            .insert(info_hash.to_string(), vec![0i32; num_pieces as usize]);
+        self.elevated.insert(
+            info_hash.to_string(),
+            vec![DEFAULT_PRIORITY; num_pieces as usize],
+        );
         self.piece_lengths.insert(info_hash.to_string(), piece_length);
         Ok(())
     }
@@ -217,13 +225,13 @@ impl PieceScheduler {
 
     // ── Internals ─────────────────────────────────────────────────────
 
-    /// Reset every piece of a torrent to priority 0.
+    /// Reset every piece of a torrent back to the idle baseline priority.
     fn reset_all(&mut self, handle: &TorrentHandle, info_hash: &str) {
         if let Some(priorities) = self.elevated.get_mut(info_hash) {
             for (p, prio) in priorities.iter_mut().enumerate() {
-                if *prio != 0 {
-                    *prio = 0;
-                    handle.set_piece_priority(p as i32, 0);
+                if *prio != DEFAULT_PRIORITY {
+                    *prio = DEFAULT_PRIORITY;
+                    handle.set_piece_priority(p as i32, DEFAULT_PRIORITY);
                 }
             }
         }
@@ -269,9 +277,9 @@ impl PieceScheduler {
 
         if !any {
             for (p, prio) in priorities.iter_mut().enumerate() {
-                if *prio != 0 {
-                    *prio = 0;
-                    handle.set_piece_priority(p as i32, 0);
+                if *prio != DEFAULT_PRIORITY {
+                    *prio = DEFAULT_PRIORITY;
+                    handle.set_piece_priority(p as i32, DEFAULT_PRIORITY);
                 }
             }
             return Ok(());

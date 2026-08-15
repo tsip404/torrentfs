@@ -350,9 +350,11 @@ lt_torrent_handle_t lt_session_add_torrent_upload_mode(lt_session_t session, lt_
         } else {
             params.save_path = "/tmp/torrentfs-cache";
         }
-        // upload_mode: torrent will connect to trackers/peers but never request pieces
-        // Clear paused flag so tracker announces work.
-        params.flags &= ~lt::torrent_flags::paused;
+        // upload_mode: torrent will connect to trackers/peers but never request pieces.
+        // Clear paused (so tracker announces work) and auto_managed (so libtorrent
+        // does NOT periodically take the torrent out of upload_mode on its own —
+        // torrentfs switches to download mode explicitly on the first read).
+        params.flags &= ~(lt::torrent_flags::paused | lt::torrent_flags::auto_managed);
         params.flags |= lt::torrent_flags::upload_mode;
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
@@ -561,6 +563,34 @@ int lt_torrent_handle_set_all_piece_priorities(lt_torrent_handle_t handle, int p
             pieces.emplace_back(lt::piece_index_t(i), static_cast<lt::download_priority_t>(priority));
         }
         h->prioritize_pieces(pieces);
+        return 0;
+    } catch (const std::exception&) {
+        return -1;
+    }
+}
+
+int lt_torrent_handle_unset_flags(lt_torrent_handle_t handle, uint64_t flags) {
+    if (!handle) return -1;
+
+    auto h = static_cast<lt::torrent_handle*>(handle);
+    if (!h->is_valid()) return -1;
+
+    try {
+        h->unset_flags(static_cast<lt::torrent_flags_t>(flags));
+        return 0;
+    } catch (const std::exception&) {
+        return -1;
+    }
+}
+
+int lt_torrent_handle_set_flags(lt_torrent_handle_t handle, uint64_t flags) {
+    if (!handle) return -1;
+
+    auto h = static_cast<lt::torrent_handle*>(handle);
+    if (!h->is_valid()) return -1;
+
+    try {
+        h->set_flags(static_cast<lt::torrent_flags_t>(flags));
         return 0;
     } catch (const std::exception&) {
         return -1;
