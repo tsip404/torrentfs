@@ -23,6 +23,16 @@ fn main() {
         .flag("-std=c++17")
         .flag("-fexceptions")
         .flag("-O1")
+        // TSI-2171: emit the boost::system `*_cat_holder<void>::instance`
+        // template statics with regular WEAK binding instead of GNU unique
+        // (STB_GNU_UNIQUE). Debian experimental's libtorrent-rasterbar2.1 is
+        // built with those same statics as GNU unique symbols; when both the
+        // library and this wrapper emit them GNU-unique (the GCC default), the
+        // dynamic linker coalesces them incorrectly and `system_category()`
+        // dereferences a null vtable → SIGSEGV in `PieceStorageDiskIO::new_torrent`.
+        // Clang already emits them WEAK and rejects `-fno-gnu-unique`, so probe
+        // for support: GCC applies the flag, Clang skips it (already correct).
+        .flag_if_supported("-fno-gnu-unique")
         .define("TORRENT_USE_OPENSSL", None)
         .define("TORRENT_USE_LIBCRYPTO", None)
         .define("TORRENT_SSL_PEERS", None)

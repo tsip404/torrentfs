@@ -36,7 +36,6 @@
 #include <fstream>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <arpa/inet.h>
 #include <dirent.h>
 #include <openssl/sha.h>
 
@@ -292,65 +291,6 @@ void lt_session_destroy(lt_session_t session) {
     }
 }
 
-// ── TSI-2171: hostname tracker filtering ───────────────────────────────────
-// libtorrent 2.1.x (Debian experimental) crashes with SIGSEGV in its DNS
-// resolver (boost::system::detail::cat_holder null pointer) when announcing to
-// a hostname tracker (e.g. bttracker.debian.org). IP-literal trackers never
-// enter the resolver and are safe. Drop hostname trackers and keep only
-// IP-literal ones so a lazy file read cannot crash the process; DHT / LSD /
-// PEX peer discovery is unaffected.
-
-// Returns true when the host portion of a tracker URL is an IP literal
-// (IPv4 or IPv6), in which case libtorrent announces without a DNS lookup.
-static bool tracker_host_is_ip_literal(std::string const& url) {
-    std::size_t const scheme = url.find("://");
-    if (scheme == std::string::npos) return false;
-
-    std::size_t host_start = scheme + 3;
-    std::size_t host_end = host_start;
-    while (host_end < url.size()
-        && url[host_end] != '/'
-        && url[host_end] != ':'
-        && url[host_end] != '?'
-        && url[host_end] != '#') {
-        ++host_end;
-    }
-    std::string host = url.substr(host_start, host_end - host_start);
-    // IPv6 literals are wrapped in brackets: "[2001:db8::1]:80".
-    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
-        host = host.substr(1, host.size() - 2);
-    }
-    if (host.empty()) return false;
-
-    struct in_addr v4;
-    struct in6_addr v6;
-    return inet_pton(AF_INET, host.c_str(), &v4) == 1
-        || inet_pton(AF_INET6, host.c_str(), &v6) == 1;
-}
-
-// Drop hostname trackers from `atp`, keeping only IP-literal ones. When at
-// least one tracker is dropped, rebuild `atp.trackers`/`tracker_tiers` and set
-// override_trackers so the filtered list replaces the torrent's own trackers.
-// The IP-literal-only case (e.g. local test trackers on 127.0.0.1) is a no-op.
-// Uses `internal_trackers()`: `trackers()` is TORRENT_DEPRECATED in ABI v2.
-static void apply_tracker_filter(lt::add_torrent_params& atp, lt::torrent_info const& ti) {
-    bool dropped = false;
-    std::vector<std::string> kept_urls;
-    std::vector<int> kept_tiers;
-    for (auto const& tr : ti.internal_trackers()) {
-        if (tracker_host_is_ip_literal(tr.url)) {
-            kept_urls.push_back(tr.url);
-            kept_tiers.push_back(static_cast<int>(tr.tier));
-        } else {
-            dropped = true;
-        }
-    }
-    if (!dropped) return;
-    atp.trackers = std::move(kept_urls);
-    atp.tracker_tiers = std::move(kept_tiers);
-    atp.flags |= lt::torrent_flags::deprecated_override_trackers;
-}
-
 lt_torrent_handle_t lt_session_add_torrent(lt_session_t session, lt_torrent_info_t info, const char* save_path, lt_error_t* error) {
     if (!session || !info) {
         if (error) {
@@ -375,7 +315,6 @@ lt_torrent_handle_t lt_session_add_torrent(lt_session_t session, lt_torrent_info
         // tracker announces and peer connections. Torrent download is
         // triggered on-demand via set_piece_deadline.
         params.flags &= ~lt::torrent_flags::paused;
-        apply_tracker_filter(params, *ti);
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(params);
@@ -417,7 +356,6 @@ lt_torrent_handle_t lt_session_add_torrent_upload_mode(lt_session_t session, lt_
         // torrentfs switches to download mode explicitly on the first read).
         params.flags &= ~(lt::torrent_flags::paused | lt::torrent_flags::auto_managed);
         params.flags |= lt::torrent_flags::upload_mode;
-        apply_tracker_filter(params, *ti);
 
         std::lock_guard<std::mutex> lock(wrapper->mutex);
         auto handle = wrapper->session->add_torrent(params);
@@ -657,43 +595,6 @@ int lt_torrent_handle_set_flags(lt_torrent_handle_t handle, uint64_t flags) {
     } catch (const std::exception&) {
         return -1;
     }
-}
-
-// Return the torrent's current tracker URL list. `urls_out` is a heap array of
-// `*count_out` C strings (owned by a thread-local backing store, valid until the
-// next call on this thread); free the array with `lt_tracker_list_free`.
-// Used by tests to assert the TSI-2171 hostname-tracker filter.
-int lt_torrent_handle_trackers(lt_torrent_handle_t handle, char*** urls_out, int* count_out) {
-    if (!handle || !urls_out || !count_out) return -1;
-
-    auto h = static_cast<lt::torrent_handle*>(handle);
-    if (!h->is_valid()) return -1;
-
-    try {
-        auto trackers = h->trackers();
-        int const n = static_cast<int>(trackers.size());
-        auto* urls = static_cast<char**>(std::calloc(
-            n > 0 ? static_cast<std::size_t>(n) : 1, sizeof(char*)));
-        if (!urls) return -1;
-
-        static thread_local std::vector<std::string> storage;
-        storage.clear();
-        storage.reserve(static_cast<std::size_t>(n));
-        for (int i = 0; i < n; ++i) {
-            storage.push_back(trackers[static_cast<std::size_t>(i)].url);
-            urls[i] = const_cast<char*>(storage.back().c_str());
-        }
-
-        *urls_out = urls;
-        *count_out = n;
-        return 0;
-    } catch (const std::exception&) {
-        return -1;
-    }
-}
-
-void lt_tracker_list_free(char** urls) {
-    std::free(urls);
 }
 
 // Minimal JSON parser for flat settings objects
