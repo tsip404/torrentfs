@@ -32,15 +32,16 @@ fn main() {
         // dereferences a null vtable → SIGSEGV in `PieceStorageDiskIO::new_torrent`.
         // Clang already emits them WEAK and rejects `-fno-gnu-unique`, so probe
         // for support: GCC applies the flag, Clang skips it (already correct).
-        .flag_if_supported("-fno-gnu-unique")
-        .define("TORRENT_USE_OPENSSL", None)
-        .define("TORRENT_USE_LIBCRYPTO", None)
-        .define("TORRENT_SSL_PEERS", None)
-        .define("TORRENT_LINKING_SHARED", None)
-        .define("BOOST_ASIO_ENABLE_CANCELIO", None)
-        .define("BOOST_ASIO_NO_DEPRECATED", None)
-        .define("BOOST_SYSTEM_USE_UTF8", None)
-        .define("TORRENT_ABI_VERSION", "2");
+        .flag_if_supported("-fno-gnu-unique");
+
+    // Apply libtorrent's ABI-relevant compile definitions from its pkg-config
+    // Cflags (e.g. TORRENT_ABI_VERSION, TORRENT_LINKING_SHARED for shared
+    // builds, TORRENT_USE_RTC=0 for static builds, plus the boost/openssl
+    // feature flags). Reading them here — instead of hardcoding — keeps the
+    // wrapper ABI consistent with however libtorrent was actually built.
+    for (key, value) in &libtorrent_cflags.defines {
+        cpp_build.define(key, value.as_deref());
+    }
 
     for include_path in libtorrent_cflags.include_paths.iter() {
         cpp_build.include(include_path);
