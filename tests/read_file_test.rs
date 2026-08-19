@@ -274,3 +274,76 @@ fn test_read_file_range_no_peers_error() {
         }
     }
 }
+
+/// Build a structurally valid single-file `.torrent` whose piece hashes are
+/// all zero.  Parsing and handle creation only need valid structure (not
+/// correct hashes); distinct `name`s yield distinct info hashes.
+fn distinct_torrent(name: &str) -> Vec<u8> {
+    let mut t = Vec::new();
+    t.extend_from_slice(b"d8:announce31:http://127.0.0.1:19999/announce4:infod");
+    t.extend_from_slice(b"6:lengthi16384e");
+    t.extend_from_slice(format!("4:name{}:{}", name.len(), name).as_bytes());
+    t.extend_from_slice(b"12:piece lengthi16384e6:pieces20:");
+    t.extend_from_slice(&[0u8; 20]);
+    t.extend_from_slice(b"ee");
+    t
+}
+
+/// Regression test (TSI-2226 P0): creating a lightweight handle through the
+/// fire-and-forget `ensure_handle_async` path must not block the caller while
+/// the engine thread is busy downloading.  The FUSE release path calls this
+/// when a `.torrent` is written to metadata/; a blocking round-trip would
+/// stall the single-threaded FUSE dispatch loop behind an in-flight read and
+/// surface as a write timeout (EIO).
+#[test]
+fn test_ensure_handle_async_does_not_block_on_busy_engine() {
+    let _session_guard = common::acquire_session_lock();
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    config.dht.enabled = Some(false);
+    config.local_discovery.lsd_enabled = Some(false);
+    // Short timeout so the "no peers" read blocks only a few seconds.
+    config.timeouts.read_timeout_secs = Some(3);
+
+    let engine = Arc::new(
+        torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+            .expect("Failed to create DownloadEngine"),
+    );
+
+    let a = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(distinct_torrent("a.iso"))
+            .expect("Failed to parse torrent a"),
+    );
+    let b = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(distinct_torrent("b.iso"))
+            .expect("Failed to parse torrent b"),
+    );
+
+    // Create A's handle, then block the engine thread on a read with no peers.
+    engine.ensure_handle(a.clone()).expect("ensure handle a");
+    let engine_for_read = engine.clone();
+    let a_for_read = a.clone();
+    let read_thread = thread::spawn(move || {
+        let _ = engine_for_read.read_file_range(a_for_read, 0, 0, 4096);
+    });
+
+    // Give the engine thread time to pick up the blocking read.
+    thread::sleep(Duration::from_millis(500));
+
+    // ensure_handle_async must return immediately rather than queue behind the
+    // in-flight read (which blocks for ~6s: peer wait + piece wait).
+    let start = std::time::Instant::now();
+    engine
+        .ensure_handle_async(b.clone())
+        .expect("ensure_handle_async b");
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "ensure_handle_async blocked for {:?} behind a busy engine",
+        elapsed
+    );
+
+    read_thread.join().expect("read thread");
+    engine.shutdown();
+}
