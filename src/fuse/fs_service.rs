@@ -16,6 +16,8 @@ use std::time::Duration;
 
 use tracing::{error, info, warn};
 
+use sha1_smol::Sha1;
+
 use crate::cache::CacheManager;
 use crate::config::TorrentfsConfig;
 use crate::db::Database;
@@ -131,12 +133,17 @@ impl FsService {
         // Recreate lightweight libtorrent handles for all persisted torrents so
         // peer/seed information and `.stats` piece status are visible without a
         // read (TSI-2112 / TSI-2133).
-        if let Some(ref ds) = svc.download_service {
+        let mut infos_by_hash: HashMap<String, Arc<TorrentInfo>> = HashMap::new();
+        if let Some(ds) = &svc.download_service {
             for data in torrent_datas {
                 match TorrentInfo::from_bytes(data) {
                     Ok(info) => {
                         let name = info.name();
-                        if let Err(e) = ds.ensure_handle_lightweight(Arc::new(info)) {
+                        let info = Arc::new(info);
+                        if let Ok(ih) = info.info_hash() {
+                            infos_by_hash.insert(hex::encode(ih), info.clone());
+                        }
+                        if let Err(e) = ds.ensure_handle_lightweight(info) {
                             warn!(
                                 "Failed to restore lightweight handle for torrent '{}': {:?}",
                                 name,
@@ -148,6 +155,15 @@ impl FsService {
                         warn!("Failed to parse stored torrent data on startup: {:?}", e);
                     }
                 }
+            }
+        }
+
+        // TSI-2199: background SHA-1 verification of on-disk cached pieces that
+        // the startup scan re-registered as unverified. Runs asynchronously so
+        // FUSE mount readiness is never blocked.
+        if !infos_by_hash.is_empty() {
+            if let Some(cache) = svc.get_cache_manager() {
+                spawn_cache_verification(cache, infos_by_hash);
             }
         }
 
@@ -1381,6 +1397,127 @@ impl FsService {
     }
 }
 
+/// TSI-2199: background SHA-1 verification of on-disk cached pieces.
+///
+/// After a restart, [`CacheManager::scan_pieces_subdirectory`] re-registers
+/// every on-disk piece but leaves it unverified — it may be a complete piece
+/// or an incomplete/corrupt file left by a crash. This worker recomputes each
+/// candidate's SHA-1 and compares it against the torrent's expected piece
+/// hash: matches are marked verified (so subsequent reads serve from local
+/// cache), mismatches are purged so they can be re-downloaded on demand.
+///
+/// Runs on a detached background thread so it never blocks FUSE mount
+/// readiness.
+fn spawn_cache_verification(
+    cache: Arc<Mutex<CacheManager>>,
+    infos_by_hash: HashMap<String, Arc<TorrentInfo>>,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("cache-verify".to_string())
+        .spawn(move || {
+            let unverified = match cache.lock() {
+                Ok(c) => c.unverified_pieces(),
+                Err(_) => {
+                    warn!("Cache lock poisoned during piece verification");
+                    return;
+                }
+            };
+
+            let mut verified = 0usize;
+            let mut purged = 0usize;
+            let mut skipped = 0usize;
+
+            for piece_key in unverified {
+                let (info_hash, piece_index) = match split_piece_key(&piece_key) {
+                    Some(v) => v,
+                    None => {
+                        warn!("Skipping malformed piece key: {}", piece_key);
+                        skipped += 1;
+                        continue;
+                    }
+                };
+
+                let expected = match infos_by_hash.get(info_hash) {
+                    Some(info) => match info.hash_for_piece(piece_index) {
+                        Some(h) => h,
+                        None => {
+                            // v2-only torrent or out-of-range index: no SHA-1 to
+                            // check against; leave the piece untouched.
+                            skipped += 1;
+                            continue;
+                        }
+                    },
+                    None => {
+                        // Torrent no longer present in the DB: leave untouched.
+                        skipped += 1;
+                        continue;
+                    }
+                };
+
+                // Resolve the on-disk path without holding the cache lock during
+                // the file I/O, so active reads are not blocked.
+                let path = match cache.lock() {
+                    Ok(c) => c.piece_path(&piece_key),
+                    Err(_) => {
+                        warn!("Cache lock poisoned during piece verification");
+                        return;
+                    }
+                };
+
+                let data = match std::fs::read(&path) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        // Metadata references a file that no longer exists:
+                        // purge the stale entry so it can be re-downloaded.
+                        warn!("Cached piece file missing, purging: {}", piece_key);
+                        if let Ok(mut c) = cache.lock() {
+                            let _ = c.delete_piece(&piece_key);
+                        }
+                        purged += 1;
+                        continue;
+                    }
+                };
+
+                let actual = Sha1::from(&data[..]).digest().bytes();
+                if actual == expected {
+                    if let Ok(mut c) = cache.lock() {
+                        c.mark_verified(&piece_key);
+                    }
+                    verified += 1;
+                } else {
+                    warn!(
+                        "Cached piece failed SHA-1 verification, purging: {}",
+                        piece_key
+                    );
+                    if let Ok(mut c) = cache.lock() {
+                        let _ = c.delete_piece(&piece_key);
+                    }
+                    purged += 1;
+                }
+            }
+
+            info!(
+                "Cache piece verification complete: {} verified, {} purged, {} skipped",
+                verified, purged, skipped
+            );
+        });
+
+    if let Err(e) = spawned {
+        warn!("Failed to spawn cache verification thread: {}", e);
+    }
+}
+
+/// Split a piece key of the form `{info_hash}:piece:{index}` into its parts.
+fn split_piece_key(key: &str) -> Option<(&str, i32)> {
+    let mut parts = key.split(':');
+    let info_hash = parts.next()?;
+    if parts.next()? != "piece" {
+        return None;
+    }
+    let index = parts.next()?.parse::<i32>().ok()?;
+    Some((info_hash, index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1460,5 +1597,18 @@ mod tests {
         assert_eq!(metrics.snapshot().l3_misses, 1);
         assert_eq!(metrics.snapshot().l3_hits, 1);
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn split_piece_key_parses_info_hash_and_index() {
+        assert_eq!(
+            split_piece_key("abcdef0123456789:piece:42"),
+            Some(("abcdef0123456789", 42))
+        );
+        // Non-`piece` segment or missing index are rejected.
+        assert_eq!(split_piece_key("abc:data:0"), None);
+        assert_eq!(split_piece_key("abc:piece:x"), None);
+        assert_eq!(split_piece_key("abc"), None);
+        assert_eq!(split_piece_key(""), None);
     }
 }

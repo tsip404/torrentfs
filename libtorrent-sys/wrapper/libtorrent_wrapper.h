@@ -95,6 +95,8 @@ int lt_torrent_info_get_files(lt_torrent_info_t info, lt_file_entry_t** files, u
 void lt_files_free(lt_file_entry_t* files);
 
 int lt_torrent_info_get_info_hash(lt_torrent_info_t info, uint8_t* hash_out);
+int lt_torrent_info_hash_for_piece(lt_torrent_info_t info, int piece_index, uint8_t* hash_out);
+
 
 lt_session_t lt_session_create(const char* listen_interface, lt_error_t* error);
 lt_session_t lt_session_create_with_custom_storage(const char* piece_cache_dir, const char* settings_json, lt_error_t* error);
