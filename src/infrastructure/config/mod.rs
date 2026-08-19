@@ -17,6 +17,7 @@ pub mod encryption;
 pub mod local_discovery;
 pub mod misc;
 pub mod performance;
+pub mod piece_priority;
 pub mod pieces;
 pub mod proxy;
 pub mod rate_limits;
@@ -37,6 +38,7 @@ pub use encryption::EncryptionConfig;
 pub use local_discovery::LocalDiscoveryConfig;
 pub use misc::MiscConfig;
 pub use performance::PerformanceConfig;
+pub use piece_priority::PiecePriorityToml;
 pub use pieces::PiecesConfig;
 pub use proxy::ProxyConfig;
 pub use rate_limits::RateLimitsConfig;
@@ -104,6 +106,8 @@ pub struct TorrentfsConfig {
 
     #[serde(default)]
     pub misc: MiscConfig,
+    #[serde(default)]
+    pub piece_priority: PiecePriorityToml,
 }
 
 impl TorrentfsConfig {
@@ -173,6 +177,7 @@ impl Default for TorrentfsConfig {
             alert: AlertConfig::default(),
             performance: PerformanceConfig::default(),
             misc: MiscConfig::default(),
+            piece_priority: PiecePriorityToml::default(),
         }
     }
 }
@@ -349,5 +354,21 @@ read_timeout_secs = 10
 "#;
         let config: TorrentfsConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.timeouts.read_timeout_secs, Some(10));
+    }
+    #[test]
+    fn test_piece_priority_config_section() {
+        let toml_str = r#"
+[piece_priority]
+access_window_mb = 2048
+rest_priority = 0
+backward_priority = 1
+"#;
+        let config: TorrentfsConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.piece_priority.access_window_mb, Some(2048));
+        assert_eq!(config.piece_priority.rest_priority, Some(0));
+        assert_eq!(config.piece_priority.backward_priority, Some(1));
+        // Unspecified fields remain None (so they fall back to defaults).
+        assert_eq!(config.piece_priority.current_priority, None);
+        assert_eq!(config.piece_priority.window_edge_priority, None);
     }
 }

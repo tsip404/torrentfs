@@ -13,42 +13,67 @@
 use std::collections::HashMap;
 
 use crate::error::TorrentResult;
-
+use crate::infrastructure::config::PiecePriorityToml;
 use crate::infrastructure::download::TorrentHandle;
 use crate::infrastructure::metadata::TorrentInfo;
 
 use super::piece_store::PieceStore;
 use super::types::FilePieceInfo;
 
-/// libtorrent `download_priority_t::default_priority` (4).  This is the
-/// baseline priority a torrent uses while idle in upload_mode: pieces are
-/// "wanted" (so the torrent stays connected and is not treated as Finished)
-/// but upload_mode suppresses any piece requests.
-const DEFAULT_PRIORITY: i32 = 4;
+/// Idle baseline piece priority: 0 = "not wanted".  Pieces outside every
+/// active reader's access window stay at 0, so libtorrent never requests them
+/// on its own.  The torrent is held in `upload_mode` while idle, so it still
+/// connects and seeds without requesting any piece.
+const DEFAULT_PRIORITY: i32 = 0;
 
 /// Priority gradient configuration for selective piece download.
 #[derive(Debug, Clone)]
 pub struct PiecePriorityConfig {
-    /// Prefetch window in MiB beyond the current read range (default 4).
-    pub prefetch_window_mb: u32,
+    /// Access window in MiB beyond (and behind) the current read range
+    /// (default 4096 = 4 GB).  Pieces within the window are "wanted" with a
+    /// descending gradient; pieces outside it stay at 0 (not wanted).
+    pub access_window_mb: u32,
     /// Priority for pieces inside the current read range (default 7).
     pub current_priority: i32,
-    /// Step priorities for pieces at distance 1, 2, 3 from current range end.
+    /// Step priorities for pieces at distance 1..=4 from the current range end.
     pub step_priorities: [i32; 4],
-    /// Priority for pieces beyond the prefetch window but still in the file.
+    /// Priority at the far forward edge of the access window (default 1).
+    /// Beyond this the piece falls to [`Self::rest_priority`].
+    pub window_edge_priority: i32,
+    /// Priority for pieces beyond the access window (default 0 = not wanted).
     pub rest_priority: i32,
-    /// Priority for pieces before the current read offset but still in the file.
+    /// Priority for pieces before the current read offset but still within
+    /// the access window (default 1).  Pieces further back are 0.
     pub backward_priority: i32,
 }
 
 impl Default for PiecePriorityConfig {
     fn default() -> Self {
         Self {
-            prefetch_window_mb: 4,
+            access_window_mb: 4096,
             current_priority: 7,
             step_priorities: [6, 5, 4, 3],
-            rest_priority: 2,
+            window_edge_priority: 1,
+            rest_priority: 0,
             backward_priority: 1,
+        }
+    }
+}
+
+impl PiecePriorityConfig {
+    /// Build the runtime config from optional TOML overrides, falling back to
+    /// [`Self::default`] for any field the user did not specify.
+    pub fn from_toml(toml: &PiecePriorityToml) -> Self {
+        let d = Self::default();
+        Self {
+            access_window_mb: toml.access_window_mb.unwrap_or(d.access_window_mb),
+            current_priority: toml.current_priority.unwrap_or(d.current_priority),
+            step_priorities: toml.step_priorities.unwrap_or(d.step_priorities),
+            window_edge_priority: toml
+                .window_edge_priority
+                .unwrap_or(d.window_edge_priority),
+            rest_priority: toml.rest_priority.unwrap_or(d.rest_priority),
+            backward_priority: toml.backward_priority.unwrap_or(d.backward_priority),
         }
     }
 }
@@ -341,38 +366,153 @@ impl PieceScheduler {
             p_cur_start
         };
 
-        // Prefetch window in pieces.
-        let prefetch_bytes = self.config.prefetch_window_mb as u64 * 1024 * 1024;
-        let prefetch_pieces = if prefetch_bytes > 0 && piece_length > 0 {
-            ((prefetch_bytes + piece_length - 1) / piece_length) as i32
-        } else {
-            0i32
-        };
-        let prefetch_end = std::cmp::min(p_file_end, p_cur_end.saturating_add(prefetch_pieces));
+        // Access window in pieces, shared by the forward and backward regions.
+        // `piece_length > 0` is guaranteed by the early return above.
+        let window_bytes = self.config.access_window_mb as u64 * 1024 * 1024;
+        let window_pieces = window_bytes.div_ceil(piece_length) as i32;
 
         let mut gradient = vec![0i32; num_pieces as usize];
         let p_start = std::cmp::max(0, p_file_start);
         let p_end = std::cmp::min(num_pieces - 1, p_file_end);
 
         for p in p_start..=p_end {
-            let prio = if p < p_cur_start {
-                self.config.backward_priority
-            } else if p <= p_cur_end {
-                self.config.current_priority
-            } else {
-                let dist = p - p_cur_end; // 1-based distance after current read end.
-                let idx = (dist - 1) as usize;
-                if idx < self.config.step_priorities.len() {
-                    self.config.step_priorities[idx]
-                } else if p <= prefetch_end {
-                    3
-                } else {
-                    self.config.rest_priority
-                }
-            };
-            gradient[p as usize] = prio;
+            gradient[p as usize] =
+                decide_priority(&self.config, p, p_cur_start, p_cur_end, window_pieces);
         }
 
         Some(gradient)
+    }
+}
+
+/// Piece priority decision for a single piece — pure and unit-testable.
+///
+/// `p_cur_start..=p_cur_end` is the current read range; `window_pieces` is the
+/// access window size in pieces.  Backward pieces within the window get
+/// `backward_priority`, forward pieces descend through `step_priorities` to
+/// `window_edge_priority` at the window edge, and everything beyond the window
+/// gets `rest_priority` (0 = not wanted).
+fn decide_priority(
+    config: &PiecePriorityConfig,
+    p: i32,
+    p_cur_start: i32,
+    p_cur_end: i32,
+    window_pieces: i32,
+) -> i32 {
+    if p < p_cur_start {
+        // Backward region: only pieces within the window behind the read range
+        // stay "wanted"; anything further back is not.
+        if p >= p_cur_start.saturating_sub(window_pieces) {
+            config.backward_priority
+        } else {
+            0
+        }
+    } else if p <= p_cur_end {
+        config.current_priority
+    } else {
+        let dist = p - p_cur_end; // 1-based distance past the current read end.
+        let idx = (dist - 1) as usize;
+        if idx < config.step_priorities.len() {
+            config.step_priorities[idx]
+        } else if p <= p_cur_end.saturating_add(window_pieces) {
+            config.window_edge_priority
+        } else {
+            config.rest_priority
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_priority_is_zero() {
+        assert_eq!(DEFAULT_PRIORITY, 0);
+    }
+
+    #[test]
+    fn default_config_matches_design() {
+        let c = PiecePriorityConfig::default();
+        assert_eq!(c.access_window_mb, 4096);
+        assert_eq!(c.current_priority, 7);
+        assert_eq!(c.step_priorities, [6, 5, 4, 3]);
+        assert_eq!(c.window_edge_priority, 1);
+        assert_eq!(c.rest_priority, 0);
+        assert_eq!(c.backward_priority, 1);
+    }
+
+    #[test]
+    fn forward_gradient_descends_to_edge_then_zero() {
+        let c = PiecePriorityConfig::default();
+        // Current read range: piece 10.  Access window: 8 pieces ahead.
+        let (cur_start, cur_end) = (10, 10);
+        let window_pieces = 8;
+
+        // Current piece is highest.
+        assert_eq!(decide_priority(&c, 10, cur_start, cur_end, window_pieces), 7);
+        // Step priorities for distance 1..=4.
+        assert_eq!(decide_priority(&c, 11, cur_start, cur_end, window_pieces), 6);
+        assert_eq!(decide_priority(&c, 12, cur_start, cur_end, window_pieces), 5);
+        assert_eq!(decide_priority(&c, 13, cur_start, cur_end, window_pieces), 4);
+        assert_eq!(decide_priority(&c, 14, cur_start, cur_end, window_pieces), 3);
+        // Remainder of the window sits at the edge priority.
+        assert_eq!(decide_priority(&c, 15, cur_start, cur_end, window_pieces), 1);
+        assert_eq!(decide_priority(&c, 18, cur_start, cur_end, window_pieces), 1);
+        // Beyond the window: not wanted.
+        assert_eq!(decide_priority(&c, 19, cur_start, cur_end, window_pieces), 0);
+    }
+
+    #[test]
+    fn backward_priority_is_gated_by_window() {
+        let c = PiecePriorityConfig::default();
+        let (cur_start, cur_end) = (10, 10);
+        let window_pieces = 8;
+
+        // Within the window behind the read range: wanted (1).
+        assert_eq!(decide_priority(&c, 9, cur_start, cur_end, window_pieces), 1);
+        assert_eq!(decide_priority(&c, 2, cur_start, cur_end, window_pieces), 1);
+        // Further back than the window: not wanted (0).
+        assert_eq!(decide_priority(&c, 1, cur_start, cur_end, window_pieces), 0);
+        assert_eq!(decide_priority(&c, 0, cur_start, cur_end, window_pieces), 0);
+    }
+
+    #[test]
+    fn from_toml_defaults_and_overrides() {
+        // Empty section → every field falls back to the default.
+        let d = PiecePriorityConfig::from_toml(&PiecePriorityToml::default());
+        assert_eq!(d.access_window_mb, 4096);
+        assert_eq!(d.rest_priority, 0);
+        assert_eq!(d.backward_priority, 1);
+
+        // Partial override: only the specified fields change.
+        let partial = PiecePriorityToml {
+            access_window_mb: Some(2048),
+            current_priority: None,
+            step_priorities: None,
+            window_edge_priority: None,
+            rest_priority: None,
+            backward_priority: None,
+        };
+        let p = PiecePriorityConfig::from_toml(&partial);
+        assert_eq!(p.access_window_mb, 2048);
+        assert_eq!(p.current_priority, 7);
+        assert_eq!(p.step_priorities, [6, 5, 4, 3]);
+
+        // Full override.
+        let full = PiecePriorityToml {
+            access_window_mb: Some(512),
+            current_priority: Some(8),
+            step_priorities: Some([7, 6, 5, 4]),
+            window_edge_priority: Some(2),
+            rest_priority: Some(1),
+            backward_priority: Some(2),
+        };
+        let f = PiecePriorityConfig::from_toml(&full);
+        assert_eq!(f.access_window_mb, 512);
+        assert_eq!(f.current_priority, 8);
+        assert_eq!(f.step_priorities, [7, 6, 5, 4]);
+        assert_eq!(f.window_edge_priority, 2);
+        assert_eq!(f.rest_priority, 1);
+        assert_eq!(f.backward_priority, 2);
     }
 }

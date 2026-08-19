@@ -124,7 +124,7 @@ impl DownloadEngine {
             1024 * 1024 * 1024,
         )?));
         let store = PieceStore::new(cache_manager.clone());
-        let scheduler = PieceScheduler::new(PiecePriorityConfig::default());
+        let scheduler = PieceScheduler::new(PiecePriorityConfig::from_toml(&config.piece_priority));
 
         let read_timeout_secs = config
             .timeouts
