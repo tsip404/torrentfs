@@ -457,6 +457,31 @@ impl CacheManager {
         self.verified_piece_keys.contains(piece_key)
     }
 
+    /// All piece keys present in cache metadata but not yet marked verified.
+    /// These are candidates for background SHA-1 verification after a restart
+    /// (TSI-2199): pieces discovered by `scan_pieces_subdirectory` that may be
+    /// complete, or may be incomplete/corrupt files left by a crash.
+    pub fn unverified_pieces(&self) -> Vec<String> {
+        self.metadata
+            .keys()
+            .filter(|key| !self.verified_piece_keys.contains(*key))
+            .cloned()
+            .collect()
+    }
+
+    /// Mark a piece as verified after its on-disk content passed SHA-1
+    /// verification against the torrent's expected piece hash (TSI-2199).
+    pub fn mark_verified(&mut self, piece_key: &str) {
+        self.verified_piece_keys.insert(piece_key.to_string());
+    }
+
+    /// Delete a piece from the cache (metadata + on-disk file + verified set).
+    /// Used to purge pieces that failed SHA-1 verification so they can be
+    /// re-downloaded on demand (TSI-2199).
+    pub fn delete_piece(&mut self, piece_key: &str) -> TorrentResult<()> {
+        self.remove_piece(piece_key)
+    }
+
     /// Check if a piece file exists on disk, regardless of whether it is
     /// registered in the in-memory metadata. This is critical for the case
     /// where libtorrent's custom storage has written a piece to disk but the
@@ -607,6 +632,75 @@ mod tests {
         let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
 
         assert!(cache.has_piece("def456:piece:0"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unverified_pieces_mark_verified_and_delete() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Simulate a piece file left on disk from a previous run (no add_piece,
+        // so it is discovered by scan_pieces_subdirectory on restart).
+        let piece_key = "cafe1234:piece:3";
+        {
+            let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+            let piece_path = cache.ensure_piece_dir(piece_key)?;
+            std::fs::write(&piece_path, vec![0xABu8; 100])?;
+        }
+
+        // Restart: the scanned piece is registered but NOT verified.
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+        assert!(cache.has_piece(piece_key));
+        assert!(!cache.is_piece_verified(piece_key));
+        assert_eq!(cache.unverified_pieces(), vec![piece_key.to_string()]);
+
+        // Mark verified after a (hypothetical) successful SHA-1 check.
+        cache.mark_verified(piece_key);
+        assert!(cache.is_piece_verified(piece_key));
+        assert!(cache.unverified_pieces().is_empty());
+
+        // A corrupted piece is purged: metadata, file and verified flag all go.
+        cache.delete_piece(piece_key)?;
+        assert!(!cache.has_piece(piece_key));
+        assert!(!cache.has_piece_on_disk(piece_key));
+        assert!(!cache.is_piece_verified(piece_key));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_piece_removes_file_and_metadata() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "beef5678:piece:1";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+        std::fs::write(&piece_path, vec![0u8; 10])?;
+        cache.add_piece(piece_key, 10)?;
+        assert!(cache.is_piece_verified(piece_key));
+
+        cache.delete_piece(piece_key)?;
+
+        assert!(!cache.has_piece(piece_key));
+        assert!(!piece_path.exists());
+        assert!(!cache.is_piece_verified(piece_key));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_piece_marks_verified() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "deadbeef:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+        std::fs::write(&piece_path, vec![0u8; 20])?;
+        cache.add_piece(piece_key, 20)?;
+
+        assert!(cache.is_piece_verified(piece_key));
+        assert!(cache.unverified_pieces().is_empty());
 
         Ok(())
     }

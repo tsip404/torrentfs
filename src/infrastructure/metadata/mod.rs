@@ -202,6 +202,30 @@ impl TorrentInfo {
         }
     }
 
+    /// The expected SHA-1 hash of the piece at `piece_index`.
+    /// Returns `None` when the index is out of range or the torrent has no
+    /// SHA-1 piece hashes (e.g. v2-only torrents).
+    pub fn hash_for_piece(&self, piece_index: i32) -> Option<[u8; 20]> {
+        if piece_index < 0 {
+            return None;
+        }
+        let mut hash = [0u8; 20];
+        // SAFETY: `self.inner` is a valid handle; `hash` is a stack-allocated
+        // 20-byte buffer that the FFI call writes into on success.
+        let result = unsafe {
+            libtorrent_sys::lt_torrent_info_hash_for_piece(
+                self.inner,
+                piece_index,
+                hash.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            None
+        } else {
+            Some(hash)
+        }
+    }
+
     pub fn metadata(&self) -> TorrentResult<TorrentMetadata> {
         Ok(TorrentMetadata {
             name: self.name(),

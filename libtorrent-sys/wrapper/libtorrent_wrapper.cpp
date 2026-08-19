@@ -228,6 +228,20 @@ int lt_torrent_info_get_info_hash(lt_torrent_info_t info, uint8_t* hash_out) {
     return 0;
 }
 
+int lt_torrent_info_hash_for_piece(lt_torrent_info_t info, int piece_index, uint8_t* hash_out) {
+    if (!info || !hash_out || piece_index < 0) return -1;
+    try {
+        auto ti = static_cast<lt::torrent_info*>(info);
+        if (piece_index >= ti->num_pieces()) return -1;
+        auto h = ti->hash_for_piece(lt::piece_index_t(piece_index));
+        if (h.is_all_zeros()) return -1;
+        std::memcpy(hash_out, h.data(), 20);
+        return 0;
+    } catch (const std::exception&) {
+        return -1;
+    }
+}
+
 lt_torrent_metadata_t* lt_torrent_info_get_metadata(lt_torrent_info_t info) {
     if (!info) return nullptr;
 
