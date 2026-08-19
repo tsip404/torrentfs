@@ -560,6 +560,8 @@ impl EngineState {
                 start_piece,
                 end_piece,
                 piece_length,
+                num_pieces,
+                total_size,
                 absolute_offset,
                 end_offset,
                 size,
@@ -695,6 +697,8 @@ impl EngineState {
             start_piece,
             end_piece,
             piece_length,
+            num_pieces,
+            total_size,
             absolute_offset,
             end_offset,
             size,
@@ -741,11 +745,13 @@ impl EngineState {
     }
 
     fn read_from_disk(
-        &self,
+        &mut self,
         info_hash: &str,
         start_piece: i32,
         end_piece: i32,
         piece_length: u64,
+        num_pieces: i32,
+        total_size: u64,
         absolute_offset: u64,
         end_offset: u64,
         size: u32,
@@ -771,6 +777,15 @@ impl EngineState {
                     )));
                 }
                 continue;
+            }
+            // TSI-2225: the piece is being served from the local disk. If it is
+            // not yet registered in the cache metadata (e.g. it was downloaded
+            // eagerly by the access-window prefetch rather than through this
+            // read's piece-wait loop), register it now so `pieces_on_disk` and
+            // restart scans treat it as a complete, verified piece instead of
+            // forcing a re-download that can time out with EIO.
+            if !self.store.has_piece(info_hash, piece_idx) {
+                self.register_piece(info_hash, piece_idx, piece_length, num_pieces, total_size);
             }
             if let Some(seeding) = &self.seeding {
                 if let Err(e) = seeding.mark_piece_available(info_hash, piece_idx) {
