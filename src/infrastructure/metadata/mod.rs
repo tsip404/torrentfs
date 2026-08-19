@@ -226,6 +226,34 @@ impl TorrentInfo {
         }
     }
 
+    /// The on-disk byte length of the piece at `piece_index`: `piece_length`
+    /// for every piece except the last, which is the trailing remainder of
+    /// `total_size`. Returns `None` when the index is out of range.
+    ///
+    /// Used by the background cache verification (TSI-2199 / TSI-2222) to
+    /// distinguish an incomplete/crash-interrupted piece (wrong size → leave
+    /// it unverified for on-demand re-download) from a complete piece whose
+    /// SHA-1 must still be checked.
+    pub fn piece_size(&self, piece_index: i32) -> Option<u64> {
+        let num_pieces = self.num_pieces() as i32;
+        if piece_index < 0 || piece_index >= num_pieces {
+            return None;
+        }
+        let piece_length = self.piece_length() as u64;
+        if piece_index == num_pieces - 1 {
+            let remainder = self
+                .total_size()
+                .saturating_sub((num_pieces - 1) as u64 * piece_length);
+            Some(if remainder > 0 {
+                remainder
+            } else {
+                piece_length
+            })
+        } else {
+            Some(piece_length)
+        }
+    }
+
     pub fn metadata(&self) -> TorrentResult<TorrentMetadata> {
         Ok(TorrentMetadata {
             name: self.name(),
@@ -274,6 +302,57 @@ mod tests {
         let tmp = create_test_torrent();
         let result = TorrentInfo::from_file(tmp.path());
         assert!(result.is_err());
+    }
+
+    /// Build a minimal single-file bencoded torrent with `total` bytes of
+    /// content and `piece_length`-byte pieces, returning the raw torrent bytes.
+    fn build_test_torrent(total: usize, piece_length: usize) -> Vec<u8> {
+        let content = (0..total).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+        let mut pieces = Vec::new();
+        for chunk in content.chunks(piece_length) {
+            use sha1_smol::Sha1;
+            pieces.extend_from_slice(&Sha1::from(chunk).digest().bytes());
+        }
+        let mut t = Vec::new();
+        t.push(b'd');
+        t.extend_from_slice(b"4:infod");
+        t.extend_from_slice(b"6:lengthi");
+        t.extend_from_slice(total.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"4:name4:test");
+        t.extend_from_slice(b"12:piece lengthi");
+        t.extend_from_slice(piece_length.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"6:pieces");
+        t.extend_from_slice(pieces.len().to_string().as_bytes());
+        t.push(b':');
+        t.extend_from_slice(&pieces);
+        t.extend_from_slice(b"ee");
+        t
+    }
+
+    #[test]
+    fn test_piece_size_matches_piece_length_and_last_remainder() {
+        // 40 bytes total, 16-byte pieces -> pieces 0..2 with sizes 16, 16, 8.
+        let torrent = build_test_torrent(40, 16);
+        let info = TorrentInfo::from_bytes(torrent).expect("parse valid torrent");
+
+        assert_eq!(info.piece_size(0), Some(16));
+        assert_eq!(info.piece_size(1), Some(16));
+        assert_eq!(info.piece_size(2), Some(8));
+        assert_eq!(info.piece_size(3), None);
+        assert_eq!(info.piece_size(-1), None);
+    }
+
+    #[test]
+    fn test_piece_size_exact_multiple_uses_full_piece_length() {
+        // 32 bytes total, 16-byte pieces -> pieces 0..2 with sizes 16, 16.
+        let torrent = build_test_torrent(32, 16);
+        let info = TorrentInfo::from_bytes(torrent).expect("parse valid torrent");
+
+        assert_eq!(info.piece_size(0), Some(16));
+        assert_eq!(info.piece_size(1), Some(16));
+        assert_eq!(info.piece_size(2), None);
     }
 
     #[test]

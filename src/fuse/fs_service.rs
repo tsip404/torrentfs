@@ -1437,18 +1437,33 @@ fn spawn_cache_verification(
                     }
                 };
 
-                let expected = match infos_by_hash.get(info_hash) {
-                    Some(info) => match info.hash_for_piece(piece_index) {
-                        Some(h) => h,
-                        None => {
-                            // v2-only torrent or out-of-range index: no SHA-1 to
-                            // check against; leave the piece untouched.
-                            skipped += 1;
-                            continue;
-                        }
-                    },
+                let info = match infos_by_hash.get(info_hash) {
+                    Some(info) => info,
                     None => {
                         // Torrent no longer present in the DB: leave untouched.
+                        skipped += 1;
+                        continue;
+                    }
+                };
+
+                let expected = match info.hash_for_piece(piece_index) {
+                    Some(h) => h,
+                    None => {
+                        // v2-only torrent or out-of-range index: no SHA-1 to
+                        // check against; leave the piece untouched.
+                        skipped += 1;
+                        continue;
+                    }
+                };
+
+                // Expected on-disk size for this piece. Used to distinguish a
+                // complete piece (exact size) from a crash-interrupted /
+                // incomplete write (short or padded file), which must not be
+                // purged — it is simply left unverified so the next read
+                // re-downloads it on demand.
+                let expected_size = match info.piece_size(piece_index) {
+                    Some(s) => s,
+                    None => {
                         skipped += 1;
                         continue;
                     }
@@ -1464,8 +1479,8 @@ fn spawn_cache_verification(
                     }
                 };
 
-                let data = match std::fs::read(&path) {
-                    Ok(d) => d,
+                let file_size = match std::fs::metadata(&path) {
+                    Ok(m) => m.len(),
                     Err(_) => {
                         // Metadata references a file that no longer exists:
                         // purge the stale entry so it can be re-downloaded.
@@ -1478,6 +1493,32 @@ fn spawn_cache_verification(
                     }
                 };
 
+                if file_size != expected_size {
+                    // Incomplete/partial piece left by an interrupted write.
+                    // Keep the file but leave it unverified: the next read will
+                    // re-download it (overwriting the short file), after which
+                    // register_piece marks it verified again.
+                    warn!(
+                        "Cached piece has wrong size ({} != {}), leaving unverified: {}",
+                        file_size, expected_size, piece_key
+                    );
+                    skipped += 1;
+                    continue;
+                }
+
+                let data = match std::fs::read(&path) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        // File vanished between the size check and the read.
+                        // Purge the stale entry rather than hashing empty data.
+                        warn!("Cached piece file disappeared, purging: {}", piece_key);
+                        if let Ok(mut c) = cache.lock() {
+                            let _ = c.delete_piece(&piece_key);
+                        }
+                        purged += 1;
+                        continue;
+                    }
+                };
                 let actual = Sha1::from(&data[..]).digest().bytes();
                 if actual == expected {
                     if let Ok(mut c) = cache.lock() {
