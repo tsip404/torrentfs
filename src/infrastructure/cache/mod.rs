@@ -481,6 +481,75 @@ impl CacheManager {
     pub fn delete_piece(&mut self, piece_key: &str) -> TorrentResult<()> {
         self.remove_piece(piece_key)
     }
+    /// Remove every cached piece belonging to `info_hash`: recursively delete
+    /// the `cache/pieces/<info_hash>/` directory and purge all matching
+    /// metadata entries.  Used when a torrent is deleted so its pieces do not
+    /// linger as orphans (TSI-2205).
+    pub fn remove_infohash_pieces(&mut self, info_hash: &str) -> TorrentResult<()> {
+        // Defensive guard: only ever touch a leaf directory whose name is
+        // literally this info_hash.  A path with separators (e.g. `../x`)
+        // would change the leaf name and is refused, so this can never escape
+        // the pieces directory.
+        if info_hash.is_empty() {
+            tracing::warn!("Refusing to purge pieces for empty info_hash");
+            return Ok(());
+        }
+
+        let pieces_dir = self.cache_dir.join("pieces").join(info_hash);
+        let dir_name = pieces_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if dir_name != info_hash {
+            tracing::warn!(
+                "Refusing to purge pieces dir {} (expected leaf name {})",
+                pieces_dir.display(),
+                info_hash
+            );
+            return Ok(());
+        }
+
+        if pieces_dir.exists() {
+            if !pieces_dir.is_dir() {
+                tracing::warn!(
+                    "Refusing to purge non-directory pieces path {}",
+                    pieces_dir.display()
+                );
+                return Ok(());
+            }
+
+            let removed_size = self.infohash_total_size(info_hash);
+            fs::remove_dir_all(&pieces_dir).map_err(|e| {
+                TorrentError::IoError(format!(
+                    "Failed to remove pieces directory {}: {}",
+                    pieces_dir.display(),
+                    e
+                ))
+            })?;
+            self.current_size = self.current_size.saturating_sub(removed_size);
+        }
+
+        self.remove_infohash_metadata(info_hash);
+        self.save_metadata_file()
+    }
+
+    /// Sum of registered piece sizes for a given info_hash.
+    fn infohash_total_size(&self, info_hash: &str) -> u64 {
+        let prefix = format!("{}:", info_hash);
+        self.metadata
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, meta)| meta.size)
+            .sum()
+    }
+
+    /// Drop metadata + verified-set entries for a given info_hash.
+    fn remove_infohash_metadata(&mut self, info_hash: &str) {
+        let prefix = format!("{}:", info_hash);
+        self.metadata.retain(|key, _| !key.starts_with(&prefix));
+        self.verified_piece_keys
+            .retain(|key| !key.starts_with(&prefix));
+    }
 
     /// Check if a piece file exists on disk, regardless of whether it is
     /// registered in the in-memory metadata. This is critical for the case
@@ -685,6 +754,58 @@ mod tests {
         assert!(!cache.has_piece(piece_key));
         assert!(!piece_path.exists());
         assert!(!cache.is_piece_verified(piece_key));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_infohash_pieces_purges_dir_and_metadata() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let key_a = "aaaa1111:piece:0";
+        let key_b = "bbbb2222:piece:0";
+        let path_a = cache.ensure_piece_dir(key_a)?;
+        let path_b = cache.ensure_piece_dir(key_b)?;
+        std::fs::write(&path_a, vec![0u8; 100])?;
+        std::fs::write(&path_b, vec![0u8; 50])?;
+        cache.add_piece(key_a, 100)?;
+        cache.add_piece(key_b, 50)?;
+        assert_eq!(cache.current_size(), 150);
+
+        cache.remove_infohash_pieces("aaaa1111")?;
+
+        assert!(!cache.has_piece(key_a));
+        assert!(!path_a.exists());
+        assert!(!path_a.parent().unwrap().exists());
+        assert!(!cache.is_piece_verified(key_a));
+
+        // A different info_hash must be left untouched.
+        assert!(cache.has_piece(key_b));
+        assert!(path_b.exists());
+        assert!(cache.is_piece_verified(key_b));
+        assert_eq!(cache.current_size(), 50);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remove_infohash_pieces_idempotent_and_refuses_escape() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        // No pieces for this hash: a no-op, not an error.
+        cache.remove_infohash_pieces("missing_hash")?;
+
+        // A path with separators must be refused and never resolved against a
+        // parent directory.
+        let outside = temp_dir.path().join("outside.txt");
+        std::fs::write(&outside, b"keep me")?;
+
+        cache.remove_infohash_pieces("../outside.txt")?;
+
+        assert!(outside.exists());
+        assert!(!temp_dir.path().join("outside").exists());
 
         Ok(())
     }
