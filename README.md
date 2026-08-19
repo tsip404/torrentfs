@@ -51,7 +51,7 @@ mount --make-shared /host/torrentfs
 
 ### Rootless podman
 
-Rootless podman **does not support shared mount propagation** (`rshared`). This is a fundamental limitation of user namespaces — the container cannot create mount events that propagate to the host.
+Rootless podman **does not support shared mount propagation** (`shared`/`rshared`). This is a fundamental limitation of user namespaces — the container runs in a private mount namespace and cannot create mount events that propagate to the host. `--privileged` does **not** change this: in rootless mode it only grants capabilities inside the user namespace, which still cannot touch the host mount namespace.
 
 **What works**: torrentfs mounts and operates correctly inside the container. Use `podman exec` to access the filesystem:
 
@@ -64,9 +64,17 @@ podman run -d --name torrentfs \
 podman exec torrentfs ls /mnt/metadata/
 ```
 
-**What does not work**: the host cannot access the FUSE mount through a bind-mounted directory. If you need host-visible FUSE mounts:
+**What does not work**: the host cannot access the FUSE mount (including `data/`) through a bind-mounted directory — a `-v /host/dir:/mnt:shared` (or `:rshared`) volume has no effect on the host side under rootless podman. For host-visible FUSE mounts, use a rootful runtime:
 
-- Use rootful podman (`sudo podman run ...`) or Docker
-- Run torrentfs directly on the host without a container
+```bash
+# Rootful podman (Docker uses the same flags)
+sudo podman run -d --name torrentfs \
+  --device /dev/fuse \
+  --cap-add SYS_ADMIN \
+  --mount type=bind,source=/host/torrentfs,target=/mnt,bind-propagation=rshared \
+  ghcr.io/tsip404/torrentfs
+```
+
+Prepare `/host/torrentfs` as a shared mount first (see Quick Start above), or run torrentfs directly on the host without a container.
 
 The entrypoint automatically detects rootless podman and runs in container-only mode, skipping the unsupported bind mount step.
