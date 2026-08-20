@@ -596,17 +596,51 @@ impl FsService {
                 name,
                 ..
             }) => {
+                // TSI-2233: FUSE hands us `offset: i64`. A negative offset
+                // casts to a huge `usize` and a super-large offset makes
+                // `Vec::resize` attempt a multi-GB allocation (OOM/abort on
+                // the FUSE dispatch thread), while `offset + data.len()` can
+                // overflow and the subsequent slice `panic`. Validate before
+                // any allocation: reject negatives, cap the post-write size
+                // at MAX_TORRENT_SIZE (the only writable inodes are .torrent
+                // buffers), and use checked arithmetic for the end offset.
+                if offset < 0 {
+                    warn!("write to {} with negative offset {}", name, offset);
+                    return Err(FsError::InvalidArgument);
+                }
                 let offset = offset as usize;
+
+                let end = match offset.checked_add(data.len()) {
+                    Some(e) => e,
+                    None => {
+                        return Err(FsError::FileTooLarge(format!(
+                            "{}: write at offset {} + {} bytes overflows usize",
+                            name,
+                            offset,
+                            data.len()
+                        )));
+                    }
+                };
+
+                if end > MAX_TORRENT_SIZE {
+                    warn!(
+                        "write to {} would grow file to {} bytes (limit {})",
+                        name, end, MAX_TORRENT_SIZE
+                    );
+                    return Err(FsError::FileTooLarge(format!(
+                        "{} exceeds {} bytes",
+                        name, MAX_TORRENT_SIZE
+                    )));
+                }
 
                 if offset > file_data.len() {
                     file_data.resize(offset, 0);
                 }
-
-                if offset + data.len() > file_data.len() {
-                    file_data.resize(offset + data.len(), 0);
+                if end > file_data.len() {
+                    file_data.resize(end, 0);
                 }
 
-                file_data[offset..offset + data.len()].copy_from_slice(data);
+                file_data[offset..end].copy_from_slice(data);
 
                 info!("Wrote {} bytes to file {}", data.len(), name);
                 Ok(data.len() as u32)
@@ -1770,6 +1804,127 @@ mod tests {
         let data_file_ino = DATA_FILE_INO_BASE + 1;
         let err = svc.write(data_file_ino, 0, b"x").unwrap_err();
         assert_eq!(err, FsError::ReadOnlyFileSystem);
+    }
+
+    /// Helper: create an empty writable `.torrent` inode via the public
+    /// `create()` path (not direct `inodes` manipulation) and return its
+    /// ino. Using the real path keeps the test honest about the
+    /// `InodeData::File` layout without duplicating its constructor.
+    fn writable_file_ino(svc: &mut FsService, name: &str) -> u64 {
+        svc.create(METADATA_INO, name)
+            .expect("create writable file")
+            .attr
+            .ino
+    }
+
+    /// TSI-2233: a negative offset must be rejected before any allocation
+    /// rather than cast to a huge `usize` and fed to `Vec::resize` (OOM).
+    #[test]
+    fn write_rejects_negative_offset() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "f.torrent");
+        let err = svc.write(ino, -1, b"x").unwrap_err();
+        assert_eq!(err, FsError::InvalidArgument);
+        // No partial allocation: the file is still empty.
+        assert_eq!(
+            svc.inode_mgr.inodes.get(&ino).and_then(|d| match d {
+                InodeData::File { data, .. } => Some(data.len()),
+                _ => None,
+            }),
+            Some(0)
+        );
+    }
+
+    /// TSI-2233: an offset that would grow the buffer past MAX_TORRENT_SIZE
+    /// is rejected with `FileTooLarge` (→ EFBIG) instead of allocating.
+    #[test]
+    fn write_rejects_offset_beyond_max_size() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "big.torrent");
+        let over = MAX_TORRENT_SIZE as i64 + 1;
+        let err = svc.write(ino, over, b"x").unwrap_err();
+        assert!(matches!(err, FsError::FileTooLarge(_)));
+        // Buffer untouched.
+        assert!(svc
+            .inode_mgr
+            .inodes
+            .get(&ino)
+            .and_then(|d| match d {
+                InodeData::File { data, .. } => Some(data.is_empty()),
+                _ => None,
+            })
+            .unwrap());
+    }
+
+    /// TSI-2233: `offset + data.len()` exceeding `MAX_TORRENT_SIZE` (even
+    /// when offset alone is within bounds) is rejected, not silently capped.
+    #[test]
+    fn write_rejects_end_beyond_max_size() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "edge.torrent");
+        // Offset alone is within the limit, but offset + 2 pushes end past
+        // it — no pre-seeded data needed.
+        let base = MAX_TORRENT_SIZE - 1;
+        let err = svc.write(ino, base as i64, b"xy").unwrap_err();
+        assert!(matches!(err, FsError::FileTooLarge(_)));
+    }
+
+    /// TSI-2233: a write whose `end` lands exactly on MAX_TORRENT_SIZE is
+    /// allowed (the guard uses strict `>`, mirroring `flush`'s `>`). This
+    /// is the positive boundary the reject tests hover around.
+    #[test]
+    fn write_at_exact_max_size_is_allowed() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "max.torrent");
+        // MAX_TORRENT_SIZE bytes from offset 0 → end == MAX_TORRENT_SIZE.
+        let payload = vec![0u8; MAX_TORRENT_SIZE];
+        let n = svc.write(ino, 0, &payload).expect("write at limit");
+        assert_eq!(n, MAX_TORRENT_SIZE as u32);
+        assert_eq!(
+            svc.inode_mgr.inodes.get(&ino).and_then(|d| match d {
+                InodeData::File { data, .. } => Some(data.len()),
+                _ => None,
+            }),
+            Some(MAX_TORRENT_SIZE)
+        );
+    }
+
+    /// TSI-2233: a normal write at a positive offset still works and grows
+    /// the buffer with a zero gap (regression guard for the guard logic).
+    #[test]
+    fn write_at_positive_offset_grows_with_gap() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "gap.torrent");
+        let n = svc.write(ino, 4, b"AB").expect("write ok");
+        assert_eq!(n, 2);
+        let data = svc.inode_mgr.inodes.get(&ino).and_then(|d| match d {
+            InodeData::File { data, .. } => Some(data.clone()),
+            _ => None,
+        });
+        assert_eq!(data.as_deref(), Some(b"\0\0\0\0AB".as_slice()));
+    }
+
+    /// TSI-2233: a huge positive offset (would cast to a multi-GB `usize`
+    /// and trigger a runaway `Vec::resize`) is rejected by the size cap
+    /// before any allocation. This is the local-DoS vector the guard closes.
+    #[test]
+    fn write_rejects_huge_positive_offset() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "big.torrent");
+        // Far beyond MAX_TORRENT_SIZE but still a valid positive i64.
+        let huge = MAX_TORRENT_SIZE as i64 * 2;
+        let err = svc.write(ino, huge, b"x").unwrap_err();
+        assert!(matches!(err, FsError::FileTooLarge(_)));
+        // No allocation happened.
+        assert!(svc
+            .inode_mgr
+            .inodes
+            .get(&ino)
+            .and_then(|d| match d {
+                InodeData::File { data, .. } => Some(data.is_empty()),
+                _ => None,
+            })
+            .unwrap());
     }
 
     #[test]
