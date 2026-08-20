@@ -24,8 +24,8 @@ use crate::db::Database;
 use crate::domain::fs_error::{FsError, FsResult};
 use crate::infrastructure::metrics::Metrics;
 use crate::metadata::TorrentInfo;
-use crate::services::download::DownloadService;
 use crate::seeding::SeedingManager;
+use crate::services::download::DownloadService;
 use crate::services::seeding::SeedingService;
 use crate::services::torrent::TorrentService;
 
@@ -45,7 +45,7 @@ pub struct FsService {
     pub inode_mgr: InodeManager,
     pub db: Option<Arc<Mutex<Database>>>,
     pub torrent_service: Option<TorrentService>,
-    pub processing_torrents: Arc<Mutex<HashMap<String, ()>>>,
+    pub processing_torrents: Arc<Mutex<HashMap<(String, String), ()>>>,
     pub download_service: Option<Arc<DownloadService>>,
     pub seeding_manager: Option<Arc<SeedingManager>>,
     pub torrent_data_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
@@ -81,7 +81,10 @@ impl FsService {
                     Some(sm)
                 }
                 Err(e) => {
-                    warn!("SeedingService initialization failed; seeding disabled: {:?}", e);
+                    warn!(
+                        "SeedingService initialization failed; seeding disabled: {:?}",
+                        e
+                    );
                     None
                 }
             },
@@ -691,41 +694,67 @@ impl FsService {
                     }
 
                     let source_path = self.inode_mgr.extract_source_path(parent);
+                    let dedup_key = (source_path.clone(), name.clone());
 
-                    let mut processing = self.processing_torrents.lock().map_err(|e| {
-                        error!("Mutex poisoned in release(): {}", e);
-                        FsError::LockPoisoned
-                    })?;
+                    // TSI-2247: Dedup guard — check + insert atomically, then
+                    // DROP the lock before spawning background work.  The key
+                    // is `(source_path, filename)` so that torrents in the
+                    // same directory (especially the root, where
+                    // `source_path` is `""`) don't collide.  The previous
+                    // code held `processing_torrents` during the entire
+                    // `add_torrent` call (DB insert + handle creation),
+                    // blocking the single-threaded FUSE dispatch loop.  Now
+                    // `add_torrent` runs on a detached thread so `release`
+                    // never blocks the dispatcher.
+                    {
+                        let mut processing = self.processing_torrents.lock().map_err(|e| {
+                            error!("Mutex poisoned in release(): {}", e);
+                            FsError::LockPoisoned
+                        })?;
 
-                    if processing.contains_key(&source_path) {
-                        warn!(
-                            "Torrent at source_path '{}' already being processed, skipping",
-                            source_path
-                        );
-                        return Ok(());
-                    }
-                    processing.insert(source_path.clone(), ());
-
-                    // Keep the processing lock held during add_torrent to
-                    // prevent concurrent releases on the same source_path from
-                    // racing on the database insert (TSI-2072).
-                    if let Some(ref ts) = self.torrent_service {
-                        match ts.add_torrent(&data, &source_path, &name) {
-                            Ok(()) => {
-                                info!("Successfully processed torrent: {}", name);
-                                processing.remove(&source_path);
-                            }
-                            Err(e) => {
-                                error!("Failed to process torrent {}: {}", name, e);
-                                processing.remove(&source_path);
-                            }
+                        if processing.contains_key(&dedup_key) {
+                            warn!(
+                                "Torrent at '{}{}' already being processed, skipping",
+                                source_path, name
+                            );
+                            return Ok(());
                         }
+                        processing.insert(dedup_key.clone(), ());
+                    }
+                    // Lock released here.
+
+                    // The inode is NOT removed here: if the background
+                    // `add_torrent` fails, the file must remain visible so
+                    // the user can retry or delete it.  On success the
+                    // DB-backed entry supersedes this inode (lookup queries
+                    // the DB), so keeping it is harmless — this mirrors the
+                    // pre-TSI-2247 behavior.
+                    if let Some(ts) = &self.torrent_service {
+                        let ts = ts.clone();
+                        let processing = self.processing_torrents.clone();
+                        let key = dedup_key.clone();
+                        let fname = name.clone();
+                        std::thread::spawn(move || {
+                            match ts.add_torrent(&data, &source_path, &name) {
+                                Ok(()) => {
+                                    info!("Successfully processed torrent: {}", fname);
+                                }
+                                Err(e) => {
+                                    error!("Failed to process torrent {}: {}", fname, e);
+                                }
+                            }
+                            if let Ok(mut guard) = processing.lock() {
+                                guard.remove(&key);
+                            }
+                        });
                     } else {
                         info!(
                             "Torrent {} received (no DB configured, skipping insert)",
                             name
                         );
-                        processing.remove(&source_path);
+                        if let Ok(mut guard) = self.processing_torrents.lock() {
+                            guard.remove(&dedup_key);
+                        }
                     }
                 }
             }
@@ -907,7 +936,7 @@ impl FsService {
                                 error!("Mutex poisoned in unlink() processing_torrents: {}", e);
                                 FsError::LockPoisoned
                             })?;
-                            processing.remove(&source_path);
+                            processing.remove(&(source_path.clone(), filename.clone()));
                             drop(processing);
 
                             let mut cache = self.torrent_data_cache.lock().map_err(|e| {
@@ -1885,7 +1914,10 @@ mod tests {
             },
         );
         let outcome = svc.open(ino).expect("open data file");
-        assert!(outcome.direct_io, "data torrent file must request direct_io");
+        assert!(
+            outcome.direct_io,
+            "data torrent file must request direct_io"
+        );
         assert_ne!(outcome.fh, 0, "data torrent file must get a real fh");
     }
 
@@ -1916,10 +1948,7 @@ mod tests {
         let mut svc = bare_service();
         // STATS_INO is the global `.stats` file.
         let outcome = svc.open(STATS_INO).expect("open stats");
-        assert!(
-            !outcome.direct_io,
-            "stats file must not request direct_io"
-        );
+        assert!(!outcome.direct_io, "stats file must not request direct_io");
     }
 
     #[test]
@@ -2100,5 +2129,185 @@ mod tests {
             matches!(outcome, VerifyOutcome::Skipped),
             "wrong-size piece should be skipped"
         );
+    }
+
+    // ── TSI-2247: release must not block the FUSE dispatch thread ─────────
+
+    /// Build a service backed by an in-memory DB + TorrentService so
+    /// `release` can exercise the full add_torrent path.
+    fn service_with_db() -> FsService {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let db_arc = Arc::new(Mutex::new(db));
+        let metrics = Arc::new(Metrics::new());
+        FsService {
+            inode_mgr: InodeManager::new(Duration::from_secs(0)),
+            db: Some(db_arc.clone()),
+            torrent_service: Some(TorrentService::new(db_arc, None, None)),
+            processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            download_service: None,
+            seeding_manager: None,
+            torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
+            torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
+            listen_addr: String::new(),
+            metrics,
+        }
+    }
+
+    /// Create a writable `.torrent` inode via the public `create()` path and
+    /// return its (ino, fh).
+    fn create_torrent_file(svc: &mut FsService, name: &str) -> (u64, u64) {
+        let created = svc.create(METADATA_INO, name).expect("create file");
+        (created.attr.ino, created.fh)
+    }
+
+    /// TSI-2247: Closing an empty `.torrent` file must hit the fast path —
+    /// `release` returns `Ok(())` immediately without touching
+    /// `processing_torrents` or the DB.
+    #[test]
+    fn release_empty_torrent_is_fast_path() {
+        let mut svc = service_with_db();
+        let (ino, fh) = create_torrent_file(&mut svc, "empty.torrent");
+
+        // release must succeed instantly — no DB insert, no background spawn.
+        svc.release(fh).expect("release ok");
+
+        // Inode is removed.
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+        // processing_torrents is untouched (empty).
+        assert!(svc.processing_torrents.lock().unwrap().is_empty());
+    }
+
+    /// TSI-2247: Closing a `.torrent` with invalid (non-parseable) data must
+    /// also hit the fast path — no DB insert, no background spawn.
+    #[test]
+    fn release_invalid_torrent_is_fast_path() {
+        let mut svc = service_with_db();
+        let (ino, fh) = create_torrent_file(&mut svc, "bad.torrent");
+        // Write garbage that is non-empty but not a valid torrent.
+        svc.write(ino, 0, b"not a torrent").expect("write ok");
+
+        svc.release(fh).expect("release ok");
+
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+        assert!(svc.processing_torrents.lock().unwrap().is_empty());
+    }
+
+    /// TSI-2247: Closing a valid `.torrent` file must NOT block the caller.
+    /// `add_torrent` runs on a background thread; `release` returns `Ok(())`
+    /// immediately.  The `processing_torrents` entry is cleaned up by the
+    /// background thread after the DB insert completes, and the torrent is
+    /// persisted in the DB.
+    #[test]
+    fn release_valid_torrent_returns_immediately() {
+        let mut svc = service_with_db();
+        let (ino, fh) = create_torrent_file(&mut svc, "valid.torrent");
+        let data = minimal_torrent_bytes();
+        svc.write(ino, 0, &data).expect("write ok");
+
+        // release should return instantly — the DB insert is deferred to a
+        // background thread.
+        let start = std::time::Instant::now();
+        svc.release(fh).expect("release ok");
+        let elapsed = start.elapsed();
+
+        // Even an in-memory DB insert takes < 1s; the point is that
+        // release itself does not wait for it.  Allow generous slack
+        // for CI scheduling jitter.
+        assert!(
+            elapsed.as_secs() < 5,
+            "release took {:?} — should be near-instant",
+            elapsed
+        );
+
+        // Inode is NOT removed (data integrity: if add_torrent fails, the
+        // file must remain visible to the user).
+        assert!(svc.inode_mgr.inodes.contains_key(&ino));
+
+        // Wait for the background thread to finish and clean up
+        // processing_torrents.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if svc.processing_torrents.lock().unwrap().is_empty() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("processing_torrents not cleaned up after 10s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Verify the torrent was persisted to the DB by the background thread.
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        let torrent = db_guard
+            .get_torrent_by_filename_and_source_path("valid.torrent", "")
+            .expect("db query");
+        assert!(torrent.is_some(), "torrent should be in DB after release");
+        assert_eq!(torrent.unwrap().filename, "valid.torrent");
+    }
+
+    /// TSI-2247: `processing_torrents` is NOT held during `add_torrent` —
+    /// the lock is released before the background thread is spawned.  Two
+    /// `.torrent` files in the root directory (both `source_path == ""`)
+    /// must both be processed and persisted — the dedup key is
+    /// `(source_path, filename)`, so they don't collide.
+    #[test]
+    fn release_does_not_hold_processing_lock_during_add() {
+        let mut svc = service_with_db();
+        let (ino1, fh1) = create_torrent_file(&mut svc, "a.torrent");
+        let data = minimal_torrent_bytes();
+        svc.write(ino1, 0, &data).expect("write ok");
+        svc.release(fh1).expect("release ok");
+
+        // At this point the background thread for a.torrent may or may not
+        // have finished.  Either way, processing_torrents should be lockable
+        // without blocking (it would be held only briefly by the background
+        // thread's cleanup).  The second release for a *different* file
+        // must succeed immediately — even though both share source_path "".
+        let (ino2, fh2) = create_torrent_file(&mut svc, "b.torrent");
+        svc.write(ino2, 0, &data).expect("write ok");
+
+        let start = std::time::Instant::now();
+        svc.release(fh2).expect("release ok");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 5,
+            "second release took {:?} — should not wait for first",
+            elapsed
+        );
+
+        // Wait for both background threads to finish.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if svc.processing_torrents.lock().unwrap().is_empty() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("processing_torrents not cleaned up after 10s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Both torrents must be in the DB — the tuple dedup key prevents
+        // the second from being skipped as a duplicate of the first.
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        let t1 = db_guard
+            .get_torrent_by_filename_and_source_path("a.torrent", "")
+            .expect("db query");
+        assert!(t1.is_some(), "a.torrent should be in DB");
+        let t2 = db_guard
+            .get_torrent_by_filename_and_source_path("b.torrent", "")
+            .expect("db query");
+        assert!(t2.is_some(), "b.torrent should be in DB");
+    }
+
+    /// TSI-2247: `flush` for an empty `.torrent` returns `EINVAL` (fast
+    /// path — no FFI call to libtorrent).
+    #[test]
+    fn flush_empty_torrent_returns_einval() {
+        let mut svc = service_with_db();
+        let (ino, _fh) = create_torrent_file(&mut svc, "empty.torrent");
+
+        let err = svc.flush(ino).unwrap_err();
+        assert_eq!(err, FsError::InvalidArgument);
     }
 }

@@ -4,8 +4,8 @@
 //! Returns `FsError` (a domain error), never raw errno — the errno mapping is
 //! the FUSE adapter's job. This module does not import `libc`.
 
-use std::sync::{Arc, Mutex};
 use crate::seeding::SeedingManager;
+use std::sync::{Arc, Mutex};
 
 use crate::db::{Database, FileEntry, InsertTorrentResult, TorrentFile};
 use crate::domain::fs_error::{FsError, FsResult};
@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use super::download::DownloadService;
 
 /// TorrentService wraps database operations for torrent lifecycle management.
+#[derive(Clone)]
 pub struct TorrentService {
     db: Arc<Mutex<Database>>,
     download_service: Option<Arc<DownloadService>>,
