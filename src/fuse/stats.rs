@@ -349,6 +349,24 @@ fn piece_progress(pieces: &[PieceStatus]) -> f64 {
     cached as f64 / pieces.len() as f64
 }
 
+/// Compute downloaded bytes from actual cached pieces.
+///
+/// libtorrent's `status.total_done` is unreliable under the custom
+/// `PieceStorageDiskIO` backend for the same reason as `progress`
+/// (see [`piece_progress`]): the piece bitmap is never fed back to
+/// libtorrent, so `total_done` stays at 0 even after pieces are cached.
+///
+/// This helper recomputes the downloaded byte count from the
+/// **authoritative** piece availability (`is_cached`), so `.stats` shows
+/// non-zero Downloaded once pieces are cached (TSI-2227).
+fn piece_downloaded(pieces: &[PieceStatus], piece_length: u64) -> u64 {
+    if pieces.is_empty() || piece_length == 0 {
+        return 0;
+    }
+    let cached = pieces.iter().filter(|p| p.is_cached).count() as u64;
+    cached * piece_length
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Generate global stats (no per-torrent details, no per-infohash cache breakdown).
@@ -470,7 +488,14 @@ pub fn generate_torrent_stats(
         0.0
     };
 
-    // -- Status --
+    // Override libtorrent's total_done with piece-availability-based bytes.
+    // Same root cause as progress (TSI-2223): status.total_done stays 0
+    // under the custom storage backend. Recompute from cached pieces
+    // (TSI-2227).
+    let total_done = piece_statuses
+        .as_ref()
+        .map(|(piece_length, pieces)| piece_downloaded(pieces, *piece_length))
+        .unwrap_or(total_done);
     output.push_str("-- Status --\n");
     output.push_str(&format!("  Name: {}\n", t.name));
     output.push_str(&format!(
@@ -592,13 +617,23 @@ pub fn generate_directory_stats(
             .as_ref()
             .and_then(|ds| ds.try_query_torrent_status(&t.info_hash))
         {
-            total_done += status.total_done;
             total_upload += status.total_upload as u64;
             total_download += status.total_download as u64;
             aggregate_dl_rate += status.download_rate;
             aggregate_ul_rate += status.upload_rate;
             aggregate_peers += status.num_peers;
             aggregate_seeds += status.num_seeds;
+        }
+
+        // Override libtorrent's total_done with piece-availability-based
+        // bytes. Same root cause as progress (TSI-2223): status.total_done
+        // stays 0 under the custom storage backend. Recompute from cached
+        // pieces (TSI-2227).
+        if let Some((piece_length, pieces)) = download_service
+            .as_ref()
+            .and_then(|ds| ds.try_get_pieces_status(&t.info_hash))
+        {
+            total_done += piece_downloaded(&pieces, piece_length);
         }
     }
 
@@ -1224,5 +1259,83 @@ mod tests {
         let text = String::from_utf8_lossy(&stats);
         // Empty path shows "No torrents found" not section headers
         assert!(text.contains("No torrents found"));
+    }
+
+    #[test]
+    fn test_piece_downloaded_empty() {
+        assert_eq!(piece_downloaded(&[], 16384), 0);
+    }
+
+    #[test]
+    fn test_piece_downloaded_zero_piece_length() {
+        let pieces = vec![PieceStatus {
+            priority: 0,
+            is_cached: true,
+            hit_count: 0,
+        }];
+        assert_eq!(piece_downloaded(&pieces, 0), 0);
+    }
+
+    #[test]
+    fn test_piece_downloaded_none_cached() {
+        let pieces = vec![
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 3,
+                is_cached: false,
+                hit_count: 0,
+            },
+        ];
+        assert_eq!(piece_downloaded(&pieces, 16384), 0);
+    }
+
+    #[test]
+    fn test_piece_downloaded_all_cached() {
+        let pieces = vec![
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 2,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 0,
+            },
+        ];
+        // 2 pieces × 16384 bytes = 32768
+        assert_eq!(piece_downloaded(&pieces, 16384), 32768);
+    }
+
+    #[test]
+    fn test_piece_downloaded_partial() {
+        // 1 of 4 cached, piece_length 262144 → 262144 bytes downloaded
+        let pieces = vec![
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 1,
+            },
+            PieceStatus {
+                priority: 3,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
+        ];
+        assert_eq!(piece_downloaded(&pieces, 262144), 262144);
     }
 }
