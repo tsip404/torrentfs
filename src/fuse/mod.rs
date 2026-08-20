@@ -26,13 +26,13 @@ use std::time::Instant;
 use std::time::{Duration, UNIX_EPOCH};
 
 use fuser::{
+    consts::FOPEN_DIRECT_IO,
     Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use tracing::warn;
-
 pub use self::fs_service::FsService;
-use self::fs_types::{Attr, FileKind, ReadOutcome, StatsKind};
+use self::fs_types::{Attr, FileKind, OpenOutcome, ReadOutcome, StatsKind};
 pub use self::worker_pool::WorkerPool;
 
 use crate::cache::CacheManager;
@@ -459,7 +459,14 @@ impl Filesystem for TorrentFs {
 
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
         match self.service.open(ino) {
-            Ok(fh) => reply.opened(fh, 0),
+            Ok(OpenOutcome { fh, direct_io }) => {
+                // TSI-2246: data/ torrent files set direct_io so the kernel
+                // bypasses its page cache; otherwise `filemap_read_folio`
+                // converts any failed read into EIO, masking the daemon's
+                // real errno (e.g. ENODATA for "no seeder").
+                let flags = if direct_io { FOPEN_DIRECT_IO } else { 0 };
+                reply.opened(fh, flags);
+            }
             Err(e) => reply.error(e.into()),
         }
     }
