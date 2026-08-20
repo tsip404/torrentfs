@@ -25,6 +25,7 @@ use crate::domain::fs_error::{FsError, FsResult};
 use crate::infrastructure::metrics::Metrics;
 use crate::metadata::TorrentInfo;
 use crate::services::download::DownloadService;
+use crate::seeding::SeedingManager;
 use crate::services::seeding::SeedingService;
 use crate::services::torrent::TorrentService;
 
@@ -46,6 +47,7 @@ pub struct FsService {
     pub torrent_service: Option<TorrentService>,
     pub processing_torrents: Arc<Mutex<HashMap<String, ()>>>,
     pub download_service: Option<Arc<DownloadService>>,
+    pub seeding_manager: Option<Arc<SeedingManager>>,
     pub torrent_data_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub torrent_info_cache: Arc<Mutex<HashMap<String, Arc<TorrentInfo>>>>,
     pub listen_addr: String,
@@ -67,13 +69,24 @@ impl FsService {
                 .ok()
                 .map(Arc::new);
 
-        // Register SeedingManager as eviction callback on the DownloadService's CacheManager.
-        if let Some(ref ds) = download_service {
-            if let Ok(seeding_svc) = SeedingService::new(&cache_path, config) {
-                ds.register_seeding_callback(seeding_svc.get_seeding_manager());
-                info!("SeedingManager registered as CacheManager eviction callback");
-            }
-        }
+        // Create the SeedingManager and register it as the CacheManager
+        // eviction callback.  The Arc is kept on FsService so it can be
+        // shared with TorrentService for seed removal on unlink (TSI-2232).
+        let seeding_manager = match &download_service {
+            Some(ds) => match SeedingService::new(&cache_path, config) {
+                Ok(seeding_svc) => {
+                    let sm = seeding_svc.get_seeding_manager();
+                    ds.register_seeding_callback(sm.clone());
+                    info!("SeedingManager registered as CacheManager eviction callback");
+                    Some(sm)
+                }
+                Err(e) => {
+                    warn!("SeedingService initialization failed; seeding disabled: {:?}", e);
+                    None
+                }
+            },
+            None => None,
+        };
 
         let creation_time = Duration::from_secs(
             std::time::SystemTime::now()
@@ -93,6 +106,7 @@ impl FsService {
             torrent_service: None,
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             download_service,
+            seeding_manager,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
             torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
             listen_addr,
@@ -130,6 +144,7 @@ impl FsService {
         svc.torrent_service = Some(TorrentService::new(
             db_arc.clone(),
             svc.download_service.clone(),
+            svc.seeding_manager.clone(),
         ));
         svc.db = Some(db_arc);
         svc.inode_mgr.restore_metadata_inodes(dirs, torrents);
@@ -1694,9 +1709,10 @@ mod tests {
         let svc = FsService {
             inode_mgr: InodeManager::new(Duration::from_secs(0)),
             db: Some(db_arc.clone()),
-            torrent_service: Some(TorrentService::new(db_arc, None)),
+            torrent_service: Some(TorrentService::new(db_arc, None, None)),
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             download_service: None,
+            seeding_manager: None,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
             torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
             listen_addr: String::new(),
@@ -1750,6 +1766,7 @@ mod tests {
             torrent_service: None,
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             download_service: None,
+            seeding_manager: None,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
             torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
             listen_addr: String::new(),

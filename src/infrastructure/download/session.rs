@@ -199,7 +199,10 @@ impl Session {
         }
     }
 
-    #[allow(dead_code)]
+    /// Remove a torrent from the session.  The C++ wrapper (`lt_session_remove_torrent`)
+    /// deletes the underlying `lt::torrent_handle*`, so we must prevent Rust's
+    /// `TorrentHandle::Drop` from calling `lt_torrent_handle_destroy` on the
+    /// same pointer — otherwise double-free (TSI-2232).
     pub fn remove_torrent(&mut self, handle: TorrentHandle, remove_files: bool) {
         unsafe {
             libtorrent_sys::lt_session_remove_torrent(
@@ -208,6 +211,8 @@ impl Session {
                 if remove_files { 1 } else { 0 },
             );
         }
+        // The C++ side has freed the handle pointer; skip Rust's Drop.
+        std::mem::forget(handle);
     }
 
     pub(crate) fn inner(&self) -> libtorrent_sys::lt_session_t {

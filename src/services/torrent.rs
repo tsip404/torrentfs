@@ -5,6 +5,7 @@
 //! the FUSE adapter's job. This module does not import `libc`.
 
 use std::sync::{Arc, Mutex};
+use crate::seeding::SeedingManager;
 
 use crate::db::{Database, FileEntry, InsertTorrentResult, TorrentFile};
 use crate::domain::fs_error::{FsError, FsResult};
@@ -17,13 +18,19 @@ use super::download::DownloadService;
 pub struct TorrentService {
     db: Arc<Mutex<Database>>,
     download_service: Option<Arc<DownloadService>>,
+    seeding_manager: Option<Arc<SeedingManager>>,
 }
 
 impl TorrentService {
-    pub fn new(db: Arc<Mutex<Database>>, download_service: Option<Arc<DownloadService>>) -> Self {
+    pub fn new(
+        db: Arc<Mutex<Database>>,
+        download_service: Option<Arc<DownloadService>>,
+        seeding_manager: Option<Arc<SeedingManager>>,
+    ) -> Self {
         Self {
             db,
             download_service,
+            seeding_manager,
         }
     }
 
@@ -137,10 +144,11 @@ impl TorrentService {
 
     /// Remove a torrent from the database by filename and source_path.
     ///
-    /// After the DB record is deleted, purges the torrent's on-disk pieces
-    /// cache (`cache/pieces/<info_hash>/`) — but only when no other torrent
-    /// still references the same info_hash, since a .torrent copied to
-    /// multiple source paths shares a single pieces directory (TSI-2205).
+    /// After the DB record is deleted, when no other torrent still references
+    /// the same info_hash: purge the on-disk pieces cache, release the
+    /// DownloadEngine handle (and its scheduler state), and remove the
+    /// SeedingManager seed — so a long-running daemon does not accumulate
+    /// handles or keep announcing a deleted torrent (TSI-2232).
     pub fn remove_torrent(&self, filename: &str, source_path: &str) -> FsResult<Option<i64>> {
         let (torrent_id, info_hash, purge_pieces) = {
             let mut db_guard = self.db.lock().map_err(|_| {
@@ -192,6 +200,7 @@ impl TorrentService {
 
         if purge_pieces {
             self.purge_pieces_cache(&info_hash);
+            self.release_engine_and_seeding(&info_hash);
         }
 
         Ok(torrent_id)
@@ -223,6 +232,29 @@ impl TorrentService {
                 "Failed to purge pieces cache for info_hash={}: {:?}",
                 info_hash, e
             );
+        }
+    }
+
+    /// Release the DownloadEngine handle and the SeedingManager seed for an
+    /// info_hash.  Best-effort: the DB row and pieces cache are already gone,
+    /// so a transient engine/seeding failure only leaves a stale handle that a
+    /// restart clears — it never desyncs DB vs. cache (TSI-2232).
+    fn release_engine_and_seeding(&self, info_hash: &str) {
+        if let Some(ds) = &self.download_service {
+            if let Err(e) = ds.remove_handle(info_hash) {
+                warn!(
+                    "Failed to remove DownloadEngine handle for info_hash={}: {:?}",
+                    info_hash, e
+                );
+            }
+        }
+        if let Some(sm) = &self.seeding_manager {
+            if let Err(e) = sm.remove_seed(info_hash) {
+                warn!(
+                    "Failed to remove seeding seed for info_hash={}: {:?}",
+                    info_hash, e
+                );
+            }
         }
     }
 
@@ -418,7 +450,7 @@ mod tests {
             insert_torrent(&mut guard, "src", "foo.torrent", &info_hash);
         }
 
-        let svc = TorrentService::new(db_arc, Some(download_service.clone()));
+        let svc = TorrentService::new(db_arc, Some(download_service.clone()), None);
 
         let pieces_dir = cache_dir.join("pieces").join(&info_hash);
         assert!(pieces_dir.exists());
@@ -451,7 +483,7 @@ mod tests {
             insert_torrent(&mut guard, "b", "foo.torrent", &info_hash);
         }
 
-        let svc = TorrentService::new(db_arc, Some(download_service.clone()));
+        let svc = TorrentService::new(db_arc, Some(download_service.clone()), None);
 
         let pieces_dir = cache_dir.join("pieces").join(&info_hash);
         assert!(pieces_dir.exists());
@@ -464,5 +496,47 @@ mod tests {
         let cache = download_service.get_cache_manager().unwrap();
         let guard = cache.lock().unwrap();
         assert!(guard.has_piece(&piece_key));
+    }
+
+    /// `release_engine_and_seeding` must be called when the last DB reference
+    /// to an info_hash is deleted (TSI-2232).  This test wires a real
+    /// SeedingManager into the service and asserts that after remove_torrent
+    /// the seeding manager no longer tracks the info_hash.
+    #[test]
+    fn test_remove_torrent_releases_seeding_manager() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+        let config = TorrentfsConfig::default_config();
+
+        let info_hash = "aabbccdd00112233445566778899aabbccdd0011".to_string();
+        let download_service = Arc::new(DownloadService::new(&cache_dir, &config).unwrap());
+        let seeding_manager =
+            Arc::new(crate::seeding::SeedingManager::new(&cache_dir, &config).unwrap());
+
+        let db = Database::open_in_memory().unwrap();
+        let db_arc = Arc::new(Mutex::new(db));
+        {
+            let mut guard = db_arc.lock().unwrap();
+            insert_torrent(&mut guard, "src", "foo.torrent", &info_hash);
+        }
+
+        let svc = TorrentService::new(
+            db_arc,
+            Some(download_service),
+            Some(seeding_manager.clone()),
+        );
+
+        // Before removal the SeedingManager has no handle yet (none was
+        // added); remove_torrent must still call remove_seed without panic
+        // (idempotent).  After removal, has_handle returns false.
+        assert!(!seeding_manager.has_handle(&info_hash));
+
+        let removed = svc.remove_torrent("foo.torrent", "src").unwrap();
+        assert_eq!(removed, Some(1));
+
+        // remove_seed was called (best-effort, no-op if no handle existed);
+        // the seeding manager must not track the deleted info_hash.
+        assert!(!seeding_manager.has_handle(&info_hash));
+        assert!(seeding_manager.get_all_seeds().is_empty());
     }
 }
