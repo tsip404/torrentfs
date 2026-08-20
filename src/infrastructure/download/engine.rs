@@ -576,6 +576,13 @@ impl EngineState {
                 tracing::warn!("read_file_range: reader_added failed: {:?}", e);
             }
         }
+        // Publish the snapshot immediately so `.stats` reflects the elevated
+        // piece priorities while this read is in progress (TSI-2224).  Without
+        // this, `publish_snapshot` only runs in the engine loop between
+        // commands — but this handler blocks the engine thread until the read
+        // completes, by which point `release_reader` has already reset all
+        // priorities to 0, so `.stats` always saw an all-`[]` Pieces grid.
+        self.publish_snapshot();
 
         // ── Fast path: all pieces available locally ────────────────────
         if self.all_pieces_local(&info_hash, start_piece, end_piece, piece_length, num_pieces, total_size) {
@@ -711,6 +718,10 @@ impl EngineState {
                         progress
                     )));
                 }
+
+                // Refresh the snapshot so `.stats` shows pieces becoming
+                // cached and priority changes during long reads (TSI-2224).
+                self.publish_snapshot();
 
                 std::thread::sleep(Duration::from_millis(200));
             }

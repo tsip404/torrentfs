@@ -939,6 +939,27 @@ mod tests {
     }
 
     #[test]
+    fn test_piece_grid_shows_priority_during_active_read() {
+        // TSI-2224: during an active read, pieces with elevated priority
+        // (not yet cached) must render as `[N]`, not `[]`.  The bug was that
+        // the snapshot never captured elevated priorities, so every piece
+        // showed `[]`.  This test locks the `piece_marker` rendering contract
+        // the fix depends on: non-cached + priority > 0 → `[N]`.
+        let grid = vec![
+            // Cached, no accesses → `[x]`
+            PieceStatus { priority: 0, is_cached: true, hit_count: 0 },
+            // Active read target, not cached, priority 7 → `[7]`
+            PieceStatus { priority: 7, is_cached: false, hit_count: 0 },
+            // Prefetch edge, not cached, priority 1 → `[1]`
+            PieceStatus { priority: 1, is_cached: false, hit_count: 0 },
+            // Outside window, not cached, priority 0 → `[]`
+            PieceStatus { priority: 0, is_cached: false, hit_count: 0 },
+        ];
+        let rendered: String = grid.iter().map(piece_marker).collect();
+        assert_eq!(rendered, "[x][7][1][]");
+    }
+
+    #[test]
     fn test_global_stats_header_present() {
         let stats = generate_global_stats(
             Duration::from_secs(0),
