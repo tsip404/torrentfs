@@ -150,8 +150,7 @@ impl FsService {
                         if let Err(e) = ds.ensure_handle_lightweight(info) {
                             warn!(
                                 "Failed to restore lightweight handle for torrent '{}': {:?}",
-                                name,
-                                e
+                                name, e
                             );
                         }
                     }
@@ -1489,31 +1488,10 @@ fn spawn_cache_verification(
                     }
                 };
 
-                let expected = match info.hash_for_piece(piece_index) {
-                    Some(h) => h,
-                    None => {
-                        // v2-only torrent or out-of-range index: no SHA-1 to
-                        // check against; leave the piece untouched.
-                        skipped += 1;
-                        continue;
-                    }
-                };
-
-                // Expected on-disk size for this piece. Used to distinguish a
-                // complete piece (exact size) from a crash-interrupted /
-                // incomplete write (short or padded file), which must not be
-                // purged — it is simply left unverified so the next read
-                // re-downloads it on demand.
-                let expected_size = match info.piece_size(piece_index) {
-                    Some(s) => s,
-                    None => {
-                        skipped += 1;
-                        continue;
-                    }
-                };
-
-                // Resolve the on-disk path without holding the cache lock during
-                // the file I/O, so active reads are not blocked.
+                // Resolve the on-disk path inside a brief lock, then do all
+                // file I/O lock-free so active reads (PieceStore /
+                // DownloadService / .stats — all take the same cache mutex)
+                // are never blocked by the verification thread.
                 let path = match cache.lock() {
                     Ok(c) => c.piece_path(&piece_key),
                     Err(_) => {
@@ -1522,61 +1500,24 @@ fn spawn_cache_verification(
                     }
                 };
 
-                let file_size = match std::fs::metadata(&path) {
-                    Ok(m) => m.len(),
-                    Err(_) => {
-                        // Metadata references a file that no longer exists:
-                        // purge the stale entry so it can be re-downloaded.
-                        warn!("Cached piece file missing, purging: {}", piece_key);
+                let outcome = verify_single_piece(&path, piece_index, info, &piece_key);
+
+                match outcome {
+                    VerifyOutcome::Verified => {
+                        if let Ok(mut c) = cache.lock() {
+                            c.mark_verified(&piece_key);
+                        }
+                        verified += 1;
+                    }
+                    VerifyOutcome::Purged => {
                         if let Ok(mut c) = cache.lock() {
                             let _ = c.delete_piece(&piece_key);
                         }
                         purged += 1;
-                        continue;
                     }
-                };
-
-                if file_size != expected_size {
-                    // Incomplete/partial piece left by an interrupted write.
-                    // Keep the file but leave it unverified: the next read will
-                    // re-download it (overwriting the short file), after which
-                    // register_piece marks it verified again.
-                    warn!(
-                        "Cached piece has wrong size ({} != {}), leaving unverified: {}",
-                        file_size, expected_size, piece_key
-                    );
-                    skipped += 1;
-                    continue;
-                }
-
-                let data = match std::fs::read(&path) {
-                    Ok(d) => d,
-                    Err(_) => {
-                        // File vanished between the size check and the read.
-                        // Purge the stale entry rather than hashing empty data.
-                        warn!("Cached piece file disappeared, purging: {}", piece_key);
-                        if let Ok(mut c) = cache.lock() {
-                            let _ = c.delete_piece(&piece_key);
-                        }
-                        purged += 1;
-                        continue;
+                    VerifyOutcome::Skipped => {
+                        skipped += 1;
                     }
-                };
-                let actual = Sha1::from(&data[..]).digest().bytes();
-                if actual == expected {
-                    if let Ok(mut c) = cache.lock() {
-                        c.mark_verified(&piece_key);
-                    }
-                    verified += 1;
-                } else {
-                    warn!(
-                        "Cached piece failed SHA-1 verification, purging: {}",
-                        piece_key
-                    );
-                    if let Ok(mut c) = cache.lock() {
-                        let _ = c.delete_piece(&piece_key);
-                    }
-                    purged += 1;
                 }
             }
 
@@ -1591,6 +1532,83 @@ fn spawn_cache_verification(
     }
 }
 
+/// Outcome of verifying a single cached piece.
+enum VerifyOutcome {
+    Verified,
+    Purged,
+    Skipped,
+}
+
+/// Verify a single on-disk cached piece against its expected SHA-1 hash.
+///
+/// Pure file I/O — no cache lock is held.  The caller resolves the on-disk
+/// `path` (and `piece_index`) from the piece key inside a brief lock, then
+/// calls this function lock-free.  The caller is responsible for applying
+/// the side effect (mark verified / delete piece).
+fn verify_single_piece(
+    path: &std::path::Path,
+    piece_index: i32,
+    info: &TorrentInfo,
+    piece_key: &str,
+) -> VerifyOutcome {
+    let expected = match info.hash_for_piece(piece_index) {
+        Some(h) => h,
+        None => return VerifyOutcome::Skipped,
+    };
+    let expected_size = match info.piece_size(piece_index) {
+        Some(s) => s,
+        None => return VerifyOutcome::Skipped,
+    };
+
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => {
+            warn!("Cached piece file missing, purging: {}", piece_key);
+            return VerifyOutcome::Purged;
+        }
+    };
+
+    let file_size = meta.len();
+    if file_size != expected_size {
+        warn!(
+            "Cached piece has wrong size ({} != {}), leaving unverified: {}",
+            file_size, expected_size, piece_key
+        );
+        return VerifyOutcome::Skipped;
+    }
+
+    // TSI-2229: a piece file may have the correct *logical* size but still be
+    // incomplete — `write_piece` writes blocks at arbitrary offsets, and a
+    // crash between block writes leaves a sparse file whose zero-filled gaps
+    // make st_size match piece_length while the physical allocation is smaller.
+    // Treat it like a wrong-size piece (leave unverified) instead of purging.
+    if is_sparse_file(&meta, file_size) {
+        warn!(
+            "Cached piece is sparse (partial write), leaving unverified: {}",
+            piece_key
+        );
+        return VerifyOutcome::Skipped;
+    }
+
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => {
+            warn!("Cached piece file disappeared, purging: {}", piece_key);
+            return VerifyOutcome::Purged;
+        }
+    };
+    let actual = Sha1::from(&data[..]).digest().bytes();
+    if actual == expected {
+        VerifyOutcome::Verified
+    } else {
+        warn!(
+            "Cached piece failed SHA-1 verification, purging: {}",
+            piece_key
+        );
+        VerifyOutcome::Purged
+    }
+}
+
 /// Split a piece key of the form `{info_hash}:piece:{index}` into its parts.
 fn split_piece_key(key: &str) -> Option<(&str, i32)> {
     let mut parts = key.split(':');
@@ -1600,6 +1618,31 @@ fn split_piece_key(key: &str) -> Option<(&str, i32)> {
     }
     let index = parts.next()?.parse::<i32>().ok()?;
     Some((info_hash, index))
+}
+
+/// Whether a piece file is *sparse* — its physical disk allocation is smaller
+/// than its logical size.
+///
+/// `write_piece` writes blocks at arbitrary offsets via `seekp`; a crash
+/// between block writes leaves a file whose `st_size` matches the expected
+/// piece length but whose interior has zero-filled gaps (the filesystem does
+/// not allocate blocks for the unwritten regions). Such a file is not a
+/// complete piece even though its logical size is correct.
+///
+/// Comparing `st_blocks * 512` (physical) against `st_size` (logical) detects
+/// this condition. A fully-written all-zero piece also appears sparse, but
+/// leaving it unverified is harmless — the next read re-downloads it,
+/// `register_piece` marks it verified, and no data is lost.
+///
+/// Takes the already-fetched `Metadata` so the caller avoids a duplicate
+/// `stat` syscall (one per piece — significant at 987+ pieces).
+fn is_sparse_file(meta: &std::fs::Metadata, logical_size: u64) -> bool {
+    if logical_size == 0 {
+        return false;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let physical = meta.blocks() * 512;
+    physical < logical_size
 }
 
 #[cfg(test)]
@@ -1859,6 +1902,186 @@ mod tests {
         assert!(
             !outcome.direct_io,
             "stats file must not request direct_io"
+        );
+    }
+
+    #[test]
+    fn is_sparse_file_detects_sparse_partial_write() {
+        // Simulate a partial multi-block piece write: create a file with the
+        // right logical size but a zero-filled gap (sparse hole) by seeking
+        // past the start before writing the trailing block.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse_piece");
+        use std::io::{Seek, Write};
+        let mut file = std::fs::File::create(&path).unwrap();
+        // Write 16 KiB at offset 256 KiB — the file's logical size becomes
+        // 256 KiB + 16 KiB, but bytes 0..256 KiB are a sparse hole.
+        file.seek(std::io::SeekFrom::Start(256 * 1024)).unwrap();
+        file.write_all(&vec![0xABu8; 16 * 1024]).unwrap();
+        drop(file);
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 256 * 1024 + 16 * 1024);
+        assert!(
+            is_sparse_file(&meta, meta.len()),
+            "file with a sparse hole must be detected as sparse"
+        );
+    }
+
+    #[test]
+    fn is_sparse_file_false_for_complete_file() {
+        // A fully-written (non-sparse) file must not be flagged as sparse.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("complete_piece");
+        std::fs::write(&path, vec![0xCDu8; 262_144]).unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 262_144);
+        assert!(
+            !is_sparse_file(&meta, meta.len()),
+            "fully-written file must not be detected as sparse"
+        );
+    }
+
+    #[test]
+    fn is_sparse_file_false_for_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty_piece");
+        std::fs::write(&path, b"").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(!is_sparse_file(&meta, 0));
+    }
+
+    /// Build a single-file bencoded torrent whose single piece has a known
+    /// SHA-1 hash.  Returns `(torrent_bytes, piece_content, piece_length)`.
+    fn build_single_piece_torrent() -> (Vec<u8>, Vec<u8>, u64) {
+        let piece_length: usize = 16_384;
+        let content = (0..piece_length)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>();
+        let hash = {
+            use sha1_smol::Sha1;
+            Sha1::from(&content).digest().bytes()
+        };
+        let mut t = Vec::new();
+        t.push(b'd');
+        t.extend_from_slice(b"4:infod");
+        t.extend_from_slice(b"6:lengthi");
+        t.extend_from_slice(content.len().to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"4:name4:test");
+        t.extend_from_slice(b"12:piece lengthi");
+        t.extend_from_slice(piece_length.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"6:pieces20:");
+        t.extend_from_slice(&hash);
+        t.extend_from_slice(b"ee");
+        (t, content, piece_length as u64)
+    }
+
+    #[test]
+    fn verify_single_piece_sparse_file_is_skipped_not_purged() {
+        let (torrent_bytes, content, piece_length) = build_single_piece_torrent();
+        let info = Arc::new(TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent"));
+        let info_hash = hex::encode(info.info_hash().expect("info hash"));
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create the piece file on disk *before* constructing the
+        // CacheManager so the startup scan registers it as unverified
+        // (exactly like a real restart).
+        let pieces_dir = temp_dir.path().join("pieces").join(&info_hash);
+        std::fs::create_dir_all(&pieces_dir).unwrap();
+        let piece_path = pieces_dir.join(&piece_key);
+
+        // Sparse file: correct logical size but a zero-filled hole at the
+        // start (simulates an interrupted multi-block write where only the
+        // trailing block was flushed to disk).
+        use std::io::{Seek, Write};
+        let mut file = std::fs::File::create(&piece_path).unwrap();
+        let tail_start = piece_length as u64 - 4096;
+        file.seek(std::io::SeekFrom::Start(tail_start)).unwrap();
+        file.write_all(&content[tail_start as usize..]).unwrap();
+        drop(file);
+
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024).unwrap();
+        // Scan registered the piece but left it unverified.
+        assert!(cache.has_piece(&piece_key));
+        assert!(!cache.is_piece_verified(&piece_key));
+
+        // The sparse file must be Skipped, not Purged.
+        let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
+        assert!(
+            matches!(outcome, VerifyOutcome::Skipped),
+            "sparse piece file should be skipped, not purged"
+        );
+        // The piece file must still exist on disk (not deleted).
+        assert!(
+            piece_path.exists(),
+            "skipped piece file must not be deleted"
+        );
+    }
+
+    #[test]
+    fn verify_single_piece_complete_correct_hash_is_verified() {
+        let (torrent_bytes, content, _piece_length) = build_single_piece_torrent();
+        let info = Arc::new(TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent"));
+        let info_hash = hex::encode(info.info_hash().expect("info hash"));
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024).unwrap();
+        let piece_path = cache.ensure_piece_dir(&piece_key).unwrap();
+        std::fs::write(&piece_path, &content).unwrap();
+        cache.add_piece(&piece_key, content.len() as u64).unwrap();
+
+        let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
+        assert!(
+            matches!(outcome, VerifyOutcome::Verified),
+            "complete piece with correct hash should be verified"
+        );
+    }
+
+    #[test]
+    fn verify_single_piece_complete_wrong_hash_is_purged() {
+        let (torrent_bytes, _content, piece_length) = build_single_piece_torrent();
+        let info = Arc::new(TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent"));
+        let info_hash = hex::encode(info.info_hash().expect("info hash"));
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024).unwrap();
+        let piece_path = cache.ensure_piece_dir(&piece_key).unwrap();
+        // Write a complete, non-sparse file with wrong content.
+        std::fs::write(&piece_path, vec![0xFFu8; piece_length as usize]).unwrap();
+        cache.add_piece(&piece_key, piece_length).unwrap();
+
+        let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
+        assert!(
+            matches!(outcome, VerifyOutcome::Purged),
+            "complete non-sparse piece with wrong hash should be purged"
+        );
+    }
+
+    #[test]
+    fn verify_single_piece_wrong_size_is_skipped() {
+        let (torrent_bytes, _content, piece_length) = build_single_piece_torrent();
+        let info = Arc::new(TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent"));
+        let info_hash = hex::encode(info.info_hash().expect("info hash"));
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024).unwrap();
+        let piece_path = cache.ensure_piece_dir(&piece_key).unwrap();
+        // Write a short file (incomplete piece).
+        std::fs::write(&piece_path, vec![0u8; piece_length as usize / 2]).unwrap();
+        cache.add_piece(&piece_key, piece_length / 2).unwrap();
+
+        let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
+        assert!(
+            matches!(outcome, VerifyOutcome::Skipped),
+            "wrong-size piece should be skipped"
         );
     }
 }
