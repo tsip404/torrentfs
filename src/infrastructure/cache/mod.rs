@@ -277,7 +277,13 @@ impl CacheManager {
     pub fn add_piece(&mut self, piece_key: &str, size: u64) -> TorrentResult<()> {
         let now = current_timestamp_ms();
 
-        let is_new = self
+        // TSI-2231: insert returns the previous metadata if the piece_key
+        // already existed (e.g. after restart scan_pieces_subdirectory
+        // already counted the on-disk piece into current_size).  Account
+        // only for the size delta instead of re-adding the full size,
+        // which would inflate current_size and cause premature LRU
+        // eviction of other torrents' valid cache pieces.
+        let prev = self
             .metadata
             .insert(
                 piece_key.to_string(),
@@ -286,19 +292,22 @@ impl CacheManager {
                     size,
                     hit_count: 0,
                 },
-            )
-            .is_none();
+            );
+
+        let is_new = prev.is_none();
 
         if is_new {
             self.miss_count += 1;
         }
+
+        let old_size = prev.map(|m| m.size).unwrap_or(0);
 
         // TSI-2048: mark as verified — add_piece is only called after
         // a successful libtorrent read_piece, which is the authoritative
         // proof of piece completeness.
         self.verified_piece_keys.insert(piece_key.to_string());
 
-        self.current_size += size;
+        self.current_size += size.saturating_sub(old_size);
 
         if self.current_size > self.max_cache_size {
             self.evict_lru()?;
@@ -1238,6 +1247,42 @@ mod tests {
             "piece registered via add_piece should be verified"
         );
         assert_eq!(cache.piece_metadata_size(piece_key), Some(262144));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_piece_re_registration_no_double_count() -> TorrentResult<()> {
+        // TSI-2231: after restart scan_pieces_subdirectory already
+        // counted an on-disk piece into current_size.  When the engine
+        // poll loop re-registers the same piece via add_piece (have ==
+        // true), current_size must not re-add the full size.
+        let temp_dir = TempDir::new().unwrap();
+
+        let piece_key = "tsi2231_redup:piece:0";
+
+        // Phase 1: write the piece file and register it so it lands on
+        // disk + in the metadata file, then drop the manager.
+        {
+            let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+            let piece_path = cache.ensure_piece_dir(piece_key)?;
+            std::fs::write(&piece_path, vec![0u8; 512])?;
+            cache.add_piece(piece_key, 512)?;
+        }
+
+        // Phase 2: restart.  scan_pieces_subdirectory re-counts the
+        // on-disk piece into current_size.
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+        assert_eq!(cache.current_size(), 512);
+
+        // Phase 3: engine poll loop calls add_piece again for the same
+        // have==true piece.  current_size must stay at 512, not 1024.
+        cache.add_piece(piece_key, 512)?;
+        assert_eq!(
+            cache.current_size(),
+            512,
+            "re-registering an existing piece must not double-count"
+        );
 
         Ok(())
     }
