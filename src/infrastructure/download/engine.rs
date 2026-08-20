@@ -68,6 +68,11 @@ pub enum Command {
         seeding: Arc<SeedingManager>,
         reply: SyncSender<()>,
     },
+    /// Remove a torrent handle from the engine session and clear its
+    /// scheduler state.  Used by the unlink/remove path when the last DB
+    /// reference to an info_hash is deleted, so the engine stops
+    /// announcing/seeding a removed torrent (TSI-2232).
+    RemoveHandle { info_hash: String },
     /// Stop the engine thread.
     Shutdown,
 }
@@ -287,6 +292,17 @@ impl DownloadEngine {
         self.send(Command::EnsureHandleAsync { info })
     }
 
+    /// Remove a torrent handle from the engine session and clear its
+    /// scheduler state.  Fire-and-forget: the command is queued and
+    /// executed eventually on the engine thread; this call does not block.
+    /// Safe to call from the FUSE unlink path — it will never stall the
+    /// dispatch loop on a busy engine (TSI-2232).
+    pub fn remove_handle(&self, info_hash: &str) -> TorrentResult<()> {
+        self.send(Command::RemoveHandle {
+            info_hash: info_hash.to_string(),
+        })
+    }
+
     /// Read a file range, driving piece download on the engine thread.
     pub fn read_file_range(
         &self,
@@ -430,6 +446,9 @@ impl EngineState {
                 self.seeding = Some(seeding);
                 let _ = reply.send(());
             }
+            Command::RemoveHandle { info_hash } => {
+                let _ = self.remove_handle(&info_hash);
+            }
             Command::Shutdown => return true,
         }
         false
@@ -461,6 +480,19 @@ impl EngineState {
         self.scheduler
             .init_torrent(&info_hash, num_pieces as i32, piece_length)?;
         self.handles.insert(info_hash, handle);
+        Ok(())
+    }
+
+    /// Remove a torrent handle from the session and clear its scheduler
+    /// state.  Idempotent: a missing info_hash is a no-op.  Called on the
+    /// engine thread when the last DB reference to an info_hash is deleted
+    /// (TSI-2232), so the engine stops announcing/seeding a removed torrent
+    /// and its handle/scheduler entries do not leak across add/remove cycles.
+    fn remove_handle(&mut self, info_hash: &str) -> TorrentResult<()> {
+        if let Some(handle) = self.handles.remove(info_hash) {
+            self.session.remove_torrent(handle, false);
+        }
+        self.scheduler.remove_torrent(info_hash);
         Ok(())
     }
 
