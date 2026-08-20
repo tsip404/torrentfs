@@ -53,9 +53,14 @@ impl DownloadService {
     }
 
     /// Ensure a lightweight handle exists for the given torrent info.
-    /// Uses upload_mode so it never requests pieces automatically.
+    ///
+    /// Fire-and-forget: the handle is created on the engine thread eventually
+    /// (in upload_mode, so no pieces are requested), but this call returns
+    /// immediately.  The FUSE release path depends on this — a torrent write
+    /// must never block the single-threaded FUSE dispatch loop on a busy
+    /// download, and the handle is re-created lazily on first read anyway.
     pub fn ensure_handle_lightweight(&self, info: Arc<TorrentInfo>) -> TorrentResult<()> {
-        self.engine.ensure_handle(info)
+        self.engine.ensure_handle_async(info)
     }
 
     /// Read a range of bytes from a specific file within a torrent.

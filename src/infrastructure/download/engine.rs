@@ -39,6 +39,11 @@ pub enum Command {
         info: Arc<TorrentInfo>,
         reply: SyncSender<TorrentResult<()>>,
     },
+    /// Fire-and-forget variant of [`Command::EnsureHandle`]: the engine
+    /// creates the handle eventually but the sender does not wait for it.
+    /// Used by the FUSE write path (torrent release), which must never block
+    /// the single-threaded FUSE dispatch loop on a busy download.
+    EnsureHandleAsync { info: Arc<TorrentInfo> },
     /// Read a byte range from a file, driving the piece download if needed.
     /// Blocks on the engine thread until the pieces are available.
     ReadFileRange {
@@ -260,10 +265,26 @@ impl DownloadEngine {
     }
 
     /// Ensure a lightweight handle exists for a torrent.
+    ///
+    /// Blocks the caller until the engine thread has created (or found) the
+    /// handle.  Only call this from contexts that may block (tests, the
+    /// engine's own read path); never from the FUSE dispatch loop, where a
+    /// busy download would stall every other filesystem operation.
     pub fn ensure_handle(&self, info: Arc<TorrentInfo>) -> TorrentResult<()> {
         let (tx, rx) = mpsc::sync_channel(1);
         self.send(Command::EnsureHandle { info, reply: tx })?;
         rx.recv().map_err(|_| Self::disconnected())?
+    }
+
+    /// Ensure a lightweight handle exists for a torrent without waiting for
+    /// the engine thread to finish.
+    ///
+    /// The command is queued and executed eventually (the `Arc<TorrentInfo>`
+    /// keeps the metadata alive).  Used by the FUSE release path so a torrent
+    /// write never blocks the single-threaded FUSE dispatch loop on a busy
+    /// download; the handle is created lazily on first read either way.
+    pub fn ensure_handle_async(&self, info: Arc<TorrentInfo>) -> TorrentResult<()> {
+        self.send(Command::EnsureHandleAsync { info })
     }
 
     /// Read a file range, driving piece download on the engine thread.
@@ -382,6 +403,9 @@ impl EngineState {
         match cmd {
             Command::EnsureHandle { info, reply } => {
                 let _ = reply.send(self.ensure_handle(&info));
+            }
+            Command::EnsureHandleAsync { info } => {
+                let _ = self.ensure_handle(&info);
             }
             Command::ReadFileRange {
                 info,
