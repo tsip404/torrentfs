@@ -14,7 +14,7 @@ use thiserror::Error;
 use super::error::TorrentError;
 use super::types::DbError;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq)]
 pub enum FsError {
     // ── path / namespace ──
     #[error("not found")]

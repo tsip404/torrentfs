@@ -33,6 +33,8 @@ use super::inodes::{
     DataInode, InodeData, InodeManager, DATA_DIR_INO_BASE, DATA_INO, DATA_TORRENT_INO_BASE,
     MAX_TORRENT_SIZE, METADATA_INO, NEXT_FH, NEXT_INO, ROOT_INO, STATS_INO,
 };
+#[cfg(test)]
+use super::inodes::{DATA_FILE_INO_BASE, SOURCE_PATH_DIR_INO_BASE};
 use super::lookup::DataResolver;
 use super::stats::{generate_directory_stats, generate_global_stats, generate_torrent_stats};
 
@@ -489,6 +491,9 @@ impl FsService {
     // ── Metadata namespace (.torrent lifecycle) ─────────────────────────────
 
     pub fn mknod(&mut self, parent: u64, name: &str) -> FsResult<Entry> {
+        if InodeManager::is_data_namespace(parent) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
         if !self.inode_mgr.is_metadata_child(parent) {
             return Err(FsError::PermissionDenied);
         }
@@ -524,6 +529,9 @@ impl FsService {
     }
 
     pub fn create(&mut self, parent: u64, name: &str) -> FsResult<Created> {
+        if InodeManager::is_data_namespace(parent) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
         if !self.inode_mgr.is_metadata_child(parent) {
             return Err(FsError::PermissionDenied);
         }
@@ -563,6 +571,14 @@ impl FsService {
 
     pub fn write(&mut self, ino: u64, offset: i64, data: &[u8]) -> FsResult<u32> {
         if ino == STATS_INO || InodeManager::is_stats_ino(ino) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
+
+        // TSI-2228: data/ namespace is read-only. Data inodes live in
+        // `data_inodes`, not `inodes`, so without this guard `write` would
+        // fall through to the `None` arm and return `ENOENT` — the inode
+        // exists, it is just not writable. Return `EROFS` instead.
+        if InodeManager::is_data_namespace(ino) {
             return Err(FsError::ReadOnlyFileSystem);
         }
 
@@ -696,6 +712,9 @@ impl FsService {
     }
 
     pub fn mkdir(&mut self, parent: u64, name: &str) -> FsResult<Attr> {
+        if InodeManager::is_data_namespace(parent) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
         if !self.inode_mgr.is_metadata_child(parent) {
             return Err(FsError::PermissionDenied);
         }
@@ -739,6 +758,9 @@ impl FsService {
     }
 
     pub fn rmdir(&mut self, parent: u64, name: &str) -> FsResult<()> {
+        if InodeManager::is_data_namespace(parent) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
         if !self.inode_mgr.is_metadata_child(parent) {
             return Err(FsError::PermissionDenied);
         }
@@ -798,6 +820,9 @@ impl FsService {
 
     pub fn unlink(&mut self, parent: u64, name: &str) -> FsResult<Option<i64>> {
         let mut removed_id = None;
+        if InodeManager::is_data_namespace(parent) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
         if !self.inode_mgr.is_metadata_child(parent) {
             return Err(FsError::PermissionDenied);
         }
@@ -908,6 +933,15 @@ impl FsService {
         newparent: u64,
         newname: &str,
     ) -> FsResult<()> {
+        // TSI-2228: data/ is a read-only namespace — renames into or out
+        // of it must return `EROFS`, not `ENOENT` or `EPERM`. Check this
+        // before parent existence: an inode number in the data range is
+        // inherently read-only, regardless of whether it is currently
+        // materialised.
+        if InodeManager::is_data_namespace(parent) || InodeManager::is_data_namespace(newparent) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
+
         // Check parent existence in both inodes and data_inodes tables.
         let parent_exists = self.inode_mgr.inodes.contains_key(&parent)
             || self.inode_mgr.data_inodes.contains_key(&parent);
@@ -1651,5 +1685,117 @@ mod tests {
         assert_eq!(split_piece_key("abc:piece:x"), None);
         assert_eq!(split_piece_key("abc"), None);
         assert_eq!(split_piece_key(""), None);
+    }
+
+    /// TSI-2228: Bare service without any torrents — sufficient for testing
+    /// that mutating operations on the read-only `data/` namespace return
+    /// `EROFS` (`ReadOnlyFileSystem`), not `ENOENT` or `EACCES`.
+    fn bare_service() -> FsService {
+        let metrics = Arc::new(Metrics::new());
+        FsService {
+            inode_mgr: InodeManager::new(Duration::from_secs(0)),
+            db: None,
+            torrent_service: None,
+            processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            download_service: None,
+            torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
+            torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
+            listen_addr: String::new(),
+            metrics,
+        }
+    }
+
+    #[test]
+    fn data_namespace_write_returns_erofs() {
+        let mut svc = bare_service();
+        // DATA_INO (the `data/` root) is a directory → would be EISDIR
+        // without the read-only guard, but the guard fires first.
+        let err = svc.write(DATA_INO, 0, b"x").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        // A data file inode (not in `inodes`, only in `data_inodes`) would
+        // previously fall through to the `None` arm → `NotFound` → ENOENT.
+        let data_file_ino = DATA_FILE_INO_BASE + 1;
+        let err = svc.write(data_file_ino, 0, b"x").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+    }
+
+    #[test]
+    fn data_namespace_create_mknod_mkdir_return_erofs() {
+        let mut svc = bare_service();
+
+        let err = svc.create(DATA_INO, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        let err = svc.mknod(DATA_INO, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        let err = svc.mkdir(DATA_INO, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        // A nested data inode as parent.
+        let data_dir_ino = DATA_DIR_INO_BASE + 5;
+        let err = svc.mkdir(data_dir_ino, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+    }
+
+    #[test]
+    fn data_namespace_unlink_rmdir_return_erofs() {
+        let mut svc = bare_service();
+
+        let err = svc.unlink(DATA_INO, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        let err = svc.rmdir(DATA_INO, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        let data_dir_ino = DATA_DIR_INO_BASE + 5;
+        let err = svc.unlink(data_dir_ino, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+        let err = svc.rmdir(data_dir_ino, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+    }
+
+    #[test]
+    fn data_namespace_rename_returns_erofs() {
+        let mut svc = bare_service();
+
+        // Rename *into* data/ as the new parent.
+        let err = svc
+            .rename(METADATA_INO, "foo", DATA_INO, "bar")
+            .unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        // Rename *out of* data/ as the source parent.
+        let err = svc
+            .rename(DATA_INO, "foo", METADATA_INO, "bar")
+            .unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        // Both parents in data/ namespace.
+        let data_dir_ino = DATA_DIR_INO_BASE + 5;
+        let err = svc
+            .rename(data_dir_ino, "foo", DATA_INO, "bar")
+            .unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+    }
+
+    #[test]
+    fn data_namespace_inodes_correctly_identified() {
+        // Unit-test the helper itself.
+        assert!(InodeManager::is_data_namespace(DATA_INO));
+        assert!(InodeManager::is_data_namespace(DATA_TORRENT_INO_BASE));
+        assert!(InodeManager::is_data_namespace(DATA_TORRENT_INO_BASE + 42));
+        assert!(InodeManager::is_data_namespace(DATA_DIR_INO_BASE + 1));
+        assert!(InodeManager::is_data_namespace(DATA_FILE_INO_BASE + 1));
+        assert!(InodeManager::is_data_namespace(SOURCE_PATH_DIR_INO_BASE));
+
+        // Non-data inodes are not in the data namespace.
+        assert!(!InodeManager::is_data_namespace(ROOT_INO));
+        assert!(!InodeManager::is_data_namespace(METADATA_INO));
+        assert!(!InodeManager::is_data_namespace(STATS_INO));
+        assert!(!InodeManager::is_data_namespace(
+            NEXT_INO.load(Ordering::SeqCst),
+        ));
     }
 }
