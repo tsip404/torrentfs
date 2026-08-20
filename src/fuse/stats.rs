@@ -8,9 +8,9 @@ use std::time::{Duration, UNIX_EPOCH};
 use crate::cache::CacheManager;
 use crate::db::{Database, TorrentStatus};
 use crate::infrastructure::download::PieceStatus;
-use crate::services::download::DownloadService;
 use crate::infrastructure::download::SessionStats;
 use crate::infrastructure::metrics::MetricsSnapshot;
+use crate::services::download::DownloadService;
 
 /// Format bytes into human-readable form.
 pub fn format_bytes(bytes: u64) -> String {
@@ -329,6 +329,26 @@ fn piece_marker(status: &PieceStatus) -> String {
     }
 }
 
+/// Compute download progress as a fraction `[0.0, 1.0]` from actual cached pieces.
+///
+/// libtorrent's `status.progress` is unreliable under the custom `PieceStorageDiskIO`
+/// backend: it reflects `total_wanted_done / total_wanted` as seen by libtorrent's
+/// piece bitmap, which can report 1.0 (100%) even when pieces have not been
+/// downloaded — because `async_check_files` reports success without feeding the
+/// piece bitmap back to libtorrent, and `async_hash` failures are treated as
+/// "not present" rather than resetting progress.
+///
+/// This helper recomputes progress from the **authoritative** piece availability
+/// (`is_cached` in the piece snapshot), so `.stats` never shows 100% while reads
+/// still time out waiting for pieces (TSI-2223).
+fn piece_progress(pieces: &[PieceStatus]) -> f64 {
+    if pieces.is_empty() {
+        return 0.0;
+    }
+    let cached = pieces.iter().filter(|p| p.is_cached).count();
+    cached as f64 / pieces.len() as f64
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Generate global stats (no per-torrent details, no per-infohash cache breakdown).
@@ -433,8 +453,19 @@ pub fn generate_torrent_stats(
         })
         .unwrap_or((0, 0, 0, 0, 0.0, 0, 0, 0, 0));
 
+    // Override libtorrent's progress with piece-availability-based progress.
+    // libtorrent's status.progress is unreliable under the custom storage
+    // backend (can report 1.0 before pieces are downloaded). Use the actual
+    // cached piece count instead (TSI-2223).
+    let piece_statuses = download_service
+        .as_ref()
+        .and_then(|ds| ds.try_get_pieces_status(info_hash));
+    let actual_progress = piece_statuses
+        .as_ref()
+        .map(|(_, pieces)| piece_progress(pieces))
+        .unwrap_or(progress as f64);
     let prog_pct = if total_size > 0 {
-        progress * 100.0
+        actual_progress * 100.0
     } else {
         0.0
     };
@@ -480,19 +511,17 @@ pub fn generate_torrent_stats(
     // -- Pieces -- visualised piece lifecycle (GitHub commit-record grid).
     // Uses only non-blocking locks so `.stats` never blocks on an active
     // download (TSI-2119).
-    if let Some(ds) = download_service {
-        if let Some((piece_length, pieces)) = ds.try_get_pieces_status(info_hash) {
-            if !pieces.is_empty() {
-                output.push_str(&format!(
-                    "\n-- Pieces ({} pieces, {} each) --\n  ",
-                    pieces.len(),
-                    format_bytes(piece_length)
-                ));
-                for status in &pieces {
-                    output.push_str(&piece_marker(status));
-                }
-                output.push('\n');
+    if let Some((piece_length, pieces)) = &piece_statuses {
+        if !pieces.is_empty() {
+            output.push_str(&format!(
+                "\n-- Pieces ({} pieces, {} each) --\n  ",
+                pieces.len(),
+                format_bytes(*piece_length)
+            ));
+            for status in pieces {
+                output.push_str(&piece_marker(status));
             }
+            output.push('\n');
         }
     }
 
@@ -656,7 +685,15 @@ pub fn generate_directory_stats(
             })
             .unwrap_or((0, 0, 0, 0, 0.0, 0));
 
-        let prog_pct = if ts > 0 { progress * 100.0 } else { 0.0 };
+        // Override libtorrent progress with piece-availability-based progress
+        // (TSI-2223): libtorrent's progress can report 1.0 before pieces are
+        // actually downloaded under the custom storage backend.
+        let actual_progress = download_service
+            .as_ref()
+            .and_then(|ds| ds.try_get_pieces_status(&t.info_hash))
+            .map(|(_, pieces)| piece_progress(&pieces))
+            .unwrap_or(progress as f64);
+        let prog_pct = if ts > 0 { actual_progress * 100.0 } else { 0.0 };
 
         output.push_str(&format!(
             "  #{:<3} {:<40} {}  {:>5.1}%  ↓ {:<10}/s  ↑ {:<10}/s  {:>3}P/{:<3}S\n",
@@ -807,6 +844,101 @@ mod tests {
     }
 
     #[test]
+    fn test_piece_progress_empty() {
+        assert_eq!(piece_progress(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_piece_progress_none_cached() {
+        let pieces = vec![
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 3,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
+        ];
+        assert_eq!(piece_progress(&pieces), 0.0);
+    }
+
+    #[test]
+    fn test_piece_progress_all_cached() {
+        let pieces = vec![
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 2,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 0,
+            },
+        ];
+        assert!((piece_progress(&pieces) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_piece_progress_partial() {
+        // 1 of 4 cached → 0.25 (25%)
+        let pieces = vec![
+            PieceStatus {
+                priority: 0,
+                is_cached: true,
+                hit_count: 1,
+            },
+            PieceStatus {
+                priority: 3,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 0,
+                is_cached: false,
+                hit_count: 0,
+            },
+        ];
+        assert!((piece_progress(&pieces) - 0.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_piece_progress_ignores_priority() {
+        // High priority but not cached → 0%
+        let pieces = vec![
+            PieceStatus {
+                priority: 7,
+                is_cached: false,
+                hit_count: 0,
+            },
+            PieceStatus {
+                priority: 7,
+                is_cached: false,
+                hit_count: 0,
+            },
+        ];
+        assert_eq!(piece_progress(&pieces), 0.0);
+    }
+
+    #[test]
     fn test_global_stats_header_present() {
         let stats = generate_global_stats(
             Duration::from_secs(0),
@@ -947,16 +1079,34 @@ mod tests {
             Some(m),
         );
         let text = String::from_utf8_lossy(&stats);
-        assert!(text.contains("Cache L1 (memory):"), "missing L1 line: {text}");
-        assert!(text.contains("hit rate 40.0%"), "missing L1 hit rate: {text}");
+        assert!(
+            text.contains("Cache L1 (memory):"),
+            "missing L1 line: {text}"
+        );
+        assert!(
+            text.contains("hit rate 40.0%"),
+            "missing L1 hit rate: {text}"
+        );
         assert!(text.contains("Cache L2 (disk):"), "missing L2 line: {text}");
-        assert!(text.contains("Cache L3 (metadata):"), "missing L3 line: {text}");
-        assert!(text.contains("Deferred reads:"), "missing Deferred line: {text}");
+        assert!(
+            text.contains("Cache L3 (metadata):"),
+            "missing L3 line: {text}"
+        );
+        assert!(
+            text.contains("Deferred reads:"),
+            "missing Deferred line: {text}"
+        );
         assert!(text.contains("Poll hit rate:"), "missing poll line: {text}");
-        assert!(text.contains("Download queue:"), "missing queue line: {text}");
+        assert!(
+            text.contains("Download queue:"),
+            "missing queue line: {text}"
+        );
         assert!(text.contains("Workers:"), "missing workers line: {text}");
-        assert!(text.contains("Lock wait:"), "missing lock wait line: {text}");
-     }
+        assert!(
+            text.contains("Lock wait:"),
+            "missing lock wait line: {text}"
+        );
+    }
 
     #[test]
     fn test_global_stats_total_unique_format() {
