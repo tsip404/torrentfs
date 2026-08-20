@@ -143,6 +143,17 @@ impl InodeManager {
         ino >= DATA_TORRENT_INO_BASE
     }
 
+    /// Check if an inode belongs to the read-only `data/` namespace.
+    ///
+    /// This includes the `data/` root itself (DATA_INO) and all derived
+    /// data inodes (torrent roots, directories, files, source-path dirs).
+    /// Mutating operations on these inodes must return `EROFS` ("read-only
+    /// file system"), not `ENOENT` or `EACCES` — the inode exists, it is
+    /// just not writable (TSI-2228).
+    pub fn is_data_namespace(ino: u64) -> bool {
+        ino == DATA_INO || Self::is_data_ino(ino)
+    }
+
     /// Derive a stats inode from a directory inode.
     pub fn make_stats_ino(dir_ino: u64) -> u64 {
         dir_ino + STATS_INO_OFFSET
