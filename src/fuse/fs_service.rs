@@ -28,7 +28,9 @@ use crate::services::download::DownloadService;
 use crate::services::seeding::SeedingService;
 use crate::services::torrent::TorrentService;
 
-use super::fs_types::{Attr, Created, DirEntry, Entry, FileKind, ReadOutcome, StatsKind};
+use super::fs_types::{
+    Attr, Created, DirEntry, Entry, FileKind, OpenOutcome, ReadOutcome, StatsKind,
+};
 use super::inodes::{
     DataInode, InodeData, InodeManager, DATA_DIR_INO_BASE, DATA_INO, DATA_TORRENT_INO_BASE,
     MAX_TORRENT_SIZE, METADATA_INO, NEXT_FH, NEXT_INO, ROOT_INO, STATS_INO,
@@ -437,22 +439,25 @@ impl FsService {
         Ok(entries.into_iter().filter(|e| e.offset > offset).collect())
     }
 
-    // ── Handle (open/opendir) namespace ─────────────────────────────────────
-
-    /// Open a file, returning the file handle (`0` = no handle needed).
-    pub fn open(&mut self, ino: u64) -> FsResult<u64> {
+    /// Open a file, returning the file handle and open-mode hints.
+    ///
+    /// Data torrent files set `direct_io: true` so the adapter applies
+    /// `FOPEN_DIRECT_IO`, bypassing the kernel page cache — this lets the
+    /// daemon's errno (e.g. ENODATA for "no seeder") reach userspace instead
+    /// of being converted to EIO by `filemap_read_folio` (TSI-2246).
+    pub fn open(&mut self, ino: u64) -> FsResult<OpenOutcome> {
         match ino {
-            ROOT_INO | METADATA_INO | DATA_INO => Ok(0),
+            ROOT_INO | METADATA_INO | DATA_INO => Ok(0.into()),
             STATS_INO => {
                 let fh = NEXT_FH.fetch_add(1, Ordering::SeqCst);
                 self.inode_mgr.open_files.insert(fh, ino);
-                Ok(fh)
+                Ok(fh.into())
             }
             _ => {
                 if InodeManager::is_stats_ino(ino) {
                     let fh = NEXT_FH.fetch_add(1, Ordering::SeqCst);
                     self.inode_mgr.open_files.insert(fh, ino);
-                    return Ok(fh);
+                    return Ok(fh.into());
                 }
 
                 if InodeManager::is_data_ino(ino) {
@@ -461,14 +466,18 @@ impl FsService {
                     {
                         let fh = NEXT_FH.fetch_add(1, Ordering::SeqCst);
                         self.inode_mgr.open_files.insert(fh, ino);
-                        Ok(fh)
+                        // Bypass page cache so read errors propagate directly.
+                        Ok(OpenOutcome {
+                            fh,
+                            direct_io: true,
+                        })
                     } else {
-                        Ok(0)
+                        Ok(0.into())
                     }
                 } else if self.inode_mgr.inodes.contains_key(&ino) {
                     let fh = NEXT_FH.fetch_add(1, Ordering::SeqCst);
                     self.inode_mgr.open_files.insert(fh, ino);
-                    Ok(fh)
+                    Ok(fh.into())
                 } else {
                     Err(FsError::NotFound)
                 }
@@ -1797,5 +1806,59 @@ mod tests {
         assert!(!InodeManager::is_data_namespace(
             NEXT_INO.load(Ordering::SeqCst),
         ));
+    }
+
+    /// TSI-2246: opening a `data/` torrent file must set `direct_io: true`
+    /// so the kernel bypasses its page cache and the daemon's errno
+    /// (e.g. ENODATA) reaches userspace instead of being converted to EIO.
+    #[test]
+    fn open_data_torrent_file_sets_direct_io() {
+        let mut svc = bare_service();
+        let ino = DATA_FILE_INO_BASE + 1;
+        svc.inode_mgr.data_inodes.insert(
+            ino,
+            DataInode::TorrentFile {
+                torrent_id: 1,
+                file_id: 1,
+                name: "foo".to_string(),
+                size: 16,
+            },
+        );
+        let outcome = svc.open(ino).expect("open data file");
+        assert!(outcome.direct_io, "data torrent file must request direct_io");
+        assert_ne!(outcome.fh, 0, "data torrent file must get a real fh");
+    }
+
+    /// TSI-2246: non-data files (e.g. metadata) must NOT set direct_io —
+    /// page cache is fine for static in-memory content.
+    #[test]
+    fn open_metadata_file_does_not_set_direct_io() {
+        let mut svc = bare_service();
+        let ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+        svc.inode_mgr.inodes.insert(
+            ino,
+            InodeData::File {
+                parent: ROOT_INO,
+                name: "x".to_string(),
+                data: vec![b'x'],
+            },
+        );
+        let outcome = svc.open(ino).expect("open metadata file");
+        assert!(
+            !outcome.direct_io,
+            "metadata file must not request direct_io"
+        );
+    }
+
+    /// TSI-2246: stats inodes must NOT set direct_io.
+    #[test]
+    fn open_stats_file_does_not_set_direct_io() {
+        let mut svc = bare_service();
+        // STATS_INO is the global `.stats` file.
+        let outcome = svc.open(STATS_INO).expect("open stats");
+        assert!(
+            !outcome.direct_io,
+            "stats file must not request direct_io"
+        );
     }
 }

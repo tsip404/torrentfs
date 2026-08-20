@@ -53,6 +53,27 @@ pub struct Created {
     pub fh: u64,
 }
 
+/// Outcome of an `open` call: the file handle plus open-mode hints.
+///
+/// `direct_io` requests the adapter to set `FOPEN_DIRECT_IO`, bypassing the
+/// kernel page cache so the daemon's errno reaches userspace directly
+/// (TSI-2246: without this, the kernel's `filemap_read_folio` converts any
+/// failed read into EIO, masking the real error such as ENODATA).
+#[derive(Debug, Clone, Copy)]
+pub struct OpenOutcome {
+    pub fh: u64,
+    pub direct_io: bool,
+}
+
+impl From<u64> for OpenOutcome {
+    fn from(fh: u64) -> Self {
+        Self {
+            fh,
+            direct_io: false,
+        }
+    }
+}
+
 /// Outcome of a synchronous attempt to serve a read.
 pub enum ReadOutcome {
     /// Serve this byte slice synchronously — memory cache, disk pieces,
