@@ -354,14 +354,16 @@ impl Database {
     ) -> Result<Vec<Torrent>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, source_path, name, filename, total_size, info_hash, file_count, status, torrent_data, resume_data, created_at
-             FROM torrents WHERE source_path = ?1 OR source_path LIKE ?2 ORDER BY id",
+             FROM torrents WHERE source_path = ?1 OR source_path LIKE ?2 ESCAPE '\\' ORDER BY id",
         )?;
+        // Escape LIKE metacharacters (%, _) and the escape character itself so that
+        // source_path is matched literally rather than treated as a glob pattern.
+        let escaped_path = super::escape_like_pattern(source_path);
         let pattern = if source_path.is_empty() {
             "%".to_string()
         } else {
-            format!("{}/%", source_path)
+            format!("{}/%", escaped_path)
         };
-
         let torrents = stmt
             .query_map(params![source_path, pattern], |row| {
                 Ok(Torrent {

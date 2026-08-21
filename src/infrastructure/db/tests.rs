@@ -499,6 +499,22 @@ fn test_get_torrents_by_source_path_prefix() {
         .get_torrents_by_source_path_prefix("nonexistent")
         .unwrap();
     assert_eq!(torrents.len(), 0);
+
+    // LIKE metacharacters in the prefix must be matched literally, not as
+    // wildcards: "a_b" must NOT match "aXb" or "aYb".
+    db.insert_torrent("aXb", "Should Not Match 1", "a1.torrent", 1024, "h_1", 1)
+        .unwrap();
+    db.insert_torrent("a_b", "Literal Underscore", "a2.torrent", 2048, "h_2", 1)
+        .unwrap();
+    db.insert_torrent("a_b/sub", "Literal Child", "a3.torrent", 4096, "h_3", 1)
+        .unwrap();
+
+    let torrents = db.get_torrents_by_source_path_prefix("a_b").unwrap();
+    let names: Vec<&str> = torrents.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(torrents.len(), 2);
+    assert!(names.contains(&"Literal Underscore"));
+    assert!(names.contains(&"Literal Child"));
+    assert!(!names.contains(&"Should Not Match 1"));
 }
 
 #[test]
@@ -755,6 +771,26 @@ fn test_cleanup_orphaned_metadata_directories_keeps_dir_with_torrent() {
         .get_source_path_prefixes("")
         .unwrap()
         .contains(&"cat-a".to_string()));
+}
+
+#[test]
+fn test_cleanup_orphaned_metadata_directories_underscore_in_name() {
+    let mut db = Database::open_in_memory().unwrap();
+
+    // "a_b" and "aXb" — underscore must be literal, not a wildcard. The
+    // torrent under "aXb" must keep "a_b" from being cleaned up.
+    db.insert_torrent("a_b", "T1", "T1", 100, "h1", 1).unwrap();
+    db.insert_torrent("aXb", "T2", "T2", 200, "h2", 1).unwrap();
+
+    // Delete the torrent under "a_b"; cleanup of "a_b" must see the torrent
+    // under "aXb" as NOT a child and proceed to remove "a_b".
+    db.delete_torrent(1).unwrap();
+    let removed = db.cleanup_orphaned_metadata_directories("a_b").unwrap();
+    assert_eq!(removed, vec!["a_b".to_string()]);
+    assert!(db
+        .get_source_path_prefixes("")
+        .unwrap()
+        .contains(&"aXb".to_string()));
 }
 
 #[test]
@@ -1172,6 +1208,29 @@ fn test_rename_metadata_directory_nested_torrents() {
     assert_eq!(t1.source_path, "z/b");
     let t2 = db.get_torrent_by_id(2).unwrap().unwrap();
     assert_eq!(t2.source_path, "z/c");
+}
+
+#[test]
+fn test_rename_metadata_directory_underscore_in_name() {
+    let mut db = Database::open_in_memory().unwrap();
+
+    // Create "a_b/c" and "aXb/d" — the underscore in "a_b" must be literal,
+    // not a LIKE wildcard matching "aXb".
+    db.ensure_metadata_directories("a_b/c").unwrap();
+    db.ensure_metadata_directories("aXb/d").unwrap();
+    db.insert_torrent("a_b/c", "T1", "T1.torrent", 100, "h1", 1)
+        .unwrap();
+    db.insert_torrent("aXb/d", "T2", "T2.torrent", 200, "h2", 1)
+        .unwrap();
+
+    // Rename "a_b" -> "a_b_new" must NOT touch "aXb/d".
+    db.rename_metadata_directory("a_b", "a_b_new", "a_b_new")
+        .unwrap();
+
+    let t1 = db.get_torrent_by_id(1).unwrap().unwrap();
+    assert_eq!(t1.source_path, "a_b_new/c");
+    let t2 = db.get_torrent_by_id(2).unwrap().unwrap();
+    assert_eq!(t2.source_path, "aXb/d");
 }
 
 #[test]
