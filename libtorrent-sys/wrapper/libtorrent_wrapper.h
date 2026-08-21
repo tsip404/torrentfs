@@ -138,6 +138,13 @@ void lt_alert_list_destroy(lt_alert_list_t* list);
 // Pass `callback == NULL` to clear.
 void lt_session_set_alert_notify(lt_session_t session, void (*callback)(void* user_data), void* user_data);
 
+// TSI-2262: Per-info-hash shared read lock. Acquire before reading piece
+// files from Rust (PieceStore::read_piece) to prevent reading partially-
+// written data during active downloads. Must be paired with
+// lt_unlock_piece_read. info_hash_hex is the hex-encoded SHA-1 info hash.
+void lt_lock_piece_read(const char* info_hash_hex);
+void lt_unlock_piece_read(const char* info_hash_hex);
+
 #ifdef __cplusplus
 }
 #endif
