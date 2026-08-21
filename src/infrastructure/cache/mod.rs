@@ -351,15 +351,26 @@ impl CacheManager {
     fn remove_piece(&mut self, piece_key: &str) -> TorrentResult<()> {
         let piece_path = self.piece_path(piece_key);
 
-        if piece_path.exists() {
-            let size = fs::metadata(&piece_path).map(|m| m.len()).unwrap_or(0);
+        // TSI-2242: debit the registered PieceMetadata.size — the same
+        // value credited by add_piece / scan_pieces_subdirectory — so
+        // current_size stays symmetric on add and remove.  Using the
+        // on-disk file length here caused permanent upward drift when a
+        // piece's disk file was shorter than its registered size
+        // (partial write / crash-restart, the scenario the tests at
+        // test_has_piece_true_but_disk_file_empty and
+        // test_metadata_size_mismatch_disk_size document): the full
+        // registered size was credited on add but only the actual disk
+        // length was debited on remove, so current_size never returned
+        // to zero and the cache over-evicted.
+        let registered_size = self.metadata.get(piece_key).map(|m| m.size).unwrap_or(0);
 
+        if piece_path.exists() {
             fs::remove_file(&piece_path).map_err(|e| {
                 TorrentError::IoError(format!("Failed to remove piece file: {}", e))
             })?;
-
-            self.current_size = self.current_size.saturating_sub(size);
         }
+
+        self.current_size = self.current_size.saturating_sub(registered_size);
 
         self.metadata.remove(piece_key);
         self.verified_piece_keys.remove(piece_key);
@@ -1282,6 +1293,85 @@ mod tests {
             cache.current_size(),
             512,
             "re-registering an existing piece must not double-count"
+        );
+
+        Ok(())
+    }
+
+    // ── TSI-2242 regression: current_size add/remove symmetry ─────────
+    //
+    // remove_piece must debit the same value that add_piece /
+    // scan_pieces_subdirectory credited (PieceMetadata.size), not the
+    // on-disk file length.  When a piece's disk file is shorter than its
+    // registered size (partial write / crash-restart), debiting the disk
+    // length left current_size permanently inflated and caused
+    // over-eviction.
+
+    #[test]
+    fn test_remove_piece_debits_registered_size_not_disk_size() -> TorrentResult<()> {
+        // add_piece credits the registered size (4096); the disk file is
+        // empty (0 bytes).  remove_piece must debit 4096 so current_size
+        // returns to zero, not 0.
+        let temp_dir = TempDir::new().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+
+        let piece_key = "tsi2242_short:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+
+        // Register a 4096-byte piece…
+        cache.add_piece(piece_key, 4096)?;
+        assert_eq!(cache.current_size(), 4096);
+
+        // …but the disk file is empty (crash before fsync).
+        std::fs::write(&piece_path, &[])?;
+        assert_eq!(std::fs::metadata(&piece_path)?.len(), 0);
+
+        cache.delete_piece(piece_key)?;
+
+        assert_eq!(
+            cache.current_size(),
+            0,
+            "current_size must return to 0 after removing a piece whose disk file was shorter than its registered size"
+        );
+        assert!(!cache.has_piece(piece_key));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_evict_debits_registered_size_on_partial_file() -> TorrentResult<()> {
+        // LRU eviction goes through remove_piece.  A piece whose disk
+        // file is shorter than its registered size must not leave
+        // residual current_size after eviction.
+        let temp_dir = TempDir::new().unwrap();
+        // max_cache_size just above one piece so the second add evicts the first.
+        let mut cache = CacheManager::new(temp_dir.path(), 4096)?;
+
+        let piece_key = "tsi2242_evict:piece:0";
+        let piece_path = cache.ensure_piece_dir(piece_key)?;
+
+        cache.add_piece(piece_key, 4096)?;
+        assert_eq!(cache.current_size(), 4096);
+
+        // Disk file is shorter than registered size.
+        std::fs::write(&piece_path, vec![0u8; 100])?;
+        assert_eq!(std::fs::metadata(&piece_path)?.len(), 100);
+
+        // Sleep so piece_2 gets a strictly newer last_accessed, making piece_1
+        // the unambiguous LRU victim.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Adding a second piece triggers eviction of the first.
+        let piece_2_key = "tsi2242_evict:piece:1";
+        let piece_2_path = cache.ensure_piece_dir(piece_2_key)?;
+        std::fs::write(&piece_2_path, vec![0u8; 4096])?;
+        cache.add_piece(piece_2_key, 4096)?;
+
+        assert!(!cache.has_piece(piece_key), "first piece should be evicted");
+        assert_eq!(
+            cache.current_size(),
+            4096,
+            "after evicting the partial piece, current_size should reflect only the surviving piece"
         );
 
         Ok(())
