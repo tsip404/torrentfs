@@ -1560,7 +1560,8 @@ impl FsService {
 /// or an incomplete/corrupt file left by a crash. This worker recomputes each
 /// candidate's SHA-1 and compares it against the torrent's expected piece
 /// hash: matches are marked verified (so subsequent reads serve from local
-/// cache), mismatches are purged so they can be re-downloaded on demand.
+/// cache), mismatches and incomplete pieces (wrong size / sparse partial
+/// write) are purged so they can be re-downloaded on demand (TSI-2257).
 ///
 /// Runs on a detached background thread so it never blocks FUSE mount
 /// readiness.
@@ -1685,23 +1686,25 @@ fn verify_single_piece(
     let file_size = meta.len();
     if file_size != expected_size {
         warn!(
-            "Cached piece has wrong size ({} != {}), leaving unverified: {}",
+            "Cached piece has wrong size ({} != {}), purging incomplete piece: {}",
             file_size, expected_size, piece_key
         );
-        return VerifyOutcome::Skipped;
+        return VerifyOutcome::Purged;
     }
 
-    // TSI-2229: a piece file may have the correct *logical* size but still be
-    // incomplete — `write_piece` writes blocks at arbitrary offsets, and a
-    // crash between block writes leaves a sparse file whose zero-filled gaps
-    // make st_size match piece_length while the physical allocation is smaller.
-    // Treat it like a wrong-size piece (leave unverified) instead of purging.
+    // TSI-2229 / TSI-2257: a piece file may have the correct *logical* size
+    // but still be incomplete — `write_piece` writes blocks at arbitrary
+    // offsets, and a crash between block writes leaves a sparse file whose
+    // zero-filled gaps make st_size match piece_length while the physical
+    // allocation is smaller. Purge it: an incomplete piece left by a crash
+    // is garbage and the space should be reclaimed. It will be re-downloaded
+    // on demand, identical to a never-downloaded piece.
     if is_sparse_file(&meta, file_size) {
         warn!(
-            "Cached piece is sparse (partial write), leaving unverified: {}",
+            "Cached piece is sparse (partial write), purging incomplete piece: {}",
             piece_key
         );
-        return VerifyOutcome::Skipped;
+        return VerifyOutcome::Purged;
     }
 
     let data = match std::fs::read(path) {
@@ -1744,9 +1747,9 @@ fn split_piece_key(key: &str) -> Option<(&str, i32)> {
 /// complete piece even though its logical size is correct.
 ///
 /// Comparing `st_blocks * 512` (physical) against `st_size` (logical) detects
-/// this condition. A fully-written all-zero piece also appears sparse, but
-/// leaving it unverified is harmless — the next read re-downloads it,
-/// `register_piece` marks it verified, and no data is lost.
+/// this condition. A fully-written all-zero piece also appears sparse; it
+/// is purged along with genuine partial writes — the next read re-downloads
+/// it, `register_piece` marks it verified, and no data is lost (TSI-2257).
 ///
 /// Takes the already-fetched `Metadata` so the caller avoids a duplicate
 /// `stat` syscall (one per piece — significant at 987+ pieces).
@@ -2243,13 +2246,27 @@ mod tests {
         (t, content, piece_length as u64)
     }
 
+    /// Write a sparse piece file to `piece_path` whose *logical* size equals
+    /// `piece_length` but whose physical allocation is smaller — simulating an
+    /// interrupted multi-block write where only the trailing block was
+    /// flushed to disk.  The tail starts at `piece_length / 4` so it never
+    /// underflows for small pieces (TSI-2257 review: the prior `piece_length -
+    /// 4096` could underflow when `piece_length < 4096`).
+    fn write_sparse_piece_file(piece_path: &std::path::Path, content: &[u8], piece_length: u64) {
+        use std::io::{Seek, Write};
+        let tail_start = piece_length / 4;
+        let mut file = std::fs::File::create(piece_path).unwrap();
+        file.seek(std::io::SeekFrom::Start(tail_start)).unwrap();
+        file.write_all(&content[tail_start as usize..]).unwrap();
+        drop(file);
+    }
+
     #[test]
-    fn verify_single_piece_sparse_file_is_skipped_not_purged() {
+    fn verify_single_piece_sparse_file_is_purged() {
         let (torrent_bytes, content, piece_length) = build_single_piece_torrent();
         let info = Arc::new(TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent"));
         let info_hash = hex::encode(info.info_hash().expect("info hash"));
         let piece_key = format!("{}:piece:0", info_hash);
-
         let temp_dir = tempfile::tempdir().unwrap();
 
         // Create the piece file on disk *before* constructing the
@@ -2262,29 +2279,22 @@ mod tests {
         // Sparse file: correct logical size but a zero-filled hole at the
         // start (simulates an interrupted multi-block write where only the
         // trailing block was flushed to disk).
-        use std::io::{Seek, Write};
-        let mut file = std::fs::File::create(&piece_path).unwrap();
-        let tail_start = piece_length as u64 - 4096;
-        file.seek(std::io::SeekFrom::Start(tail_start)).unwrap();
-        file.write_all(&content[tail_start as usize..]).unwrap();
-        drop(file);
+        write_sparse_piece_file(&piece_path, &content, piece_length);
 
         let cache = CacheManager::new(temp_dir.path(), 1024 * 1024).unwrap();
         // Scan registered the piece but left it unverified.
         assert!(cache.has_piece(&piece_key));
         assert!(!cache.is_piece_verified(&piece_key));
 
-        // The sparse file must be Skipped, not Purged.
+        // TSI-2257: a sparse (partial-write) piece is purged, not skipped.
         let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
         assert!(
-            matches!(outcome, VerifyOutcome::Skipped),
-            "sparse piece file should be skipped, not purged"
+            matches!(outcome, VerifyOutcome::Purged),
+            "sparse piece file should be purged, not skipped"
         );
-        // The piece file must still exist on disk (not deleted).
-        assert!(
-            piece_path.exists(),
-            "skipped piece file must not be deleted"
-        );
+        // The caller (spawn_cache_verification) applies Purged by deleting
+        // the piece from the cache; here we only assert the outcome, but
+        // the purge contract implies the file is reclaimable.
     }
 
     #[test]
@@ -2320,7 +2330,6 @@ mod tests {
         // Write a complete, non-sparse file with wrong content.
         std::fs::write(&piece_path, vec![0xFFu8; piece_length as usize]).unwrap();
         cache.add_piece(&piece_key, piece_length).unwrap();
-
         let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
         assert!(
             matches!(outcome, VerifyOutcome::Purged),
@@ -2329,7 +2338,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_single_piece_wrong_size_is_skipped() {
+    fn verify_single_piece_wrong_size_is_purged() {
         let (torrent_bytes, _content, piece_length) = build_single_piece_torrent();
         let info = Arc::new(TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent"));
         let info_hash = hex::encode(info.info_hash().expect("info hash"));
@@ -2344,9 +2353,53 @@ mod tests {
 
         let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
         assert!(
-            matches!(outcome, VerifyOutcome::Skipped),
-            "wrong-size piece should be skipped"
+            matches!(outcome, VerifyOutcome::Purged),
+            "wrong-size piece should be purged"
         );
+    }
+
+    /// TSI-2257: a purged incomplete piece must be deleted from the cache
+    /// (metadata + on-disk file) so the disk space is reclaimed.  This
+    /// exercises the full `spawn_cache_verification` purge contract by
+    /// applying `VerifyOutcome::Purged` via `delete_piece` — the same path
+    /// the verification worker uses.
+    #[test]
+    fn purged_sparse_piece_frees_disk_and_metadata() {
+        let (torrent_bytes, content, piece_length) = build_single_piece_torrent();
+        let info = Arc::new(TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent"));
+        let info_hash = hex::encode(info.info_hash().expect("info hash"));
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create a sparse piece file on disk *before* constructing the
+        // CacheManager so the startup scan registers it as unverified.
+        let pieces_dir = temp_dir.path().join("pieces").join(&info_hash);
+        std::fs::create_dir_all(&pieces_dir).unwrap();
+        let piece_path = pieces_dir.join(&piece_key);
+
+        // Sparse file: correct logical size but a zero-filled hole at the
+        // start (simulates an interrupted multi-block write where only the
+        // trailing block was flushed to disk).
+        write_sparse_piece_file(&piece_path, &content, piece_length);
+
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024).unwrap();
+        assert!(cache.has_piece(&piece_key));
+        assert!(!cache.is_piece_verified(&piece_key));
+        assert!(piece_path.exists());
+        let size_before = cache.current_size();
+        assert!(size_before > 0, "scan should credit the piece size");
+
+        // Verify → Purged → the worker applies the side effect.
+        let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
+        assert!(matches!(outcome, VerifyOutcome::Purged));
+        cache.delete_piece(&piece_key).unwrap();
+
+        // The piece is gone from metadata, verified set, and disk.
+        assert!(!cache.has_piece(&piece_key));
+        assert!(!cache.is_piece_verified(&piece_key));
+        assert!(!piece_path.exists(), "purged piece file must be deleted");
+        assert_eq!(cache.current_size(), 0, "current_size must drop to zero");
     }
 
     // ── TSI-2247: release must not block the FUSE dispatch thread ─────────
