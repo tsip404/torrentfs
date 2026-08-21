@@ -80,4 +80,20 @@ mod tests {
         let e: libc::c_int = FsError::PieceNotReady("waiting".to_string()).into();
         assert_eq!(e, libc::EIO);
     }
+
+    /// TSI-2261: when the piece-wait times out with zero seeders, the engine
+    /// returns `NoPeers` (not `Timeout`). This must still map to ENODATA, not
+    /// EIO, so the user sees "no data available" instead of "I/O error".
+    #[test]
+    fn no_seeder_timeout_maps_to_enodata() {
+        let e: libc::c_int = FsError::NoPeers(
+            "No seeder connected for info_hash abc after 30s. \
+             The torrent has no available seeder — check tracker health or \
+             try again later."
+                .to_string(),
+        )
+        .into();
+        assert_eq!(e, libc::ENODATA);
+        assert_ne!(e, libc::EIO);
+    }
 }

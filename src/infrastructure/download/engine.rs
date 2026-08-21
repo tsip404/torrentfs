@@ -830,17 +830,50 @@ impl EngineState {
 
                 if piece_start.elapsed() >= piece_wait_timeout {
                     self.release_reader(&info_hash);
-                    let progress = self
+                    // TSI-2261: when the piece-wait times out, distinguish
+                    // "no seeder available" from "slow download". If the
+                    // torrent has zero connected seeders after the full
+                    // timeout, the swarm has no seeder — return NoPeers
+                    // (→ ENODATA, "no data available") instead of Timeout
+                    // (→ EIO, "input/output error") so the user sees a
+                    // meaningful error. Seeders present but slow still
+                    // returns Timeout → EIO.
+                    //
+                    // If status is unavailable (handle gone or status()
+                    // failed), fall back to Timeout — do NOT fabricate a
+                    // zero-seeder swarm that would mislead the user into
+                    // checking tracker health for what is really a stale
+                    // handle.
+                    let (progress, num_seeds) = match self
                         .handles
                         .get(&info_hash)
                         .and_then(|h| h.status().ok())
-                        .map(|s| s.progress * 100.0)
-                        .unwrap_or(0.0);
+                    {
+                        Some(s) => (s.progress * 100.0, s.num_seeds),
+                        None => {
+                            return Err(TorrentError::Timeout(format!(
+                                "Timed out waiting for piece {} after {:.0}s \
+                                 (status unavailable)",
+                                piece_idx,
+                                piece_wait_timeout.as_secs(),
+                            )));
+                        }
+                    };
+                    if num_seeds == 0 {
+                        return Err(TorrentError::NoPeers(format!(
+                            "No seeder connected for info_hash {} after {:.0}s. \
+                             The torrent has no available seeder — check \
+                             tracker health or try again later.",
+                            info_hash,
+                            piece_wait_timeout.as_secs(),
+                        )));
+                    }
                     return Err(TorrentError::Timeout(format!(
-                        "Timed out waiting for piece {} after {:.0}s. Torrent progress: {:.2}%",
+                        "Timed out waiting for piece {} after {:.0}s. \
+                         Torrent progress: {:.2}%",
                         piece_idx,
                         piece_wait_timeout.as_secs(),
-                        progress
+                        progress,
                     )));
                 }
 
