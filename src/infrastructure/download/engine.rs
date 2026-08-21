@@ -125,8 +125,7 @@ impl DownloadEngine {
     ) -> TorrentResult<Self> {
         let cache_dir_str = cache_dir.to_string_lossy().into_owned();
         let pieces_dir = cache_dir.join("pieces");
-        std::fs::create_dir_all(&pieces_dir)
-            .map_err(|e| TorrentError::IoError(e.to_string()))?;
+        std::fs::create_dir_all(&pieces_dir).map_err(|e| TorrentError::IoError(e.to_string()))?;
 
         // Send-safe shared state, created on the caller's thread.
         let cache_manager = Arc::new(Mutex::new(CacheManager::new(
@@ -206,12 +205,10 @@ impl DownloadEngine {
                 message: format!("Failed to spawn download engine thread: {}", e),
             })?;
 
-        init_rx
-            .recv()
-            .map_err(|_| TorrentError::Unknown {
-                code: -1,
-                message: "Download engine thread disconnected before init".to_string(),
-            })??;
+        init_rx.recv().map_err(|_| TorrentError::Unknown {
+            code: -1,
+            message: "Download engine thread disconnected before init".to_string(),
+        })??;
 
         Ok(DownloadEngine {
             tx,
@@ -249,7 +246,12 @@ impl DownloadEngine {
 
     /// Non-blocking piece status from the last engine snapshot.
     pub fn try_pieces_status(&self, info_hash: &str) -> Option<(u64, Vec<PieceStatus>)> {
-        self.snapshot.try_lock().ok()?.pieces.get(info_hash).cloned()
+        self.snapshot
+            .try_lock()
+            .ok()?
+            .pieces
+            .get(info_hash)
+            .cloned()
     }
 
     pub fn metrics(&self) -> Arc<Metrics> {
@@ -347,7 +349,10 @@ impl DownloadEngine {
     /// Register a seeding manager for eviction + piece-ready callbacks.
     pub fn register_seeding(&self, seeding: Arc<SeedingManager>) {
         let (tx, rx) = mpsc::sync_channel(1);
-        if self.send(Command::RegisterSeeding { seeding, reply: tx }).is_ok() {
+        if self
+            .send(Command::RegisterSeeding { seeding, reply: tx })
+            .is_ok()
+        {
             let _ = rx.recv();
         }
     }
@@ -385,7 +390,6 @@ const UPLOAD_MODE_FLAG: u64 = 1 << 1;
 /// consumer thread handles them event-driven via `set_alert_notify` — so this
 /// interval only bounds `.stats` staleness for per-torrent status/pieces.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
-
 
 fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
     tracing::info!("Download engine started");
@@ -468,13 +472,14 @@ impl EngineState {
         }
 
         let pieces_dir = Path::new(&self.cache_dir).join("pieces");
-        std::fs::create_dir_all(&pieces_dir)
-            .map_err(|e| TorrentError::IoError(e.to_string()))?;
+        std::fs::create_dir_all(&pieces_dir).map_err(|e| TorrentError::IoError(e.to_string()))?;
         let torrent_save_dir = pieces_dir.join(&info_hash);
         std::fs::create_dir_all(&torrent_save_dir)
             .map_err(|e| TorrentError::IoError(e.to_string()))?;
 
-        let handle = self.session.add_torrent_upload_mode(info, &torrent_save_dir)?;
+        let handle = self
+            .session
+            .add_torrent_upload_mode(info, &torrent_save_dir)?;
 
         let (piece_length, num_pieces) = handle.get_torrent_info()?;
         self.scheduler
@@ -601,15 +606,14 @@ impl EngineState {
 
         // ── ReaderAdded: elevate priority for this read ────────────────
         {
-            let handle = self.handles.get(&info_hash).ok_or_else(|| Self::missing())?;
-            if let Err(e) = self.scheduler.reader_added(
-                handle,
-                info,
-                file_index,
-                offset,
-                size,
-                &self.store,
-            ) {
+            let handle = self
+                .handles
+                .get(&info_hash)
+                .ok_or_else(|| Self::missing())?;
+            if let Err(e) =
+                self.scheduler
+                    .reader_added(handle, info, file_index, offset, size, &self.store)
+            {
                 tracing::warn!("read_file_range: reader_added failed: {:?}", e);
             }
         }
@@ -621,8 +625,36 @@ impl EngineState {
         // priorities to 0, so `.stats` always saw an all-`[]` Pieces grid.
         self.publish_snapshot();
 
+        // ── Detect stale libtorrent piece state (TSI-2258) ───────────────
+        // A piece can be purged from cache (file deleted + metadata cleared by
+        // the background SHA-1 verification) while libtorrent's internal
+        // piece bitmask still marks it as complete (resume state not
+        // updated).  Without intervention, `all_pieces_local` would take the
+        // fast path, `read_from_disk` would find the file missing, silently
+        // skip it, and return a short read → EIO.  Detect this: if any piece
+        // in the range has `have_piece == true` but the on-disk file is gone,
+        // call `force_recheck` so libtorrent re-verifies via the custom storage
+        // and clears the stale bit, then wait for the recheck to finish.
+        if self.has_stale_pieces(&info_hash, start_piece, end_piece) {
+            tracing::info!(
+                "read_file_range: stale libtorrent piece state detected for \
+                 info_hash={}, forcing recheck to clear bits for pieces {}-{}",
+                info_hash,
+                start_piece,
+                end_piece
+            );
+            self.force_recheck_and_wait(&info_hash);
+        }
+
         // ── Fast path: all pieces available locally ────────────────────
-        if self.all_pieces_local(&info_hash, start_piece, end_piece, piece_length, num_pieces, total_size) {
+        if self.all_pieces_local(
+            &info_hash,
+            start_piece,
+            end_piece,
+            piece_length,
+            num_pieces,
+            total_size,
+        ) {
             let result = self.read_from_disk(
                 &info_hash,
                 start_piece,
@@ -644,7 +676,10 @@ impl EngineState {
         // gradient; clearing upload_mode now lets libtorrent start requesting
         // those pieces from the peers it is already connected to.
         {
-            let handle = self.handles.get(&info_hash).ok_or_else(|| Self::missing())?;
+            let handle = self
+                .handles
+                .get(&info_hash)
+                .ok_or_else(|| Self::missing())?;
             if !handle.unset_flags(UPLOAD_MODE_FLAG) {
                 tracing::warn!(
                     "read_file_range: failed to clear upload_mode for {}",
@@ -664,10 +699,12 @@ impl EngineState {
         // all-pieces-local fast path above, so reaching here means at least one
         // piece is missing and only the network could supply it — which it
         // cannot with zero peers/seeds.
-        let peer_wait_timeout =
-            Duration::from_secs(std::cmp::min(self.read_timeout_secs, 9));
+        let peer_wait_timeout = Duration::from_secs(std::cmp::min(self.read_timeout_secs, 9));
         {
-            let handle = self.handles.get(&info_hash).ok_or_else(|| Self::missing())?;
+            let handle = self
+                .handles
+                .get(&info_hash)
+                .ok_or_else(|| Self::missing())?;
             if status.num_peers == 0 && status.num_seeds == 0 {
                 let peer_wait_start = Instant::now();
                 loop {
@@ -713,10 +750,20 @@ impl EngineState {
         }
 
         // ── Set piece deadlines ────────────────────────────────────────
+        // TSI-2258 review: `have_piece` can be stale (true but file purged).
+        // Only skip the deadline for pieces that are truly available —
+        // `have_piece` true AND the file exists on disk.  Stale pieces
+        // still need a deadline so libtorrent re-requests them.
         {
-            let handle = self.handles.get(&info_hash).ok_or_else(|| Self::missing())?;
+            let handle = self
+                .handles
+                .get(&info_hash)
+                .ok_or_else(|| Self::missing())?;
             for piece_idx in start_piece..=end_piece {
-                if !handle.have_piece(piece_idx) {
+                let piece_key = PieceStore::piece_key(&info_hash, piece_idx);
+                let truly_available =
+                    handle.have_piece(piece_idx) && !self.store.has_stale_piece(&piece_key);
+                if !truly_available {
                     handle.set_piece_deadline(piece_idx, 0);
                 }
             }
@@ -739,6 +786,17 @@ impl EngineState {
                     .get(&info_hash)
                     .map(|h| h.have_piece(piece_idx))
                     .unwrap_or(false);
+                // TSI-2258: `have_piece` can be stale (resume state marks the
+                // piece as complete, but the file was purged from cache).
+                // In that case, do not treat it as ready — instead, fall
+                // through to the download path so libtorrent re-requests
+                // the piece.
+                let have_valid = if have {
+                    let piece_key = PieceStore::piece_key(&info_hash, piece_idx);
+                    !self.store.has_stale_piece(&piece_key)
+                } else {
+                    false
+                };
                 let cached = {
                     let piece_key = PieceStore::piece_key(&info_hash, piece_idx);
                     let cache = self.store.cache_manager();
@@ -756,9 +814,9 @@ impl EngineState {
                         })
                         .unwrap_or(false)
                 };
-                self.metrics.record_poll(have || cached);
-                if have || cached {
-                    if have {
+                self.metrics.record_poll(have_valid || cached);
+                if have_valid || cached {
+                    if have_valid {
                         self.register_piece(
                             &info_hash,
                             piece_idx,
@@ -839,11 +897,119 @@ impl EngineState {
                     )
                 })
                 .unwrap_or(false);
-            if !handle.have_piece(piece_idx) && !complete {
+            // TSI-2258: use the unified stale detection — `have_piece` true
+            // but the on-disk file is gone means the bit is stale; the
+            // piece is NOT available locally and must be re-downloaded.
+            let have = handle.have_piece(piece_idx);
+            let have_valid = if have {
+                !self.store.has_stale_piece(&piece_key)
+            } else {
+                false
+            };
+            if !have_valid && !complete {
                 return false;
             }
         }
         true
+    }
+
+    /// TSI-2258: detect whether any piece in the range has a stale
+    /// libtorrent bitmask — `have_piece == true` but the on-disk piece file
+    /// is gone (purged by cache verification or manual `delete_piece`).
+    /// Returns `true` if at least one such piece exists.
+    fn has_stale_pieces(&self, info_hash: &str, start_piece: i32, end_piece: i32) -> bool {
+        let handle = match self.handles.get(info_hash) {
+            Some(h) => h,
+            None => return false,
+        };
+        for piece_idx in start_piece..=end_piece {
+            if handle.have_piece(piece_idx) {
+                let piece_key = PieceStore::piece_key(info_hash, piece_idx);
+                if self.store.has_stale_piece(&piece_key) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// TSI-2258: force libtorrent to re-verify all pieces for a torrent and
+    /// wait for the recheck to complete (or time out).  After `force_recheck`,
+    /// libtorrent transitions through `CheckingFiles` and, via the custom
+    /// storage's `async_check_files`, discovers that purged pieces are gone
+    /// — clearing their `have_piece` bits so the normal download path can
+    /// re-request them.
+    fn force_recheck_and_wait(&self, info_hash: &str) {
+        let handle = match self.handles.get(info_hash) {
+            Some(h) => h,
+            None => return,
+        };
+        if !handle.force_recheck() {
+            tracing::warn!(
+                "force_recheck failed for info_hash={}; stale bits may persist",
+                info_hash
+            );
+            return;
+        }
+        // TSI-2258 review: wait for the recheck to finish.  Two subtleties:
+        // 1. TOCTOU — `force_recheck()` is asynchronous; libtorrent may not
+        //    have transitioned to `QueuedForChecking` by the time we first
+        //    poll.  Without a grace period, the first `status()` would see
+        //    the old state (Seeding/Downloading), conclude "recheck done",
+        //    and return while stale bits still persist.  Fix: sleep a grace
+        //    period before the first poll, then track whether we *ever*
+        //    observed a checking state — only return after observing the
+        //    transition OUT of checking.
+        // 2. Poll interval — 200ms reduces syscall overhead while keeping
+        //    recheck latency (typically <1s) acceptable.
+        let max_wait = Duration::from_secs(std::cmp::min(self.read_timeout_secs, 10));
+        let start = Instant::now();
+
+        // Grace period: let libtorrent queue the recheck before polling.
+        std::thread::sleep(Duration::from_millis(200));
+
+        let mut saw_checking = false;
+        while start.elapsed() < max_wait {
+            if self.stopping.load(Ordering::Relaxed) {
+                return;
+            }
+            match handle.status() {
+                Ok(s) => {
+                    let is_checking = matches!(
+                        s.state,
+                        TorrentState::QueuedForChecking
+                            | TorrentState::CheckingFiles
+                            | TorrentState::CheckingResumeData
+                    );
+                    if is_checking {
+                        saw_checking = true;
+                    } else if saw_checking {
+                        // We observed the checking state and it has now
+                        // ended — the recheck is truly complete.
+                        return;
+                    } else if start.elapsed() > Duration::from_secs(2) {
+                        // No checking state observed after 2s — the recheck
+                        // may have completed instantly (unlikely but
+                        // possible) or failed to start.  Fall through; the
+                        // safety nets in all_pieces_local and the piece-wait
+                        // loop will catch any remaining stale bits.
+                        tracing::warn!(
+                            "force_recheck: no checking state observed for \
+                             info_hash={} after 2s, proceeding",
+                            info_hash
+                        );
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        tracing::warn!(
+            "force_recheck did not finish within {:?} for info_hash={}",
+            max_wait,
+            info_hash
+        );
     }
 
     fn read_from_disk(
@@ -865,6 +1031,24 @@ impl EngineState {
             let piece_data = match self.store.read_piece(&piece_key) {
                 Ok(d) => d,
                 Err(_) => {
+                    // TSI-2258: the piece file is gone but we reached
+                    // read_from_disk — either the fast path (have_piece was
+                    // true but file purged) or the piece-wait loop broke
+                    // on `have_piece` without verifying disk presence.
+                    // Rather than silently skipping (which leads to a
+                    // short-read EIO), return PieceNotReady so the caller
+                    // sees a transient error and can retry, and the stale
+                    // libtorrent bitmask is caught by the recheck guard
+                    // on the next attempt.
+                    let piece_start = (piece_idx as u64) * piece_length;
+                    let piece_end_theoretical = piece_start + piece_length;
+                    if absolute_offset < piece_end_theoretical && end_offset > piece_start {
+                        return Err(TorrentError::PieceNotReady(format!(
+                            "Piece {} file missing from cache but overlaps \
+                             requested range (possible stale libtorrent state)",
+                            piece_idx
+                        )));
+                    }
                     tracing::debug!("read_from_disk: piece {} not on disk", piece_idx);
                     continue;
                 }

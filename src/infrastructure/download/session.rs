@@ -262,7 +262,6 @@ impl Drop for Session {
     }
 }
 
-
 impl TorrentHandle {
     pub fn is_valid(&self) -> bool {
         unsafe { libtorrent_sys::lt_torrent_handle_is_valid(self.inner) != 0 }
@@ -316,7 +315,6 @@ impl TorrentHandle {
             })
         }
     }
-
 
     pub fn get_file_piece_info(&self, file_index: i32) -> TorrentResult<FilePieceInfo> {
         let mut first_piece: i64 = 0;
@@ -405,6 +403,16 @@ impl TorrentHandle {
     /// clearing `torrent_flags::upload_mode` (numeric value `1 << 1`).
     pub fn unset_flags(&self, flags: u64) -> bool {
         unsafe { libtorrent_sys::lt_torrent_handle_unset_flags(self.inner, flags) == 0 }
+    }
+
+    /// Force libtorrent to re-verify all pieces.  After a `delete_piece` the
+    /// on-disk piece file is gone, but libtorrent's internal piece bitmask
+    /// may still mark it as complete (stale resume state).  `force_recheck`
+    /// puts the torrent back into the checking queue so libtorrent re-reads
+    /// the custom storage and discovers the missing piece, clearing its
+    /// `have_piece` bit so the next read triggers a fresh download (TSI-2258).
+    pub fn force_recheck(&self) -> bool {
+        unsafe { libtorrent_sys::lt_torrent_handle_force_recheck(self.inner) == 0 }
     }
 
     pub fn info_hash(&self) -> &str {

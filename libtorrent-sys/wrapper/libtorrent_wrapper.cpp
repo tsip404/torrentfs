@@ -611,6 +611,20 @@ int lt_torrent_handle_set_flags(lt_torrent_handle_t handle, uint64_t flags) {
     }
 }
 
+int lt_torrent_handle_force_recheck(lt_torrent_handle_t handle) {
+    if (!handle) return -1;
+
+    auto h = static_cast<lt::torrent_handle*>(handle);
+    if (!h->is_valid()) return -1;
+
+    try {
+        h->force_recheck();
+        return 0;
+    } catch (const std::exception&) {
+        return -1;
+    }
+}
+
 // Minimal JSON parser for flat settings objects
 // Handles: {"key1": "str", "key2": 123, "key3": true, "key4": false}
 static void skip_json_ws(const char*& p) {
