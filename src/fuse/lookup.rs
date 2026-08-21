@@ -343,17 +343,7 @@ impl DataResolver {
                         DATA_INO
                     } else {
                         let parent_path = path_parts[..path_parts.len() - 1].join("/");
-                        let db_guard = db.lock().ok()?;
-
-                        let torrents = db_guard
-                            .get_torrents_by_source_path(&parent_path)
-                            .ok()
-                            .unwrap_or_default();
-                        if !torrents.is_empty() {
-                            InodeManager::make_torrent_root_ino(torrents[0].id)
-                        } else {
-                            DATA_INO
-                        }
+                        InodeManager::make_source_path_dir_ino(&parent_path)
                     }
                 };
                 entries.push((parent_ino, 2, FileKind::Directory, "..".to_string()));
@@ -486,5 +476,190 @@ impl DataResolver {
             error!("Database not available");
             FsError::Internal("database not available".to_string())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DataInode, DataResolver, FileKind};
+    use crate::db::{Database, InsertTorrentResult};
+    use crate::fuse::inodes::{DATA_INO, InodeManager};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Build a DB with a single torrent at the given source_path.
+    fn db_with_torrent(source_path: &str) -> Arc<Mutex<Database>> {
+        let mut db = Database::open_in_memory().unwrap();
+        let result = db
+            .insert_torrent(
+                source_path,
+                "test-torrent",
+                "test.torrent",
+                1024,
+                "abc123",
+                1,
+            )
+            .unwrap();
+        assert!(matches!(result, InsertTorrentResult::Inserted(_)));
+        Arc::new(Mutex::new(db))
+    }
+
+    /// Find the `..` entry's ino from a readdir result.
+    fn dotdot_ino(entries: &[(u64, i64, FileKind, String)]) -> u64 {
+        entries
+            .iter()
+            .find(|(_, _, _, name)| name == "..")
+            .map(|(ino, _, _, _)| *ino)
+            .expect("`..` entry not found")
+    }
+
+    /// TSI-2237: TorrentRoot `..` must point to the parent source-path
+    /// directory inode, not an arbitrary sibling torrent root.
+    ///
+    /// source_path = "a/b" → `..` should be `make_source_path_dir_ino("a")`,
+    /// matching the `..` returned by readdir on `SourcePathDir { path: "a" }`.
+    #[test]
+    fn torrent_root_dotdot_points_to_parent_source_path_dir() {
+        let db = db_with_torrent("a/b");
+
+        let torrent_ino = InodeManager::make_torrent_root_ino(1);
+
+        let mut inode_mgr = InodeManager::new(Duration::from_secs(0));
+        inode_mgr.data_inodes.insert(
+            torrent_ino,
+            DataInode::TorrentRoot {
+                torrent_id: 1,
+                source_path: "a/b".to_string(),
+                name: "test-torrent".to_string(),
+                filename: "test.torrent".to_string(),
+            },
+        );
+
+        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, torrent_ino, 0)
+            .expect("readdir TorrentRoot returned entries");
+
+        let dotdot = dotdot_ino(&entries);
+        let expected = InodeManager::make_source_path_dir_ino("a");
+
+        assert_eq!(
+            dotdot, expected,
+            "TorrentRoot `..` should point to parent source-path dir inode"
+        );
+
+        // Cross-check: readdir on the parent SourcePathDir { path: "a" }
+        // must yield the same inode for its `.` entry, proving the tree
+        // is consistent in both directions.
+        let parent_ino = InodeManager::make_source_path_dir_ino("a");
+        let mut inode_mgr2 = InodeManager::new(Duration::from_secs(0));
+        inode_mgr2.data_inodes.insert(
+            parent_ino,
+            DataInode::SourcePathDir {
+                path: "a".to_string(),
+            },
+        );
+        let parent_entries = DataResolver::readdir_data(&mut inode_mgr2, &db, parent_ino, 0)
+            .expect("readdir SourcePathDir returned entries");
+        let dot = parent_entries
+            .iter()
+            .find(|(_, _, _, name)| name == ".")
+            .map(|(ino, _, _, _)| *ino)
+            .expect("`.` entry not found");
+
+        assert_eq!(dot, parent_ino, "SourcePathDir `.` is its own inode");
+    }
+
+    /// TSI-2237: when source_path is a single path segment (e.g. "a"),
+    /// `..` should point to DATA_INO (the data/ root), not skip to a
+    /// sibling torrent.
+    #[test]
+    fn torrent_root_dotdot_single_segment_points_to_data_ino() {
+        let db = db_with_torrent("a");
+
+        let torrent_ino = InodeManager::make_torrent_root_ino(1);
+        let mut inode_mgr = InodeManager::new(Duration::from_secs(0));
+        inode_mgr.data_inodes.insert(
+            torrent_ino,
+            DataInode::TorrentRoot {
+                torrent_id: 1,
+                source_path: "a".to_string(),
+                name: "test-torrent".to_string(),
+                filename: "test.torrent".to_string(),
+            },
+        );
+
+        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, torrent_ino, 0)
+            .expect("readdir returned entries");
+
+        assert_eq!(
+            dotdot_ino(&entries),
+            DATA_INO,
+            "single-segment source_path `..` should be DATA_INO"
+        );
+    }
+
+    /// TSI-2237: empty source_path (torrent at data/ root) → `..` is DATA_INO.
+    #[test]
+    fn torrent_root_dotdot_empty_source_path_points_to_data_ino() {
+        let db = db_with_torrent("");
+
+        let torrent_ino = InodeManager::make_torrent_root_ino(1);
+        let mut inode_mgr = InodeManager::new(Duration::from_secs(0));
+        inode_mgr.data_inodes.insert(
+            torrent_ino,
+            DataInode::TorrentRoot {
+                torrent_id: 1,
+                source_path: String::new(),
+                name: "test-torrent".to_string(),
+                filename: "test.torrent".to_string(),
+            },
+        );
+
+        let entries = DataResolver::readdir_data(&mut inode_mgr, &db, torrent_ino, 0)
+            .expect("readdir returned entries");
+
+        assert_eq!(
+            dotdot_ino(&entries),
+            DATA_INO,
+            "empty source_path `..` should be DATA_INO"
+        );
+    }
+
+    /// TSI-2237: multiple torrents sharing a parent source_path — `..`
+    /// from any of their roots must resolve to the same parent dir
+    /// inode (the source-path dir), not to torrents[0]'s root.
+    #[test]
+    fn torrent_root_dotdot_shared_parent_is_stable_across_torrents() {
+        let mut db = Database::open_in_memory().unwrap();
+        db.insert_torrent("a/b", "t1", "t1.torrent", 1024, "h1", 1)
+            .unwrap();
+        db.insert_torrent("a/b", "t2", "t2.torrent", 2048, "h2", 1)
+            .unwrap();
+        let db = Arc::new(Mutex::new(db));
+
+        let expected_parent = InodeManager::make_source_path_dir_ino("a");
+
+        for (tid, name) in [(1, "t1"), (2, "t2")] {
+            let torrent_ino = InodeManager::make_torrent_root_ino(tid);
+            let mut inode_mgr = InodeManager::new(Duration::from_secs(0));
+            inode_mgr.data_inodes.insert(
+                torrent_ino,
+                DataInode::TorrentRoot {
+                    torrent_id: tid,
+                    source_path: "a/b".to_string(),
+                    name: name.to_string(),
+                    filename: format!("{}.torrent", name),
+                },
+            );
+
+            let entries = DataResolver::readdir_data(&mut inode_mgr, &db, torrent_ino, 0)
+                .expect("readdir returned entries");
+
+            assert_eq!(
+                dotdot_ino(&entries),
+                expected_parent,
+                "torrent {} `..` should point to parent source-path dir, not a sibling",
+                name
+            );
+        }
     }
 }
