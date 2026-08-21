@@ -407,7 +407,7 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
         }
     }
     // Unregister the alert-notify hook before the session is dropped.
-    if let Some(consumer) = state.alert_consumer.take() {
+    if let Some(mut consumer) = state.alert_consumer.take() {
         consumer.stop();
     }
     tracing::info!("Download engine stopped");
