@@ -33,12 +33,13 @@
 #include <cctype>
 #include <map>
 #include <set>
-#include <fstream>
+#include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
+#include <fstream>
 #include <openssl/sha.h>
-
 // ── DIAG logging gate ──────────────────────────────────────────────────────
 // Verbose per-piece/per-operation `[DIAG]` logging floods stderr during active
 // download (one line per `async_write` / `async_hash` / `write_piece` block).
@@ -1341,7 +1342,34 @@ public:
         file.seekp(offset);
         file.write(buf, size);
         if (!file.good()) return false;
+        // TSI-2263: flush + fsync so piece data reaches disk before
+        // the metadata is persisted.  Without fsync the OS page cache
+        // holds the dirty page; a container restart (which may not
+        // flush dirty pages) leaves a partial / zero-length piece file
+        // that the restart scan registers at the wrong size, causing
+        // the background SHA-1 verifier to purge it ("cache piece
+        // cleaned" after restart).
+        file.flush();
+        // TSI-2263 review: flush pushes the C++ stream buffer to the OS
+        // page cache.  If it fails (disk full / I/O error) the piece is
+        // incomplete — proceeding to fsync and returning true would
+        // silently swallow a partial write, the exact bug class this fix
+        // targets.  Return false so libtorrent sees the write failure.
+        if (!file.good()) {
+            file.close();
+            return false;
+        }
         file.close();
+        // Open the file descriptor solely to fsync it.  fstream does not
+        // expose its fd, so reopen the path read-only and fsync that.
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd >= 0) {
+            if (::fsync(fd) != 0) {
+                TORRENTFS_DIAG("[DIAG] write_piece fsync failed for %s: %s\n",
+                        path.c_str(), strerror(errno));
+            }
+            ::close(fd);
+        }
         return true;
     }
 

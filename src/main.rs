@@ -180,6 +180,26 @@ fn wait_for_shutdown(
     if let Some(ds) = &download_service {
         ds.shutdown();
     }
+    // TSI-2263: flush the cache metadata to disk (with fsync) before
+    // unmounting.  The download engine has already stopped, so no new
+    // pieces are being registered.  Without this explicit flush, a
+    // container restart can leave cache_metadata.txt stale, causing
+    // scan_pieces_subdirectory to register pieces at wrong sizes and
+    // the verifier to purge them ("cache piece cleaned" after restart).
+    if let Some(ds) = &download_service {
+        if let Some(cache) = ds.get_cache_manager() {
+            match cache.lock() {
+                Ok(cm) => {
+                    if let Err(e) = cm.flush() {
+                        warn!("Failed to flush cache metadata on shutdown: {:?}", e);
+                    } else {
+                        info!("cache metadata flushed to disk");
+                    }
+                }
+                Err(_) => warn!("Cache lock poisoned on shutdown — metadata not flushed"),
+            }
+        }
+    }
     info!("draining download worker queue");
     worker_pool.shutdown();
     info!("unmounting FUSE filesystem");
