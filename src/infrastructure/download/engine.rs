@@ -684,7 +684,7 @@ impl EngineState {
                     match handle.status() {
                         Ok(s) => {
                             status = s;
-                            if status.num_peers > 1 || status.num_seeds > 0 {
+                            if status.num_peers > 0 || status.num_seeds > 0 {
                                 break;
                             }
                         }
