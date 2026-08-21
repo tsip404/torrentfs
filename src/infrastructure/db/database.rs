@@ -209,8 +209,52 @@ impl Database {
     /// Caller MUST have disabled foreign_keys before calling this, otherwise
     /// DROP TABLE will cascade-delete child rows in torrent_directories /
     /// directory_closure / torrent_files.
+    ///
+    /// With foreign_keys OFF, the old UNIQUE(info_hash, source_path) constraint may
+    /// have left multiple rows per (source_path, filename). Only MAX(id) per key is
+    /// retained; the rest would leave orphaned child rows in torrent_files /
+    /// torrent_directories / directory_closure (their torrent_id no longer exists
+    /// after DROP TABLE, and re-enabling foreign_keys does not retroactively clean
+    /// them). We therefore collect the non-retained ids and explicitly DELETE their
+    /// child rows before the DROP. The whole migration runs in a transaction for
+    /// crash consistency.
     pub(crate) fn migrate_v5(conn: &Connection) -> Result<(), DbError> {
-        conn.execute_batch(
+        let tx = conn.unchecked_transaction()?;
+
+        // Child rows of the non-retained torrents must be removed explicitly;
+        // foreign_keys is OFF so DROP TABLE will not cascade.
+        tx.execute_batch(
+            "CREATE TEMP TABLE _v5_orphans AS
+             SELECT id FROM torrents
+             WHERE id NOT IN (
+                 SELECT MAX(id) FROM torrents GROUP BY source_path, filename
+             );",
+        )?;
+
+        // directory_closure has no direct torrent_id FK — clean rows whose
+        // ancestor/descendant directory ids belong to orphaned torrents.
+        // CTE computes the orphan directory id set once.
+        tx.execute_batch(
+            "WITH orphan_dirs AS (
+                 SELECT id FROM torrent_directories
+                 WHERE torrent_id IN (SELECT id FROM _v5_orphans)
+             )
+             DELETE FROM directory_closure
+             WHERE ancestor_id IN (SELECT id FROM orphan_dirs)
+                OR descendant_id IN (SELECT id FROM orphan_dirs);",
+        )?;
+
+        tx.execute_batch(
+            "DELETE FROM torrent_directories
+             WHERE torrent_id IN (SELECT id FROM _v5_orphans);
+
+             DELETE FROM torrent_files
+             WHERE torrent_id IN (SELECT id FROM _v5_orphans);",
+        )?;
+
+        tx.execute_batch("DROP TABLE IF EXISTS _v5_orphans;")?;
+
+        tx.execute_batch(
             "CREATE TABLE torrents_v5 (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 info_hash TEXT NOT NULL,
@@ -248,6 +292,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_torrents_info_hash_source_path ON torrents(info_hash, source_path);
             CREATE INDEX IF NOT EXISTS idx_torrents_source_path ON torrents(source_path);",
         )?;
+
+        tx.commit()?;
         Ok(())
     }
 
