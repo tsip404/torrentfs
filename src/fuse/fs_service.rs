@@ -434,8 +434,13 @@ impl FsService {
                         Some((*child_ino, FileKind::Directory, name.clone()))
                     }
                     InodeData::File {
-                        parent: p, name, ..
-                    } if *p == ino => Some((*child_ino, FileKind::RegularFile, name.clone())),
+                        parent: p,
+                        name,
+                        unlinked,
+                        ..
+                    } if *p == ino && !*unlinked => {
+                        Some((*child_ino, FileKind::RegularFile, name.clone()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -539,6 +544,7 @@ impl FsService {
                 parent,
                 name: name.to_string(),
                 data: Vec::new(),
+                unlinked: false,
             },
         );
 
@@ -577,6 +583,7 @@ impl FsService {
                 parent,
                 name: name.to_string(),
                 data: Vec::new(),
+                unlinked: false,
             },
         );
 
@@ -706,8 +713,22 @@ impl FsService {
     /// Persist a closed `.torrent` into the database (release).
     pub fn release(&mut self, fh: u64) -> FsResult<()> {
         if let Some(ino) = self.inode_mgr.open_files.remove(&fh) {
-            if let Some(InodeData::File { data, name, parent }) =
-                self.inode_mgr.inodes.get(&ino).cloned()
+            // TSI-2234: the file handle is now closed. If the inode was
+            // unlinked while still open, this `release` is the "last close"
+            // point at which the inode is finally destroyed (unless another
+            // handle is still open). An unlinked `.torrent` was already
+            // removed from the DB by `unlink`, so do NOT re-persist its
+            // buffered bytes here — just retire the inode.
+            if self.inode_mgr.is_unlinked_file(ino) {
+                if self.inode_mgr.open_handle_count(ino) == 0 {
+                    self.inode_mgr.inodes.remove(&ino);
+                }
+                return Ok(());
+            }
+
+            if let Some(InodeData::File {
+                data, name, parent, ..
+            }) = self.inode_mgr.inodes.get(&ino).cloned()
             {
                 if name.ends_with(".torrent") {
                     if data.is_empty() {
@@ -862,7 +883,11 @@ impl FsService {
             Some(InodeData::Directory { .. }) => {
                 let has_children = self.inode_mgr.inodes.iter().any(|(_, data)| match data {
                     InodeData::Directory { parent: p, .. } if *p == ino => true,
-                    InodeData::File { parent: p, .. } if *p == ino => true,
+                    InodeData::File {
+                        parent: p,
+                        unlinked,
+                        ..
+                    } if *p == ino && !*unlinked => true,
                     _ => false,
                 });
 
@@ -937,10 +962,16 @@ impl FsService {
                     match ts.remove_torrent(&filename, &source_path) {
                         Ok(Some(torrent_id)) => {
                             removed_id = Some(torrent_id);
-                            self.inode_mgr.inodes.remove(&ino);
-                            self.inode_mgr
-                                .open_files
-                                .retain(|_, &mut open_ino| open_ino != ino);
+                            // TSI-2234: defer inode destruction. Mark the
+                            // inode unlinked (so its directory name vanishes
+                            // from lookup/readdir) but keep the inode + any
+                            // open handles alive: read/write/flush/release
+                            // on a still-open handle must keep working until
+                            // the last handle is released. If no handle is
+                            // open, `unlink_file` destroys the inode now.
+                            // open_files is NOT stripped: that would orphan
+                            // the handle and silently drop buffered bytes.
+                            self.inode_mgr.unlink_file(ino);
 
                             // Clean up metadata directories left empty by this
                             // deletion so the data/ mirror no longer exposes
@@ -986,10 +1017,8 @@ impl FsService {
                             );
                         }
                         Ok(None) => {
-                            self.inode_mgr.inodes.remove(&ino);
-                            self.inode_mgr
-                                .open_files
-                                .retain(|_, &mut open_ino| open_ino != ino);
+                            // TSI-2234: same deferred-destruction logic.
+                            self.inode_mgr.unlink_file(ino);
                             info!("Deleted file '{}' (not yet in database)", filename);
                         }
                         Err(e) => {
@@ -998,10 +1027,8 @@ impl FsService {
                         }
                     }
                 } else {
-                    self.inode_mgr.inodes.remove(&ino);
-                    self.inode_mgr
-                        .open_files
-                        .retain(|_, &mut open_ino| open_ino != ino);
+                    // TSI-2234: same deferred-destruction logic (no DB).
+                    self.inode_mgr.unlink_file(ino);
                     info!("Deleted file '{}' (no database)", filename);
                 }
 
@@ -1132,8 +1159,13 @@ impl FsService {
                 return Err(FsError::PermissionDenied);
             }
 
-            let (file_data, old_name) = match self.inode_mgr.inodes.get(&source_ino) {
-                Some(InodeData::File { data, name, .. }) => (data.clone(), name.clone()),
+            let (file_data, old_name, was_unlinked) = match self.inode_mgr.inodes.get(&source_ino) {
+                Some(InodeData::File {
+                    data,
+                    name,
+                    unlinked,
+                    ..
+                }) => (data.clone(), name.clone(), *unlinked),
                 None => {
                     return Err(FsError::NotFound);
                 }
@@ -1146,9 +1178,9 @@ impl FsService {
                     parent: newparent,
                     name: newname.to_string(),
                     data: file_data,
+                    unlinked: was_unlinked,
                 },
             );
-
             if let Some(ref ts) = self.torrent_service {
                 let old_source_path = self.inode_mgr.extract_source_path(parent);
                 let new_source_path = self.inode_mgr.extract_source_path(newparent);
@@ -1428,10 +1460,14 @@ impl FsService {
             if let InodeData::File {
                 name,
                 data: file_data,
+                unlinked,
                 ..
             } = data
             {
-                if name.ends_with(".torrent") && !file_data.is_empty() {
+                // TSI-2234: skip unlinked-but-open inodes — their torrent_id
+                // was already removed from the DB by `unlink`, so matching
+                // their buffered bytes here would be a stale dirty read.
+                if !*unlinked && name.ends_with(".torrent") && !file_data.is_empty() {
                     if let Ok(info) = TorrentInfo::from_bytes(file_data.clone()) {
                         if let Ok(metadata) = info.metadata() {
                             if hex::encode(metadata.info_hash) == torrent.info_hash {
@@ -2088,6 +2124,7 @@ mod tests {
                 parent: ROOT_INO,
                 name: "x".to_string(),
                 data: vec![b'x'],
+                unlinked: false,
             },
         );
         let outcome = svc.open(ino).expect("open metadata file");
@@ -2464,5 +2501,186 @@ mod tests {
 
         let err = svc.flush(ino).unwrap_err();
         assert_eq!(err, FsError::InvalidArgument);
+    }
+
+    // ── TSI-2234: unlink-while-open keeps the inode alive ───────────────
+
+    /// TSI-2234: `unlink` on a file with no open handle destroys the
+    /// inode immediately — the name is gone and the inode is absent.
+    #[test]
+    fn unlink_closed_file_destroys_inode() {
+        let mut svc = bare_service();
+        // Create a file, write valid torrent bytes, and close the handle.
+        // `release` for valid data does NOT remove the inode (no DB in
+        // bare_service, so the add_torrent path is skipped but the inode
+        // lingers), so the inode is alive with zero open handles — the
+        // precondition for immediate destruction on unlink.
+        let created = svc.create(METADATA_INO, "closed.torrent").expect("create");
+        let ino = created.attr.ino;
+        let fh = created.fh;
+        let data = minimal_torrent_bytes();
+        svc.write(ino, 0, &data).expect("write valid torrent");
+        svc.release(fh).expect("close handle");
+        assert!(svc.inode_mgr.inodes.contains_key(&ino));
+        assert_eq!(svc.inode_mgr.open_handle_count(ino), 0);
+
+        // unlink with no open handle → immediate destruction.
+        svc.unlink(METADATA_INO, "closed.torrent").expect("unlink");
+        assert_eq!(
+            svc.inode_mgr
+                .find_child_by_name(METADATA_INO, "closed.torrent"),
+            None
+        );
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+    }
+
+    /// TSI-2234: an open handle keeps read/write working after unlink, and
+    /// the inode is destroyed only on the LAST release (not the first).
+    #[test]
+    fn unlink_while_open_keeps_handle_until_last_release() {
+        let mut svc = bare_service();
+        let created = svc.create(METADATA_INO, "open.torrent").expect("create");
+        let ino = created.attr.ino;
+        let fh1 = created.fh;
+        // Open a second handle on the same inode.
+        let fh2 = match svc.open(ino).expect("open") {
+            OpenOutcome { fh, .. } => fh,
+        };
+        svc.write(ino, 0, b"hello").expect("write");
+
+        // unlink while both handles are open.
+        svc.unlink(METADATA_INO, "open.torrent").expect("unlink");
+        // Name gone, inode lingers (unlinked).
+        assert_eq!(
+            svc.inode_mgr
+                .find_child_by_name(METADATA_INO, "open.torrent"),
+            None
+        );
+        assert!(svc.inode_mgr.is_unlinked_file(ino));
+        assert_eq!(svc.inode_mgr.open_handle_count(ino), 2);
+
+        // read/write via fh1's ino still succeed.
+        svc.write(ino, 5, b"!").expect("write after unlink");
+        let outcome = svc.read(ino, 0, 6).expect("read after unlink");
+        let buf = match outcome {
+            ReadOutcome::Ready(b) => b,
+            _ => panic!("expected Ready read"),
+        };
+        assert_eq!(&buf, b"hello!");
+
+        // First release: inode survives (fh2 still open).
+        svc.release(fh1).expect("release fh1");
+        assert!(svc.inode_mgr.inodes.contains_key(&ino));
+        assert_eq!(svc.inode_mgr.open_handle_count(ino), 1);
+
+        // Second (last) release: inode destroyed.
+        svc.release(fh2).expect("release fh2");
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+    }
+
+    /// TSI-2234: after unlink, `readdir` no longer lists the file even
+    /// though its inode lingers for an open handle.
+    #[test]
+    fn unlink_hides_name_from_readdir_while_open() {
+        let mut svc = bare_service();
+        let created = svc.create(METADATA_INO, "hidden.torrent").expect("create");
+        let ino = created.attr.ino;
+        let fh = created.fh;
+        // Visible before unlink.
+        let names: Vec<String> = svc
+            .readdir(METADATA_INO, 0)
+            .expect("readdir")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "hidden.torrent"));
+
+        svc.unlink(METADATA_INO, "hidden.torrent").expect("unlink");
+
+        // Gone from readdir after unlink.
+        let names: Vec<String> = svc
+            .readdir(METADATA_INO, 0)
+            .expect("readdir")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(!names.iter().any(|n| n == "hidden.torrent"));
+        // Inode still alive.
+        assert!(svc.inode_mgr.inodes.contains_key(&ino));
+        svc.release(fh).expect("release");
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+    }
+
+    /// TSI-2234: a second `unlink` of the same name returns `ENOENT`
+    /// because `find_child_by_name` skips the unlinked inode.
+    #[test]
+    fn unlink_twice_returns_not_found() {
+        let mut svc = bare_service();
+        let created = svc.create(METADATA_INO, "twice.torrent").expect("create");
+        let _fh = created.fh;
+        svc.unlink(METADATA_INO, "twice.torrent")
+            .expect("first unlink");
+        let err = svc.unlink(METADATA_INO, "twice.torrent").unwrap_err();
+        assert_eq!(err, FsError::NotFound);
+    }
+
+    /// TSI-2234: creating a new file with the same name as an unlinked-but-
+    /// still-open inode succeeds (the old name is freed even though the
+    /// old inode lingers).
+    #[test]
+    fn recreate_name_after_unlink_while_open_succeeds() {
+        let mut svc = bare_service();
+        let created = svc.create(METADATA_INO, "reuse.torrent").expect("create");
+        let old_ino = created.attr.ino;
+        let _fh = created.fh;
+        svc.unlink(METADATA_INO, "reuse.torrent").expect("unlink");
+        // Re-create with the same name — must not collide with the lingering
+        // unlinked inode.
+        let created2 = svc.create(METADATA_INO, "reuse.torrent").expect("recreate");
+        assert_ne!(created2.attr.ino, old_ino);
+        // Both inodes coexist: old one (unlinked, open) + new one (linked).
+        assert!(svc.inode_mgr.is_unlinked_file(old_ino));
+        assert!(!svc.inode_mgr.is_unlinked_file(created2.attr.ino));
+    }
+
+    /// TSI-2234: an unlinked `.torrent` is NOT re-persisted on release —
+    /// the torrent was already removed from the DB by `unlink`, so
+    /// `release` just destroys the buffered inode.
+    #[test]
+    fn unlinked_torrent_not_repersisted_on_release() {
+        let mut svc = service_with_db();
+        let (ino, fh) = create_torrent_file(&mut svc, "repersist.torrent");
+        svc.write(ino, 0, &minimal_torrent_bytes()).expect("write");
+        svc.unlink(METADATA_INO, "repersist.torrent")
+            .expect("unlink");
+        assert!(svc.inode_mgr.is_unlinked_file(ino));
+        // release must NOT spawn a background add_torrent for an unlinked
+        // file — processing_torrents stays empty.
+        svc.release(fh).expect("release");
+        assert!(svc.processing_torrents.lock().unwrap().is_empty());
+        // Inode destroyed on last release.
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+    }
+
+    /// TSI-2234 (review blocking #1): a directory whose only remaining
+    /// child is an unlinked-but-still-open file must be removable — POSIX
+    /// treats "only unlinked-but-open files" as empty. Before the fix,
+    /// `rmdir` saw the lingering unlinked `File` inode as a child and
+    /// wrongly returned `ENOTEMPTY`.
+    #[test]
+    fn rmdir_succeeds_after_unlink_while_open() {
+        let mut svc = bare_service();
+        // Create a subdirectory under metadata/ and a .torrent inside it.
+        let dir = svc.mkdir(METADATA_INO, "sub").expect("mkdir sub").ino;
+        let created = svc.create(dir, "x.torrent").expect("create");
+        let _fh = created.fh;
+        // Unlink the file while its handle is open — inode lingers (unlinked).
+        svc.unlink(dir, "x.torrent").expect("unlink");
+        assert!(svc.inode_mgr.is_unlinked_file(created.attr.ino));
+        assert!(svc.inode_mgr.inodes.contains_key(&created.attr.ino));
+        // The directory now has no *visible* children; rmdir must succeed.
+        svc.rmdir(METADATA_INO, "sub")
+            .expect("rmdir after unlink-while-open");
+        assert!(!svc.inode_mgr.inodes.contains_key(&dir));
     }
 }
