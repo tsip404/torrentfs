@@ -122,6 +122,7 @@ int lt_torrent_handle_set_piece_priority(lt_torrent_handle_t handle, int piece_i
 int lt_torrent_handle_set_all_piece_priorities(lt_torrent_handle_t handle, int priority);
 int lt_torrent_handle_set_flags(lt_torrent_handle_t handle, uint64_t flags);
 int lt_torrent_handle_unset_flags(lt_torrent_handle_t handle, uint64_t flags);
+int lt_torrent_handle_force_recheck(lt_torrent_handle_t handle);
 
 void lt_session_apply_settings(lt_session_t session, const char* settings_json);
 

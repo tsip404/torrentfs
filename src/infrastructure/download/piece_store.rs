@@ -17,7 +17,6 @@ use crate::error::{TorrentError, TorrentResult};
 use crate::infrastructure::cache::CacheManager;
 use crate::infrastructure::metadata::TorrentInfo;
 
-
 pub struct PieceStore {
     cache: Arc<Mutex<CacheManager>>,
 }
@@ -52,6 +51,15 @@ impl PieceStore {
             .lock()
             .map(|c| c.has_piece_on_disk(piece_key))
             .unwrap_or(false)
+    }
+
+    /// TSI-2258: whether a piece is stale — libtorrent's `have_piece` says
+    /// true but the on-disk piece file has been purged (deleted by cache
+    /// verification or manual `delete_piece`).  This is the unified stale
+    /// detection primitive used by the engine's `has_stale_pieces`,
+    /// `all_pieces_local`, and the piece-wait loop.
+    pub fn has_stale_piece(&self, piece_key: &str) -> bool {
+        !self.has_piece_on_disk(piece_key)
     }
 
     /// Read a whole piece from the on-disk cache, recording an access.
@@ -89,7 +97,12 @@ impl PieceStore {
     /// metadata and marks it verified.  libtorrent's custom storage has
     /// already written the piece bytes to disk; this only makes the cache
     /// aware of them.
-    pub fn register_piece(&self, info_hash: &str, piece_index: i32, size: u64) -> TorrentResult<()> {
+    pub fn register_piece(
+        &self,
+        info_hash: &str,
+        piece_index: i32,
+        size: u64,
+    ) -> TorrentResult<()> {
         let key = Self::piece_key(info_hash, piece_index);
         let mut cache = self.cache.lock().map_err(|_| Self::poisoned())?;
         cache.add_piece(&key, size)
@@ -156,11 +169,7 @@ impl PieceStore {
         }
 
         let files = info.files()?;
-        let file_start_offset: u64 = files
-            .iter()
-            .take(file_index as usize)
-            .map(|f| f.size)
-            .sum();
+        let file_start_offset: u64 = files.iter().take(file_index as usize).map(|f| f.size).sum();
         let file_size = files.get(file_index as usize).map(|f| f.size).unwrap_or(0);
 
         let absolute_offset = file_start_offset + offset;
@@ -172,10 +181,7 @@ impl PieceStore {
         let size = std::cmp::min(size as u64, file_end - absolute_offset) as u32;
         let start_piece = (absolute_offset / piece_length) as i32;
         let end_offset = absolute_offset + size as u64;
-        let end_piece = std::cmp::min(
-            ((end_offset - 1) / piece_length) as i32,
-            num_pieces - 1,
-        );
+        let end_piece = std::cmp::min(((end_offset - 1) / piece_length) as i32, num_pieces - 1);
 
         if start_piece > end_piece || start_piece >= num_pieces {
             return Ok(true);
@@ -197,5 +203,155 @@ impl PieceStore {
         }
 
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// TSI-2258: after `delete_piece` purges a piece (file + metadata), the
+    /// `has_piece_on_disk` check must return `false` — this is the signal the
+    /// engine's stale-bitmask detection uses to decide that `have_piece == true`
+    /// is stale and a `force_recheck` is needed before the read proceeds.
+    #[test]
+    fn has_piece_on_disk_false_after_delete_piece() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
+        let store = PieceStore::new(cache);
+
+        let info_hash = "abc123";
+        let piece_idx = 0;
+        let piece_key = PieceStore::piece_key(info_hash, piece_idx);
+        let piece_content = vec![0xAAu8; 16_384];
+
+        // Write the piece file to disk (libtorrent's custom storage does
+        // this in production) and register it in cache metadata.
+        let path = {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            c.ensure_piece_dir(&piece_key)?
+        };
+        std::fs::write(&path, &piece_content)?;
+        store.register_piece(info_hash, piece_idx, 16_384)?;
+
+        assert!(
+            store.has_piece_on_disk(&piece_key),
+            "piece should be on disk after registration"
+        );
+
+        // Purge the piece (simulates cache verification or manual delete).
+        {
+            let cache = store.cache_manager();
+            let mut c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            c.delete_piece(&piece_key)?;
+        }
+
+        assert!(
+            !store.has_piece_on_disk(&piece_key),
+            "piece must NOT be on disk after delete_piece — \
+             this false result is the stale-bitmask trigger"
+        );
+        assert!(
+            !store.has_piece(info_hash, piece_idx),
+            "metadata also cleared"
+        );
+
+        Ok(())
+    }
+
+    /// TSI-2258: `has_stale_piece` is the unified stale-detection primitive
+    /// used by the engine's `has_stale_pieces`, `all_pieces_local`, the
+    /// piece-wait loop, and the deadline-setting section.  After a purge,
+    /// it must return `true` (piece file gone) so the engine knows the
+    /// libtorrent bitmask is stale.
+    #[test]
+    fn has_stale_piece_true_after_purge() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
+        let store = PieceStore::new(cache);
+
+        let info_hash = "ghi789";
+        let piece_idx = 0;
+        let piece_key = PieceStore::piece_key(info_hash, piece_idx);
+
+        // No file on disk yet → stale (no piece to serve).
+        assert!(
+            store.has_stale_piece(&piece_key),
+            "piece not on disk → stale detection returns true"
+        );
+
+        // Write the piece file to disk → not stale.
+        let path = {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            c.ensure_piece_dir(&piece_key)?
+        };
+        std::fs::write(&path, vec![0xCCu8; 16_384])?;
+        store.register_piece(info_hash, piece_idx, 16_384)?;
+        assert!(
+            !store.has_stale_piece(&piece_key),
+            "piece on disk → not stale"
+        );
+
+        // Purge → stale again.
+        {
+            let cache = store.cache_manager();
+            let mut c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            c.delete_piece(&piece_key)?;
+        }
+        assert!(
+            store.has_stale_piece(&piece_key),
+            "piece purged → stale detection returns true"
+        );
+
+        Ok(())
+    }
+
+    /// TSI-2258: `read_piece` must fail (Err) when the piece file was purged.
+    /// The engine's `read_from_disk` uses this Err to return `PieceNotReady`
+    /// instead of silently skipping, which would produce a short-read EIO.
+    #[test]
+    fn read_piece_fails_after_delete_piece() -> TorrentResult<()> {
+        let temp_dir = TempDir::new().unwrap();
+        let cache = Arc::new(Mutex::new(CacheManager::new(temp_dir.path(), 1024 * 1024)?));
+        let store = PieceStore::new(cache);
+
+        let info_hash = "def456";
+        let piece_idx = 1;
+        let piece_key = PieceStore::piece_key(info_hash, piece_idx);
+        let piece_content = vec![0xBBu8; 16_384];
+
+        // Write the piece file to disk and register in metadata.
+        let path = {
+            let cache = store.cache_manager();
+            let c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            c.ensure_piece_dir(&piece_key)?
+        };
+        std::fs::write(&path, &piece_content)?;
+        store.register_piece(info_hash, piece_idx, 16_384)?;
+
+        // Sanity: reading before purge works.
+        let data = store.read_piece(&piece_key)?;
+        assert_eq!(data.len(), 16_384);
+
+        // Purge.
+        {
+            let cache = store.cache_manager();
+            let mut c = cache.lock().map_err(|_| PieceStore::poisoned())?;
+            c.delete_piece(&piece_key)?;
+        }
+
+        // After purge, read_piece must Err — the engine maps this to
+        // PieceNotReady, not a silent skip.
+        let result = store.read_piece(&piece_key);
+        assert!(
+            result.is_err(),
+            "read_piece must fail after delete_piece so read_from_disk \
+             returns PieceNotReady instead of silently skipping"
+        );
+
+        Ok(())
     }
 }
