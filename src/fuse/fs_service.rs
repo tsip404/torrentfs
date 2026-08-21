@@ -2028,9 +2028,22 @@ mod tests {
         assert_eq!(err, FsError::ReadOnlyFileSystem);
     }
 
+    /// TSI-2248: `rmdir`/`unlink` on the read-only `data/` namespace must
+    /// return `EROFS` **without any side effect** — no inode table mutation,
+    /// no `data_inodes` mutation, no cache eviction.  A mutation here would
+    /// corrupt FUSE session state: subsequent `readdir`/`lookup` on the
+    /// data/ subtree could serve stale or missing entries, and in the worst
+    /// case the dispatcher thread could dereference a half-removed inode,
+    /// aborting the FUSE session (mount disappears while the process lives).
+    /// This test pins the early-return contract so the guard can never be
+    /// accidentally bypassed by a future refactor.
     #[test]
     fn data_namespace_unlink_rmdir_return_erofs() {
         let mut svc = bare_service();
+
+        // Snapshot the inode tables before any EROFS operation.
+        let inodes_before = svc.inode_mgr.inodes.len();
+        let data_inodes_before = svc.inode_mgr.data_inodes.len();
 
         let err = svc.unlink(DATA_INO, "foo").unwrap_err();
         assert_eq!(err, FsError::ReadOnlyFileSystem);
@@ -2043,6 +2056,19 @@ mod tests {
         assert_eq!(err, FsError::ReadOnlyFileSystem);
         let err = svc.rmdir(data_dir_ino, "foo").unwrap_err();
         assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        // TSI-2248: No side effects — the early-return guard must not
+        // mutate inode state, which would corrupt the FUSE session.
+        assert_eq!(
+            svc.inode_mgr.inodes.len(),
+            inodes_before,
+            "EROFS path must not mutate the inode table"
+        );
+        assert_eq!(
+            svc.inode_mgr.data_inodes.len(),
+            data_inodes_before,
+            "EROFS path must not mutate the data_inodes cache"
+        );
     }
 
     #[test]
