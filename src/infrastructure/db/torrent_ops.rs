@@ -132,8 +132,8 @@ impl Database {
 
                 if is_file {
                     tx.execute(
-                        "INSERT INTO torrent_files (torrent_id, directory_id, name, size) VALUES (?, ?, ?, ?)",
-                        params![torrent_id, current_parent_id, part, file_entry.size],
+                        "INSERT INTO torrent_files (torrent_id, directory_id, name, path, size) VALUES (?, ?, ?, ?, ?)",
+                        params![torrent_id, current_parent_id, part, &file_entry.path, file_entry.size],
                     )?;
                 } else {
                     if let Some(&cached_id) = dir_cache.get(&current_path) {
