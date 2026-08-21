@@ -68,6 +68,11 @@ pub enum Command {
         seeding: Arc<SeedingManager>,
         reply: SyncSender<()>,
     },
+    /// Remove a torrent handle from the engine session and clear its
+    /// scheduler state.  Used by the unlink/remove path when the last DB
+    /// reference to an info_hash is deleted, so the engine stops
+    /// announcing/seeding a removed torrent (TSI-2232).
+    RemoveHandle { info_hash: String },
     /// Stop the engine thread.
     Shutdown,
 }
@@ -287,6 +292,17 @@ impl DownloadEngine {
         self.send(Command::EnsureHandleAsync { info })
     }
 
+    /// Remove a torrent handle from the engine session and clear its
+    /// scheduler state.  Fire-and-forget: the command is queued and
+    /// executed eventually on the engine thread; this call does not block.
+    /// Safe to call from the FUSE unlink path — it will never stall the
+    /// dispatch loop on a busy engine (TSI-2232).
+    pub fn remove_handle(&self, info_hash: &str) -> TorrentResult<()> {
+        self.send(Command::RemoveHandle {
+            info_hash: info_hash.to_string(),
+        })
+    }
+
     /// Read a file range, driving piece download on the engine thread.
     pub fn read_file_range(
         &self,
@@ -391,7 +407,7 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
         }
     }
     // Unregister the alert-notify hook before the session is dropped.
-    if let Some(consumer) = state.alert_consumer.take() {
+    if let Some(mut consumer) = state.alert_consumer.take() {
         consumer.stop();
     }
     tracing::info!("Download engine stopped");
@@ -430,6 +446,9 @@ impl EngineState {
                 self.seeding = Some(seeding);
                 let _ = reply.send(());
             }
+            Command::RemoveHandle { info_hash } => {
+                let _ = self.remove_handle(&info_hash);
+            }
             Command::Shutdown => return true,
         }
         false
@@ -461,6 +480,19 @@ impl EngineState {
         self.scheduler
             .init_torrent(&info_hash, num_pieces as i32, piece_length)?;
         self.handles.insert(info_hash, handle);
+        Ok(())
+    }
+
+    /// Remove a torrent handle from the session and clear its scheduler
+    /// state.  Idempotent: a missing info_hash is a no-op.  Called on the
+    /// engine thread when the last DB reference to an info_hash is deleted
+    /// (TSI-2232), so the engine stops announcing/seeding a removed torrent
+    /// and its handle/scheduler entries do not leak across add/remove cycles.
+    fn remove_handle(&mut self, info_hash: &str) -> TorrentResult<()> {
+        if let Some(handle) = self.handles.remove(info_hash) {
+            self.session.remove_torrent(handle, false);
+        }
+        self.scheduler.remove_torrent(info_hash);
         Ok(())
     }
 
@@ -620,11 +652,18 @@ impl EngineState {
         std::thread::sleep(Duration::from_millis(100));
 
         // ── Slow path: peer discovery + piece-wait ─────────────────────
+        // TSI-2246: when the swarm has no available seeder we fail fast with
+        // `NoPeers` instead of falling through to the full `piece_wait_timeout`
+        // (which would surface as a `Timeout` → EIO, a misleading "I/O error"
+        // for what is really "no seeder").  We already passed the
+        // all-pieces-local fast path above, so reaching here means at least one
+        // piece is missing and only the network could supply it — which it
+        // cannot with zero peers/seeds.
+        let peer_wait_timeout =
+            Duration::from_secs(std::cmp::min(self.read_timeout_secs, 9));
         {
             let handle = self.handles.get(&info_hash).ok_or_else(|| Self::missing())?;
             if status.num_peers == 0 && status.num_seeds == 0 {
-                let peer_wait_timeout =
-                    Duration::from_secs(std::cmp::min(self.read_timeout_secs, 9));
                 let peer_wait_start = Instant::now();
                 loop {
                     if peer_wait_start.elapsed() >= peer_wait_timeout {
@@ -638,9 +677,26 @@ impl EngineState {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        // TSI-2246 review: `handle.status()` failed — return
+                        // the actual error instead of falling through to the
+                        // `NoPeers` check below, which would mask the real
+                        // cause behind a misleading "no seeder" message.
+                        Err(e) => {
+                            self.release_reader(&info_hash);
+                            return Err(e);
+                        }
                     }
                 }
+            }
+            if status.num_peers == 0 && status.num_seeds == 0 {
+                self.release_reader(&info_hash);
+                return Err(TorrentError::NoPeers(format!(
+                    "No peers or seeders connected for info_hash {} after {}s; \
+                     the swarm has no available seeder. Check tracker health or \
+                     try again later.",
+                    info_hash,
+                    peer_wait_timeout.as_secs()
+                )));
             }
             let _ = handle.status();
         }

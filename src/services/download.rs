@@ -63,6 +63,13 @@ impl DownloadService {
         self.engine.ensure_handle_async(info)
     }
 
+    /// Remove a torrent handle from the download engine session and clear
+    /// its scheduler state.  Call only when the last DB reference to the
+    /// info_hash is deleted (TSI-2232).
+    pub fn remove_handle(&self, info_hash: &str) -> TorrentResult<()> {
+        self.engine.remove_handle(info_hash)
+    }
+
     /// Read a range of bytes from a specific file within a torrent.
     pub fn read_file_range(
         &self,

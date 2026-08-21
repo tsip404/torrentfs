@@ -24,15 +24,20 @@ use crate::db::Database;
 use crate::domain::fs_error::{FsError, FsResult};
 use crate::infrastructure::metrics::Metrics;
 use crate::metadata::TorrentInfo;
+use crate::seeding::SeedingManager;
 use crate::services::download::DownloadService;
 use crate::services::seeding::SeedingService;
 use crate::services::torrent::TorrentService;
 
-use super::fs_types::{Attr, Created, DirEntry, Entry, FileKind, ReadOutcome, StatsKind};
+use super::fs_types::{
+    Attr, Created, DirEntry, Entry, FileKind, OpenOutcome, ReadOutcome, StatsKind,
+};
 use super::inodes::{
     DataInode, InodeData, InodeManager, DATA_DIR_INO_BASE, DATA_INO, DATA_TORRENT_INO_BASE,
     MAX_TORRENT_SIZE, METADATA_INO, NEXT_FH, NEXT_INO, ROOT_INO, STATS_INO,
 };
+#[cfg(test)]
+use super::inodes::{DATA_FILE_INO_BASE, SOURCE_PATH_DIR_INO_BASE};
 use super::lookup::DataResolver;
 use super::stats::{generate_directory_stats, generate_global_stats, generate_torrent_stats};
 
@@ -40,8 +45,9 @@ pub struct FsService {
     pub inode_mgr: InodeManager,
     pub db: Option<Arc<Mutex<Database>>>,
     pub torrent_service: Option<TorrentService>,
-    pub processing_torrents: Arc<Mutex<HashMap<String, ()>>>,
+    pub processing_torrents: Arc<Mutex<HashMap<(String, String), ()>>>,
     pub download_service: Option<Arc<DownloadService>>,
+    pub seeding_manager: Option<Arc<SeedingManager>>,
     pub torrent_data_cache: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub torrent_info_cache: Arc<Mutex<HashMap<String, Arc<TorrentInfo>>>>,
     pub listen_addr: String,
@@ -63,13 +69,27 @@ impl FsService {
                 .ok()
                 .map(Arc::new);
 
-        // Register SeedingManager as eviction callback on the DownloadService's CacheManager.
-        if let Some(ref ds) = download_service {
-            if let Ok(seeding_svc) = SeedingService::new(&cache_path, config) {
-                ds.register_seeding_callback(seeding_svc.get_seeding_manager());
-                info!("SeedingManager registered as CacheManager eviction callback");
-            }
-        }
+        // Create the SeedingManager and register it as the CacheManager
+        // eviction callback.  The Arc is kept on FsService so it can be
+        // shared with TorrentService for seed removal on unlink (TSI-2232).
+        let seeding_manager = match &download_service {
+            Some(ds) => match SeedingService::new(&cache_path, config) {
+                Ok(seeding_svc) => {
+                    let sm = seeding_svc.get_seeding_manager();
+                    ds.register_seeding_callback(sm.clone());
+                    info!("SeedingManager registered as CacheManager eviction callback");
+                    Some(sm)
+                }
+                Err(e) => {
+                    warn!(
+                        "SeedingService initialization failed; seeding disabled: {:?}",
+                        e
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
 
         let creation_time = Duration::from_secs(
             std::time::SystemTime::now()
@@ -89,6 +109,7 @@ impl FsService {
             torrent_service: None,
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             download_service,
+            seeding_manager,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
             torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
             listen_addr,
@@ -126,6 +147,7 @@ impl FsService {
         svc.torrent_service = Some(TorrentService::new(
             db_arc.clone(),
             svc.download_service.clone(),
+            svc.seeding_manager.clone(),
         ));
         svc.db = Some(db_arc);
         svc.inode_mgr.restore_metadata_inodes(dirs, torrents);
@@ -146,8 +168,7 @@ impl FsService {
                         if let Err(e) = ds.ensure_handle_lightweight(info) {
                             warn!(
                                 "Failed to restore lightweight handle for torrent '{}': {:?}",
-                                name,
-                                e
+                                name, e
                             );
                         }
                     }
@@ -413,8 +434,13 @@ impl FsService {
                         Some((*child_ino, FileKind::Directory, name.clone()))
                     }
                     InodeData::File {
-                        parent: p, name, ..
-                    } if *p == ino => Some((*child_ino, FileKind::RegularFile, name.clone())),
+                        parent: p,
+                        name,
+                        unlinked,
+                        ..
+                    } if *p == ino && !*unlinked => {
+                        Some((*child_ino, FileKind::RegularFile, name.clone()))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -435,22 +461,25 @@ impl FsService {
         Ok(entries.into_iter().filter(|e| e.offset > offset).collect())
     }
 
-    // ── Handle (open/opendir) namespace ─────────────────────────────────────
-
-    /// Open a file, returning the file handle (`0` = no handle needed).
-    pub fn open(&mut self, ino: u64) -> FsResult<u64> {
+    /// Open a file, returning the file handle and open-mode hints.
+    ///
+    /// Data torrent files set `direct_io: true` so the adapter applies
+    /// `FOPEN_DIRECT_IO`, bypassing the kernel page cache — this lets the
+    /// daemon's errno (e.g. ENODATA for "no seeder") reach userspace instead
+    /// of being converted to EIO by `filemap_read_folio` (TSI-2246).
+    pub fn open(&mut self, ino: u64) -> FsResult<OpenOutcome> {
         match ino {
-            ROOT_INO | METADATA_INO | DATA_INO => Ok(0),
+            ROOT_INO | METADATA_INO | DATA_INO => Ok(0.into()),
             STATS_INO => {
                 let fh = NEXT_FH.fetch_add(1, Ordering::SeqCst);
                 self.inode_mgr.open_files.insert(fh, ino);
-                Ok(fh)
+                Ok(fh.into())
             }
             _ => {
                 if InodeManager::is_stats_ino(ino) {
                     let fh = NEXT_FH.fetch_add(1, Ordering::SeqCst);
                     self.inode_mgr.open_files.insert(fh, ino);
-                    return Ok(fh);
+                    return Ok(fh.into());
                 }
 
                 if InodeManager::is_data_ino(ino) {
@@ -459,14 +488,18 @@ impl FsService {
                     {
                         let fh = NEXT_FH.fetch_add(1, Ordering::SeqCst);
                         self.inode_mgr.open_files.insert(fh, ino);
-                        Ok(fh)
+                        // Bypass page cache so read errors propagate directly.
+                        Ok(OpenOutcome {
+                            fh,
+                            direct_io: true,
+                        })
                     } else {
-                        Ok(0)
+                        Ok(0.into())
                     }
                 } else if self.inode_mgr.inodes.contains_key(&ino) {
                     let fh = NEXT_FH.fetch_add(1, Ordering::SeqCst);
                     self.inode_mgr.open_files.insert(fh, ino);
-                    Ok(fh)
+                    Ok(fh.into())
                 } else {
                     Err(FsError::NotFound)
                 }
@@ -489,6 +522,9 @@ impl FsService {
     // ── Metadata namespace (.torrent lifecycle) ─────────────────────────────
 
     pub fn mknod(&mut self, parent: u64, name: &str) -> FsResult<Entry> {
+        if InodeManager::is_data_namespace(parent) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
         if !self.inode_mgr.is_metadata_child(parent) {
             return Err(FsError::PermissionDenied);
         }
@@ -508,6 +544,7 @@ impl FsService {
                 parent,
                 name: name.to_string(),
                 data: Vec::new(),
+                unlinked: false,
             },
         );
 
@@ -524,6 +561,9 @@ impl FsService {
     }
 
     pub fn create(&mut self, parent: u64, name: &str) -> FsResult<Created> {
+        if InodeManager::is_data_namespace(parent) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
         if !self.inode_mgr.is_metadata_child(parent) {
             return Err(FsError::PermissionDenied);
         }
@@ -543,6 +583,7 @@ impl FsService {
                 parent,
                 name: name.to_string(),
                 data: Vec::new(),
+                unlinked: false,
             },
         );
 
@@ -566,23 +607,65 @@ impl FsService {
             return Err(FsError::ReadOnlyFileSystem);
         }
 
+        // TSI-2228: data/ namespace is read-only. Data inodes live in
+        // `data_inodes`, not `inodes`, so without this guard `write` would
+        // fall through to the `None` arm and return `ENOENT` — the inode
+        // exists, it is just not writable. Return `EROFS` instead.
+        if InodeManager::is_data_namespace(ino) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
+
         match self.inode_mgr.inodes.get_mut(&ino) {
             Some(InodeData::File {
                 data: file_data,
                 name,
                 ..
             }) => {
+                // TSI-2233: FUSE hands us `offset: i64`. A negative offset
+                // casts to a huge `usize` and a super-large offset makes
+                // `Vec::resize` attempt a multi-GB allocation (OOM/abort on
+                // the FUSE dispatch thread), while `offset + data.len()` can
+                // overflow and the subsequent slice `panic`. Validate before
+                // any allocation: reject negatives, cap the post-write size
+                // at MAX_TORRENT_SIZE (the only writable inodes are .torrent
+                // buffers), and use checked arithmetic for the end offset.
+                if offset < 0 {
+                    warn!("write to {} with negative offset {}", name, offset);
+                    return Err(FsError::InvalidArgument);
+                }
                 let offset = offset as usize;
+
+                let end = match offset.checked_add(data.len()) {
+                    Some(e) => e,
+                    None => {
+                        return Err(FsError::FileTooLarge(format!(
+                            "{}: write at offset {} + {} bytes overflows usize",
+                            name,
+                            offset,
+                            data.len()
+                        )));
+                    }
+                };
+
+                if end > MAX_TORRENT_SIZE {
+                    warn!(
+                        "write to {} would grow file to {} bytes (limit {})",
+                        name, end, MAX_TORRENT_SIZE
+                    );
+                    return Err(FsError::FileTooLarge(format!(
+                        "{} exceeds {} bytes",
+                        name, MAX_TORRENT_SIZE
+                    )));
+                }
 
                 if offset > file_data.len() {
                     file_data.resize(offset, 0);
                 }
-
-                if offset + data.len() > file_data.len() {
-                    file_data.resize(offset + data.len(), 0);
+                if end > file_data.len() {
+                    file_data.resize(end, 0);
                 }
 
-                file_data[offset..offset + data.len()].copy_from_slice(data);
+                file_data[offset..end].copy_from_slice(data);
 
                 info!("Wrote {} bytes to file {}", data.len(), name);
                 Ok(data.len() as u32)
@@ -630,8 +713,22 @@ impl FsService {
     /// Persist a closed `.torrent` into the database (release).
     pub fn release(&mut self, fh: u64) -> FsResult<()> {
         if let Some(ino) = self.inode_mgr.open_files.remove(&fh) {
-            if let Some(InodeData::File { data, name, parent }) =
-                self.inode_mgr.inodes.get(&ino).cloned()
+            // TSI-2234: the file handle is now closed. If the inode was
+            // unlinked while still open, this `release` is the "last close"
+            // point at which the inode is finally destroyed (unless another
+            // handle is still open). An unlinked `.torrent` was already
+            // removed from the DB by `unlink`, so do NOT re-persist its
+            // buffered bytes here — just retire the inode.
+            if self.inode_mgr.is_unlinked_file(ino) {
+                if self.inode_mgr.open_handle_count(ino) == 0 {
+                    self.inode_mgr.inodes.remove(&ino);
+                }
+                return Ok(());
+            }
+
+            if let Some(InodeData::File {
+                data, name, parent, ..
+            }) = self.inode_mgr.inodes.get(&ino).cloned()
             {
                 if name.ends_with(".torrent") {
                     if data.is_empty() {
@@ -652,41 +749,67 @@ impl FsService {
                     }
 
                     let source_path = self.inode_mgr.extract_source_path(parent);
+                    let dedup_key = (source_path.clone(), name.clone());
 
-                    let mut processing = self.processing_torrents.lock().map_err(|e| {
-                        error!("Mutex poisoned in release(): {}", e);
-                        FsError::LockPoisoned
-                    })?;
+                    // TSI-2247: Dedup guard — check + insert atomically, then
+                    // DROP the lock before spawning background work.  The key
+                    // is `(source_path, filename)` so that torrents in the
+                    // same directory (especially the root, where
+                    // `source_path` is `""`) don't collide.  The previous
+                    // code held `processing_torrents` during the entire
+                    // `add_torrent` call (DB insert + handle creation),
+                    // blocking the single-threaded FUSE dispatch loop.  Now
+                    // `add_torrent` runs on a detached thread so `release`
+                    // never blocks the dispatcher.
+                    {
+                        let mut processing = self.processing_torrents.lock().map_err(|e| {
+                            error!("Mutex poisoned in release(): {}", e);
+                            FsError::LockPoisoned
+                        })?;
 
-                    if processing.contains_key(&source_path) {
-                        warn!(
-                            "Torrent at source_path '{}' already being processed, skipping",
-                            source_path
-                        );
-                        return Ok(());
-                    }
-                    processing.insert(source_path.clone(), ());
-
-                    // Keep the processing lock held during add_torrent to
-                    // prevent concurrent releases on the same source_path from
-                    // racing on the database insert (TSI-2072).
-                    if let Some(ref ts) = self.torrent_service {
-                        match ts.add_torrent(&data, &source_path, &name) {
-                            Ok(()) => {
-                                info!("Successfully processed torrent: {}", name);
-                                processing.remove(&source_path);
-                            }
-                            Err(e) => {
-                                error!("Failed to process torrent {}: {}", name, e);
-                                processing.remove(&source_path);
-                            }
+                        if processing.contains_key(&dedup_key) {
+                            warn!(
+                                "Torrent at '{}{}' already being processed, skipping",
+                                source_path, name
+                            );
+                            return Ok(());
                         }
+                        processing.insert(dedup_key.clone(), ());
+                    }
+                    // Lock released here.
+
+                    // The inode is NOT removed here: if the background
+                    // `add_torrent` fails, the file must remain visible so
+                    // the user can retry or delete it.  On success the
+                    // DB-backed entry supersedes this inode (lookup queries
+                    // the DB), so keeping it is harmless — this mirrors the
+                    // pre-TSI-2247 behavior.
+                    if let Some(ts) = &self.torrent_service {
+                        let ts = ts.clone();
+                        let processing = self.processing_torrents.clone();
+                        let key = dedup_key.clone();
+                        let fname = name.clone();
+                        std::thread::spawn(move || {
+                            match ts.add_torrent(&data, &source_path, &name) {
+                                Ok(()) => {
+                                    info!("Successfully processed torrent: {}", fname);
+                                }
+                                Err(e) => {
+                                    error!("Failed to process torrent {}: {}", fname, e);
+                                }
+                            }
+                            if let Ok(mut guard) = processing.lock() {
+                                guard.remove(&key);
+                            }
+                        });
                     } else {
                         info!(
                             "Torrent {} received (no DB configured, skipping insert)",
                             name
                         );
-                        processing.remove(&source_path);
+                        if let Ok(mut guard) = self.processing_torrents.lock() {
+                            guard.remove(&dedup_key);
+                        }
                     }
                 }
             }
@@ -696,6 +819,9 @@ impl FsService {
     }
 
     pub fn mkdir(&mut self, parent: u64, name: &str) -> FsResult<Attr> {
+        if InodeManager::is_data_namespace(parent) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
         if !self.inode_mgr.is_metadata_child(parent) {
             return Err(FsError::PermissionDenied);
         }
@@ -739,6 +865,9 @@ impl FsService {
     }
 
     pub fn rmdir(&mut self, parent: u64, name: &str) -> FsResult<()> {
+        if InodeManager::is_data_namespace(parent) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
         if !self.inode_mgr.is_metadata_child(parent) {
             return Err(FsError::PermissionDenied);
         }
@@ -754,7 +883,11 @@ impl FsService {
             Some(InodeData::Directory { .. }) => {
                 let has_children = self.inode_mgr.inodes.iter().any(|(_, data)| match data {
                     InodeData::Directory { parent: p, .. } if *p == ino => true,
-                    InodeData::File { parent: p, .. } if *p == ino => true,
+                    InodeData::File {
+                        parent: p,
+                        unlinked,
+                        ..
+                    } if *p == ino && !*unlinked => true,
                     _ => false,
                 });
 
@@ -798,6 +931,9 @@ impl FsService {
 
     pub fn unlink(&mut self, parent: u64, name: &str) -> FsResult<Option<i64>> {
         let mut removed_id = None;
+        if InodeManager::is_data_namespace(parent) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
         if !self.inode_mgr.is_metadata_child(parent) {
             return Err(FsError::PermissionDenied);
         }
@@ -826,10 +962,16 @@ impl FsService {
                     match ts.remove_torrent(&filename, &source_path) {
                         Ok(Some(torrent_id)) => {
                             removed_id = Some(torrent_id);
-                            self.inode_mgr.inodes.remove(&ino);
-                            self.inode_mgr
-                                .open_files
-                                .retain(|_, &mut open_ino| open_ino != ino);
+                            // TSI-2234: defer inode destruction. Mark the
+                            // inode unlinked (so its directory name vanishes
+                            // from lookup/readdir) but keep the inode + any
+                            // open handles alive: read/write/flush/release
+                            // on a still-open handle must keep working until
+                            // the last handle is released. If no handle is
+                            // open, `unlink_file` destroys the inode now.
+                            // open_files is NOT stripped: that would orphan
+                            // the handle and silently drop buffered bytes.
+                            self.inode_mgr.unlink_file(ino);
 
                             // Clean up metadata directories left empty by this
                             // deletion so the data/ mirror no longer exposes
@@ -859,7 +1001,7 @@ impl FsService {
                                 error!("Mutex poisoned in unlink() processing_torrents: {}", e);
                                 FsError::LockPoisoned
                             })?;
-                            processing.remove(&source_path);
+                            processing.remove(&(source_path.clone(), filename.clone()));
                             drop(processing);
 
                             let mut cache = self.torrent_data_cache.lock().map_err(|e| {
@@ -875,10 +1017,8 @@ impl FsService {
                             );
                         }
                         Ok(None) => {
-                            self.inode_mgr.inodes.remove(&ino);
-                            self.inode_mgr
-                                .open_files
-                                .retain(|_, &mut open_ino| open_ino != ino);
+                            // TSI-2234: same deferred-destruction logic.
+                            self.inode_mgr.unlink_file(ino);
                             info!("Deleted file '{}' (not yet in database)", filename);
                         }
                         Err(e) => {
@@ -887,10 +1027,8 @@ impl FsService {
                         }
                     }
                 } else {
-                    self.inode_mgr.inodes.remove(&ino);
-                    self.inode_mgr
-                        .open_files
-                        .retain(|_, &mut open_ino| open_ino != ino);
+                    // TSI-2234: same deferred-destruction logic (no DB).
+                    self.inode_mgr.unlink_file(ino);
                     info!("Deleted file '{}' (no database)", filename);
                 }
 
@@ -908,6 +1046,15 @@ impl FsService {
         newparent: u64,
         newname: &str,
     ) -> FsResult<()> {
+        // TSI-2228: data/ is a read-only namespace — renames into or out
+        // of it must return `EROFS`, not `ENOENT` or `EPERM`. Check this
+        // before parent existence: an inode number in the data range is
+        // inherently read-only, regardless of whether it is currently
+        // materialised.
+        if InodeManager::is_data_namespace(parent) || InodeManager::is_data_namespace(newparent) {
+            return Err(FsError::ReadOnlyFileSystem);
+        }
+
         // Check parent existence in both inodes and data_inodes tables.
         let parent_exists = self.inode_mgr.inodes.contains_key(&parent)
             || self.inode_mgr.data_inodes.contains_key(&parent);
@@ -1012,8 +1159,13 @@ impl FsService {
                 return Err(FsError::PermissionDenied);
             }
 
-            let (file_data, old_name) = match self.inode_mgr.inodes.get(&source_ino) {
-                Some(InodeData::File { data, name, .. }) => (data.clone(), name.clone()),
+            let (file_data, old_name, was_unlinked) = match self.inode_mgr.inodes.get(&source_ino) {
+                Some(InodeData::File {
+                    data,
+                    name,
+                    unlinked,
+                    ..
+                }) => (data.clone(), name.clone(), *unlinked),
                 None => {
                     return Err(FsError::NotFound);
                 }
@@ -1026,9 +1178,9 @@ impl FsService {
                     parent: newparent,
                     name: newname.to_string(),
                     data: file_data,
+                    unlinked: was_unlinked,
                 },
             );
-
             if let Some(ref ts) = self.torrent_service {
                 let old_source_path = self.inode_mgr.extract_source_path(parent);
                 let new_source_path = self.inode_mgr.extract_source_path(newparent);
@@ -1308,10 +1460,14 @@ impl FsService {
             if let InodeData::File {
                 name,
                 data: file_data,
+                unlinked,
                 ..
             } = data
             {
-                if name.ends_with(".torrent") && !file_data.is_empty() {
+                // TSI-2234: skip unlinked-but-open inodes — their torrent_id
+                // was already removed from the DB by `unlink`, so matching
+                // their buffered bytes here would be a stale dirty read.
+                if !*unlinked && name.ends_with(".torrent") && !file_data.is_empty() {
                     if let Ok(info) = TorrentInfo::from_bytes(file_data.clone()) {
                         if let Ok(metadata) = info.metadata() {
                             if hex::encode(metadata.info_hash) == torrent.info_hash {
@@ -1446,31 +1602,10 @@ fn spawn_cache_verification(
                     }
                 };
 
-                let expected = match info.hash_for_piece(piece_index) {
-                    Some(h) => h,
-                    None => {
-                        // v2-only torrent or out-of-range index: no SHA-1 to
-                        // check against; leave the piece untouched.
-                        skipped += 1;
-                        continue;
-                    }
-                };
-
-                // Expected on-disk size for this piece. Used to distinguish a
-                // complete piece (exact size) from a crash-interrupted /
-                // incomplete write (short or padded file), which must not be
-                // purged — it is simply left unverified so the next read
-                // re-downloads it on demand.
-                let expected_size = match info.piece_size(piece_index) {
-                    Some(s) => s,
-                    None => {
-                        skipped += 1;
-                        continue;
-                    }
-                };
-
-                // Resolve the on-disk path without holding the cache lock during
-                // the file I/O, so active reads are not blocked.
+                // Resolve the on-disk path inside a brief lock, then do all
+                // file I/O lock-free so active reads (PieceStore /
+                // DownloadService / .stats — all take the same cache mutex)
+                // are never blocked by the verification thread.
                 let path = match cache.lock() {
                     Ok(c) => c.piece_path(&piece_key),
                     Err(_) => {
@@ -1479,61 +1614,24 @@ fn spawn_cache_verification(
                     }
                 };
 
-                let file_size = match std::fs::metadata(&path) {
-                    Ok(m) => m.len(),
-                    Err(_) => {
-                        // Metadata references a file that no longer exists:
-                        // purge the stale entry so it can be re-downloaded.
-                        warn!("Cached piece file missing, purging: {}", piece_key);
+                let outcome = verify_single_piece(&path, piece_index, info, &piece_key);
+
+                match outcome {
+                    VerifyOutcome::Verified => {
+                        if let Ok(mut c) = cache.lock() {
+                            c.mark_verified(&piece_key);
+                        }
+                        verified += 1;
+                    }
+                    VerifyOutcome::Purged => {
                         if let Ok(mut c) = cache.lock() {
                             let _ = c.delete_piece(&piece_key);
                         }
                         purged += 1;
-                        continue;
                     }
-                };
-
-                if file_size != expected_size {
-                    // Incomplete/partial piece left by an interrupted write.
-                    // Keep the file but leave it unverified: the next read will
-                    // re-download it (overwriting the short file), after which
-                    // register_piece marks it verified again.
-                    warn!(
-                        "Cached piece has wrong size ({} != {}), leaving unverified: {}",
-                        file_size, expected_size, piece_key
-                    );
-                    skipped += 1;
-                    continue;
-                }
-
-                let data = match std::fs::read(&path) {
-                    Ok(d) => d,
-                    Err(_) => {
-                        // File vanished between the size check and the read.
-                        // Purge the stale entry rather than hashing empty data.
-                        warn!("Cached piece file disappeared, purging: {}", piece_key);
-                        if let Ok(mut c) = cache.lock() {
-                            let _ = c.delete_piece(&piece_key);
-                        }
-                        purged += 1;
-                        continue;
+                    VerifyOutcome::Skipped => {
+                        skipped += 1;
                     }
-                };
-                let actual = Sha1::from(&data[..]).digest().bytes();
-                if actual == expected {
-                    if let Ok(mut c) = cache.lock() {
-                        c.mark_verified(&piece_key);
-                    }
-                    verified += 1;
-                } else {
-                    warn!(
-                        "Cached piece failed SHA-1 verification, purging: {}",
-                        piece_key
-                    );
-                    if let Ok(mut c) = cache.lock() {
-                        let _ = c.delete_piece(&piece_key);
-                    }
-                    purged += 1;
                 }
             }
 
@@ -1548,6 +1646,83 @@ fn spawn_cache_verification(
     }
 }
 
+/// Outcome of verifying a single cached piece.
+enum VerifyOutcome {
+    Verified,
+    Purged,
+    Skipped,
+}
+
+/// Verify a single on-disk cached piece against its expected SHA-1 hash.
+///
+/// Pure file I/O — no cache lock is held.  The caller resolves the on-disk
+/// `path` (and `piece_index`) from the piece key inside a brief lock, then
+/// calls this function lock-free.  The caller is responsible for applying
+/// the side effect (mark verified / delete piece).
+fn verify_single_piece(
+    path: &std::path::Path,
+    piece_index: i32,
+    info: &TorrentInfo,
+    piece_key: &str,
+) -> VerifyOutcome {
+    let expected = match info.hash_for_piece(piece_index) {
+        Some(h) => h,
+        None => return VerifyOutcome::Skipped,
+    };
+    let expected_size = match info.piece_size(piece_index) {
+        Some(s) => s,
+        None => return VerifyOutcome::Skipped,
+    };
+
+    let meta = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => {
+            warn!("Cached piece file missing, purging: {}", piece_key);
+            return VerifyOutcome::Purged;
+        }
+    };
+
+    let file_size = meta.len();
+    if file_size != expected_size {
+        warn!(
+            "Cached piece has wrong size ({} != {}), leaving unverified: {}",
+            file_size, expected_size, piece_key
+        );
+        return VerifyOutcome::Skipped;
+    }
+
+    // TSI-2229: a piece file may have the correct *logical* size but still be
+    // incomplete — `write_piece` writes blocks at arbitrary offsets, and a
+    // crash between block writes leaves a sparse file whose zero-filled gaps
+    // make st_size match piece_length while the physical allocation is smaller.
+    // Treat it like a wrong-size piece (leave unverified) instead of purging.
+    if is_sparse_file(&meta, file_size) {
+        warn!(
+            "Cached piece is sparse (partial write), leaving unverified: {}",
+            piece_key
+        );
+        return VerifyOutcome::Skipped;
+    }
+
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => {
+            warn!("Cached piece file disappeared, purging: {}", piece_key);
+            return VerifyOutcome::Purged;
+        }
+    };
+    let actual = Sha1::from(&data[..]).digest().bytes();
+    if actual == expected {
+        VerifyOutcome::Verified
+    } else {
+        warn!(
+            "Cached piece failed SHA-1 verification, purging: {}",
+            piece_key
+        );
+        VerifyOutcome::Purged
+    }
+}
+
 /// Split a piece key of the form `{info_hash}:piece:{index}` into its parts.
 fn split_piece_key(key: &str) -> Option<(&str, i32)> {
     let mut parts = key.split(':');
@@ -1557,6 +1732,31 @@ fn split_piece_key(key: &str) -> Option<(&str, i32)> {
     }
     let index = parts.next()?.parse::<i32>().ok()?;
     Some((info_hash, index))
+}
+
+/// Whether a piece file is *sparse* — its physical disk allocation is smaller
+/// than its logical size.
+///
+/// `write_piece` writes blocks at arbitrary offsets via `seekp`; a crash
+/// between block writes leaves a file whose `st_size` matches the expected
+/// piece length but whose interior has zero-filled gaps (the filesystem does
+/// not allocate blocks for the unwritten regions). Such a file is not a
+/// complete piece even though its logical size is correct.
+///
+/// Comparing `st_blocks * 512` (physical) against `st_size` (logical) detects
+/// this condition. A fully-written all-zero piece also appears sparse, but
+/// leaving it unverified is harmless — the next read re-downloads it,
+/// `register_piece` marks it verified, and no data is lost.
+///
+/// Takes the already-fetched `Metadata` so the caller avoids a duplicate
+/// `stat` syscall (one per piece — significant at 987+ pieces).
+fn is_sparse_file(meta: &std::fs::Metadata, logical_size: u64) -> bool {
+    if logical_size == 0 {
+        return false;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let physical = meta.blocks() * 512;
+    physical < logical_size
 }
 
 #[cfg(test)]
@@ -1608,9 +1808,10 @@ mod tests {
         let svc = FsService {
             inode_mgr: InodeManager::new(Duration::from_secs(0)),
             db: Some(db_arc.clone()),
-            torrent_service: Some(TorrentService::new(db_arc, None)),
+            torrent_service: Some(TorrentService::new(db_arc, None, None)),
             processing_torrents: Arc::new(Mutex::new(HashMap::new())),
             download_service: None,
+            seeding_manager: None,
             torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
             torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
             listen_addr: String::new(),
@@ -1651,5 +1852,835 @@ mod tests {
         assert_eq!(split_piece_key("abc:piece:x"), None);
         assert_eq!(split_piece_key("abc"), None);
         assert_eq!(split_piece_key(""), None);
+    }
+
+    /// TSI-2228: Bare service without any torrents — sufficient for testing
+    /// that mutating operations on the read-only `data/` namespace return
+    /// `EROFS` (`ReadOnlyFileSystem`), not `ENOENT` or `EACCES`.
+    fn bare_service() -> FsService {
+        let metrics = Arc::new(Metrics::new());
+        FsService {
+            inode_mgr: InodeManager::new(Duration::from_secs(0)),
+            db: None,
+            torrent_service: None,
+            processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            download_service: None,
+            seeding_manager: None,
+            torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
+            torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
+            listen_addr: String::new(),
+            metrics,
+        }
+    }
+
+    #[test]
+    fn data_namespace_write_returns_erofs() {
+        let mut svc = bare_service();
+        // DATA_INO (the `data/` root) is a directory → would be EISDIR
+        // without the read-only guard, but the guard fires first.
+        let err = svc.write(DATA_INO, 0, b"x").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        // A data file inode (not in `inodes`, only in `data_inodes`) would
+        // previously fall through to the `None` arm → `NotFound` → ENOENT.
+        let data_file_ino = DATA_FILE_INO_BASE + 1;
+        let err = svc.write(data_file_ino, 0, b"x").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+    }
+
+    /// Helper: create an empty writable `.torrent` inode via the public
+    /// `create()` path (not direct `inodes` manipulation) and return its
+    /// ino. Using the real path keeps the test honest about the
+    /// `InodeData::File` layout without duplicating its constructor.
+    fn writable_file_ino(svc: &mut FsService, name: &str) -> u64 {
+        svc.create(METADATA_INO, name)
+            .expect("create writable file")
+            .attr
+            .ino
+    }
+
+    /// TSI-2233: a negative offset must be rejected before any allocation
+    /// rather than cast to a huge `usize` and fed to `Vec::resize` (OOM).
+    #[test]
+    fn write_rejects_negative_offset() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "f.torrent");
+        let err = svc.write(ino, -1, b"x").unwrap_err();
+        assert_eq!(err, FsError::InvalidArgument);
+        // No partial allocation: the file is still empty.
+        assert_eq!(
+            svc.inode_mgr.inodes.get(&ino).and_then(|d| match d {
+                InodeData::File { data, .. } => Some(data.len()),
+                _ => None,
+            }),
+            Some(0)
+        );
+    }
+
+    /// TSI-2233: an offset that would grow the buffer past MAX_TORRENT_SIZE
+    /// is rejected with `FileTooLarge` (→ EFBIG) instead of allocating.
+    #[test]
+    fn write_rejects_offset_beyond_max_size() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "big.torrent");
+        let over = MAX_TORRENT_SIZE as i64 + 1;
+        let err = svc.write(ino, over, b"x").unwrap_err();
+        assert!(matches!(err, FsError::FileTooLarge(_)));
+        // Buffer untouched.
+        assert!(svc
+            .inode_mgr
+            .inodes
+            .get(&ino)
+            .and_then(|d| match d {
+                InodeData::File { data, .. } => Some(data.is_empty()),
+                _ => None,
+            })
+            .unwrap());
+    }
+
+    /// TSI-2233: `offset + data.len()` exceeding `MAX_TORRENT_SIZE` (even
+    /// when offset alone is within bounds) is rejected, not silently capped.
+    #[test]
+    fn write_rejects_end_beyond_max_size() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "edge.torrent");
+        // Offset alone is within the limit, but offset + 2 pushes end past
+        // it — no pre-seeded data needed.
+        let base = MAX_TORRENT_SIZE - 1;
+        let err = svc.write(ino, base as i64, b"xy").unwrap_err();
+        assert!(matches!(err, FsError::FileTooLarge(_)));
+    }
+
+    /// TSI-2233: a write whose `end` lands exactly on MAX_TORRENT_SIZE is
+    /// allowed (the guard uses strict `>`, mirroring `flush`'s `>`). This
+    /// is the positive boundary the reject tests hover around.
+    #[test]
+    fn write_at_exact_max_size_is_allowed() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "max.torrent");
+        // MAX_TORRENT_SIZE bytes from offset 0 → end == MAX_TORRENT_SIZE.
+        let payload = vec![0u8; MAX_TORRENT_SIZE];
+        let n = svc.write(ino, 0, &payload).expect("write at limit");
+        assert_eq!(n, MAX_TORRENT_SIZE as u32);
+        assert_eq!(
+            svc.inode_mgr.inodes.get(&ino).and_then(|d| match d {
+                InodeData::File { data, .. } => Some(data.len()),
+                _ => None,
+            }),
+            Some(MAX_TORRENT_SIZE)
+        );
+    }
+
+    /// TSI-2233: a normal write at a positive offset still works and grows
+    /// the buffer with a zero gap (regression guard for the guard logic).
+    #[test]
+    fn write_at_positive_offset_grows_with_gap() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "gap.torrent");
+        let n = svc.write(ino, 4, b"AB").expect("write ok");
+        assert_eq!(n, 2);
+        let data = svc.inode_mgr.inodes.get(&ino).and_then(|d| match d {
+            InodeData::File { data, .. } => Some(data.clone()),
+            _ => None,
+        });
+        assert_eq!(data.as_deref(), Some(b"\0\0\0\0AB".as_slice()));
+    }
+
+    /// TSI-2233: a huge positive offset (would cast to a multi-GB `usize`
+    /// and trigger a runaway `Vec::resize`) is rejected by the size cap
+    /// before any allocation. This is the local-DoS vector the guard closes.
+    #[test]
+    fn write_rejects_huge_positive_offset() {
+        let mut svc = bare_service();
+        let ino = writable_file_ino(&mut svc, "big.torrent");
+        // Far beyond MAX_TORRENT_SIZE but still a valid positive i64.
+        let huge = MAX_TORRENT_SIZE as i64 * 2;
+        let err = svc.write(ino, huge, b"x").unwrap_err();
+        assert!(matches!(err, FsError::FileTooLarge(_)));
+        // No allocation happened.
+        assert!(svc
+            .inode_mgr
+            .inodes
+            .get(&ino)
+            .and_then(|d| match d {
+                InodeData::File { data, .. } => Some(data.is_empty()),
+                _ => None,
+            })
+            .unwrap());
+    }
+
+    #[test]
+    fn data_namespace_create_mknod_mkdir_return_erofs() {
+        let mut svc = bare_service();
+
+        let err = svc.create(DATA_INO, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        let err = svc.mknod(DATA_INO, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        let err = svc.mkdir(DATA_INO, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        // A nested data inode as parent.
+        let data_dir_ino = DATA_DIR_INO_BASE + 5;
+        let err = svc.mkdir(data_dir_ino, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+    }
+
+    #[test]
+    fn data_namespace_unlink_rmdir_return_erofs() {
+        let mut svc = bare_service();
+
+        let err = svc.unlink(DATA_INO, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        let err = svc.rmdir(DATA_INO, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        let data_dir_ino = DATA_DIR_INO_BASE + 5;
+        let err = svc.unlink(data_dir_ino, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+        let err = svc.rmdir(data_dir_ino, "foo").unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+    }
+
+    #[test]
+    fn data_namespace_rename_returns_erofs() {
+        let mut svc = bare_service();
+
+        // Rename *into* data/ as the new parent.
+        let err = svc
+            .rename(METADATA_INO, "foo", DATA_INO, "bar")
+            .unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        // Rename *out of* data/ as the source parent.
+        let err = svc
+            .rename(DATA_INO, "foo", METADATA_INO, "bar")
+            .unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+
+        // Both parents in data/ namespace.
+        let data_dir_ino = DATA_DIR_INO_BASE + 5;
+        let err = svc
+            .rename(data_dir_ino, "foo", DATA_INO, "bar")
+            .unwrap_err();
+        assert_eq!(err, FsError::ReadOnlyFileSystem);
+    }
+
+    #[test]
+    fn data_namespace_inodes_correctly_identified() {
+        // Unit-test the helper itself.
+        assert!(InodeManager::is_data_namespace(DATA_INO));
+        assert!(InodeManager::is_data_namespace(DATA_TORRENT_INO_BASE));
+        assert!(InodeManager::is_data_namespace(DATA_TORRENT_INO_BASE + 42));
+        assert!(InodeManager::is_data_namespace(DATA_DIR_INO_BASE + 1));
+        assert!(InodeManager::is_data_namespace(DATA_FILE_INO_BASE + 1));
+        assert!(InodeManager::is_data_namespace(SOURCE_PATH_DIR_INO_BASE));
+
+        // Non-data inodes are not in the data namespace.
+        assert!(!InodeManager::is_data_namespace(ROOT_INO));
+        assert!(!InodeManager::is_data_namespace(METADATA_INO));
+        assert!(!InodeManager::is_data_namespace(STATS_INO));
+        assert!(!InodeManager::is_data_namespace(
+            NEXT_INO.load(Ordering::SeqCst),
+        ));
+    }
+
+    /// TSI-2246: opening a `data/` torrent file must set `direct_io: true`
+    /// so the kernel bypasses its page cache and the daemon's errno
+    /// (e.g. ENODATA) reaches userspace instead of being converted to EIO.
+    #[test]
+    fn open_data_torrent_file_sets_direct_io() {
+        let mut svc = bare_service();
+        let ino = DATA_FILE_INO_BASE + 1;
+        svc.inode_mgr.data_inodes.insert(
+            ino,
+            DataInode::TorrentFile {
+                torrent_id: 1,
+                file_id: 1,
+                name: "foo".to_string(),
+                size: 16,
+            },
+        );
+        let outcome = svc.open(ino).expect("open data file");
+        assert!(
+            outcome.direct_io,
+            "data torrent file must request direct_io"
+        );
+        assert_ne!(outcome.fh, 0, "data torrent file must get a real fh");
+    }
+
+    /// TSI-2246: non-data files (e.g. metadata) must NOT set direct_io —
+    /// page cache is fine for static in-memory content.
+    #[test]
+    fn open_metadata_file_does_not_set_direct_io() {
+        let mut svc = bare_service();
+        let ino = NEXT_INO.fetch_add(1, Ordering::SeqCst);
+        svc.inode_mgr.inodes.insert(
+            ino,
+            InodeData::File {
+                parent: ROOT_INO,
+                name: "x".to_string(),
+                data: vec![b'x'],
+                unlinked: false,
+            },
+        );
+        let outcome = svc.open(ino).expect("open metadata file");
+        assert!(
+            !outcome.direct_io,
+            "metadata file must not request direct_io"
+        );
+    }
+
+    /// TSI-2246: stats inodes must NOT set direct_io.
+    #[test]
+    fn open_stats_file_does_not_set_direct_io() {
+        let mut svc = bare_service();
+        // STATS_INO is the global `.stats` file.
+        let outcome = svc.open(STATS_INO).expect("open stats");
+        assert!(!outcome.direct_io, "stats file must not request direct_io");
+    }
+
+    #[test]
+    fn is_sparse_file_detects_sparse_partial_write() {
+        // Simulate a partial multi-block piece write: create a file with the
+        // right logical size but a zero-filled gap (sparse hole) by seeking
+        // past the start before writing the trailing block.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sparse_piece");
+        use std::io::{Seek, Write};
+        let mut file = std::fs::File::create(&path).unwrap();
+        // Write 16 KiB at offset 256 KiB — the file's logical size becomes
+        // 256 KiB + 16 KiB, but bytes 0..256 KiB are a sparse hole.
+        file.seek(std::io::SeekFrom::Start(256 * 1024)).unwrap();
+        file.write_all(&vec![0xABu8; 16 * 1024]).unwrap();
+        drop(file);
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 256 * 1024 + 16 * 1024);
+        assert!(
+            is_sparse_file(&meta, meta.len()),
+            "file with a sparse hole must be detected as sparse"
+        );
+    }
+
+    #[test]
+    fn is_sparse_file_false_for_complete_file() {
+        // A fully-written (non-sparse) file must not be flagged as sparse.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("complete_piece");
+        std::fs::write(&path, vec![0xCDu8; 262_144]).unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), 262_144);
+        assert!(
+            !is_sparse_file(&meta, meta.len()),
+            "fully-written file must not be detected as sparse"
+        );
+    }
+
+    #[test]
+    fn is_sparse_file_false_for_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty_piece");
+        std::fs::write(&path, b"").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert!(!is_sparse_file(&meta, 0));
+    }
+
+    /// Build a single-file bencoded torrent whose single piece has a known
+    /// SHA-1 hash.  Returns `(torrent_bytes, piece_content, piece_length)`.
+    fn build_single_piece_torrent() -> (Vec<u8>, Vec<u8>, u64) {
+        let piece_length: usize = 16_384;
+        let content = (0..piece_length)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>();
+        let hash = {
+            use sha1_smol::Sha1;
+            Sha1::from(&content).digest().bytes()
+        };
+        let mut t = Vec::new();
+        t.push(b'd');
+        t.extend_from_slice(b"4:infod");
+        t.extend_from_slice(b"6:lengthi");
+        t.extend_from_slice(content.len().to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"4:name4:test");
+        t.extend_from_slice(b"12:piece lengthi");
+        t.extend_from_slice(piece_length.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"6:pieces20:");
+        t.extend_from_slice(&hash);
+        t.extend_from_slice(b"ee");
+        (t, content, piece_length as u64)
+    }
+
+    #[test]
+    fn verify_single_piece_sparse_file_is_skipped_not_purged() {
+        let (torrent_bytes, content, piece_length) = build_single_piece_torrent();
+        let info = Arc::new(TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent"));
+        let info_hash = hex::encode(info.info_hash().expect("info hash"));
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create the piece file on disk *before* constructing the
+        // CacheManager so the startup scan registers it as unverified
+        // (exactly like a real restart).
+        let pieces_dir = temp_dir.path().join("pieces").join(&info_hash);
+        std::fs::create_dir_all(&pieces_dir).unwrap();
+        let piece_path = pieces_dir.join(&piece_key);
+
+        // Sparse file: correct logical size but a zero-filled hole at the
+        // start (simulates an interrupted multi-block write where only the
+        // trailing block was flushed to disk).
+        use std::io::{Seek, Write};
+        let mut file = std::fs::File::create(&piece_path).unwrap();
+        let tail_start = piece_length as u64 - 4096;
+        file.seek(std::io::SeekFrom::Start(tail_start)).unwrap();
+        file.write_all(&content[tail_start as usize..]).unwrap();
+        drop(file);
+
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024).unwrap();
+        // Scan registered the piece but left it unverified.
+        assert!(cache.has_piece(&piece_key));
+        assert!(!cache.is_piece_verified(&piece_key));
+
+        // The sparse file must be Skipped, not Purged.
+        let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
+        assert!(
+            matches!(outcome, VerifyOutcome::Skipped),
+            "sparse piece file should be skipped, not purged"
+        );
+        // The piece file must still exist on disk (not deleted).
+        assert!(
+            piece_path.exists(),
+            "skipped piece file must not be deleted"
+        );
+    }
+
+    #[test]
+    fn verify_single_piece_complete_correct_hash_is_verified() {
+        let (torrent_bytes, content, _piece_length) = build_single_piece_torrent();
+        let info = Arc::new(TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent"));
+        let info_hash = hex::encode(info.info_hash().expect("info hash"));
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024).unwrap();
+        let piece_path = cache.ensure_piece_dir(&piece_key).unwrap();
+        std::fs::write(&piece_path, &content).unwrap();
+        cache.add_piece(&piece_key, content.len() as u64).unwrap();
+
+        let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
+        assert!(
+            matches!(outcome, VerifyOutcome::Verified),
+            "complete piece with correct hash should be verified"
+        );
+    }
+
+    #[test]
+    fn verify_single_piece_complete_wrong_hash_is_purged() {
+        let (torrent_bytes, _content, piece_length) = build_single_piece_torrent();
+        let info = Arc::new(TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent"));
+        let info_hash = hex::encode(info.info_hash().expect("info hash"));
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024).unwrap();
+        let piece_path = cache.ensure_piece_dir(&piece_key).unwrap();
+        // Write a complete, non-sparse file with wrong content.
+        std::fs::write(&piece_path, vec![0xFFu8; piece_length as usize]).unwrap();
+        cache.add_piece(&piece_key, piece_length).unwrap();
+
+        let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
+        assert!(
+            matches!(outcome, VerifyOutcome::Purged),
+            "complete non-sparse piece with wrong hash should be purged"
+        );
+    }
+
+    #[test]
+    fn verify_single_piece_wrong_size_is_skipped() {
+        let (torrent_bytes, _content, piece_length) = build_single_piece_torrent();
+        let info = Arc::new(TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent"));
+        let info_hash = hex::encode(info.info_hash().expect("info hash"));
+        let piece_key = format!("{}:piece:0", info_hash);
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024).unwrap();
+        let piece_path = cache.ensure_piece_dir(&piece_key).unwrap();
+        // Write a short file (incomplete piece).
+        std::fs::write(&piece_path, vec![0u8; piece_length as usize / 2]).unwrap();
+        cache.add_piece(&piece_key, piece_length / 2).unwrap();
+
+        let outcome = verify_single_piece(&piece_path, 0, &info, &piece_key);
+        assert!(
+            matches!(outcome, VerifyOutcome::Skipped),
+            "wrong-size piece should be skipped"
+        );
+    }
+
+    // ── TSI-2247: release must not block the FUSE dispatch thread ─────────
+
+    /// Build a service backed by an in-memory DB + TorrentService so
+    /// `release` can exercise the full add_torrent path.
+    fn service_with_db() -> FsService {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let db_arc = Arc::new(Mutex::new(db));
+        let metrics = Arc::new(Metrics::new());
+        FsService {
+            inode_mgr: InodeManager::new(Duration::from_secs(0)),
+            db: Some(db_arc.clone()),
+            torrent_service: Some(TorrentService::new(db_arc, None, None)),
+            processing_torrents: Arc::new(Mutex::new(HashMap::new())),
+            download_service: None,
+            seeding_manager: None,
+            torrent_data_cache: Arc::new(Mutex::new(HashMap::new())),
+            torrent_info_cache: Arc::new(Mutex::new(HashMap::new())),
+            listen_addr: String::new(),
+            metrics,
+        }
+    }
+
+    /// Create a writable `.torrent` inode via the public `create()` path and
+    /// return its (ino, fh).
+    fn create_torrent_file(svc: &mut FsService, name: &str) -> (u64, u64) {
+        let created = svc.create(METADATA_INO, name).expect("create file");
+        (created.attr.ino, created.fh)
+    }
+
+    /// TSI-2247: Closing an empty `.torrent` file must hit the fast path —
+    /// `release` returns `Ok(())` immediately without touching
+    /// `processing_torrents` or the DB.
+    #[test]
+    fn release_empty_torrent_is_fast_path() {
+        let mut svc = service_with_db();
+        let (ino, fh) = create_torrent_file(&mut svc, "empty.torrent");
+
+        // release must succeed instantly — no DB insert, no background spawn.
+        svc.release(fh).expect("release ok");
+
+        // Inode is removed.
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+        // processing_torrents is untouched (empty).
+        assert!(svc.processing_torrents.lock().unwrap().is_empty());
+    }
+
+    /// TSI-2247: Closing a `.torrent` with invalid (non-parseable) data must
+    /// also hit the fast path — no DB insert, no background spawn.
+    #[test]
+    fn release_invalid_torrent_is_fast_path() {
+        let mut svc = service_with_db();
+        let (ino, fh) = create_torrent_file(&mut svc, "bad.torrent");
+        // Write garbage that is non-empty but not a valid torrent.
+        svc.write(ino, 0, b"not a torrent").expect("write ok");
+
+        svc.release(fh).expect("release ok");
+
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+        assert!(svc.processing_torrents.lock().unwrap().is_empty());
+    }
+
+    /// TSI-2247: Closing a valid `.torrent` file must NOT block the caller.
+    /// `add_torrent` runs on a background thread; `release` returns `Ok(())`
+    /// immediately.  The `processing_torrents` entry is cleaned up by the
+    /// background thread after the DB insert completes, and the torrent is
+    /// persisted in the DB.
+    #[test]
+    fn release_valid_torrent_returns_immediately() {
+        let mut svc = service_with_db();
+        let (ino, fh) = create_torrent_file(&mut svc, "valid.torrent");
+        let data = minimal_torrent_bytes();
+        svc.write(ino, 0, &data).expect("write ok");
+
+        // release should return instantly — the DB insert is deferred to a
+        // background thread.
+        let start = std::time::Instant::now();
+        svc.release(fh).expect("release ok");
+        let elapsed = start.elapsed();
+
+        // Even an in-memory DB insert takes < 1s; the point is that
+        // release itself does not wait for it.  Allow generous slack
+        // for CI scheduling jitter.
+        assert!(
+            elapsed.as_secs() < 5,
+            "release took {:?} — should be near-instant",
+            elapsed
+        );
+
+        // Inode is NOT removed (data integrity: if add_torrent fails, the
+        // file must remain visible to the user).
+        assert!(svc.inode_mgr.inodes.contains_key(&ino));
+
+        // Wait for the background thread to finish and clean up
+        // processing_torrents.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if svc.processing_torrents.lock().unwrap().is_empty() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("processing_torrents not cleaned up after 10s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Verify the torrent was persisted to the DB by the background thread.
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        let torrent = db_guard
+            .get_torrent_by_filename_and_source_path("valid.torrent", "")
+            .expect("db query");
+        assert!(torrent.is_some(), "torrent should be in DB after release");
+        assert_eq!(torrent.unwrap().filename, "valid.torrent");
+    }
+
+    /// TSI-2247: `processing_torrents` is NOT held during `add_torrent` —
+    /// the lock is released before the background thread is spawned.  Two
+    /// `.torrent` files in the root directory (both `source_path == ""`)
+    /// must both be processed and persisted — the dedup key is
+    /// `(source_path, filename)`, so they don't collide.
+    #[test]
+    fn release_does_not_hold_processing_lock_during_add() {
+        let mut svc = service_with_db();
+        let (ino1, fh1) = create_torrent_file(&mut svc, "a.torrent");
+        let data = minimal_torrent_bytes();
+        svc.write(ino1, 0, &data).expect("write ok");
+        svc.release(fh1).expect("release ok");
+
+        // At this point the background thread for a.torrent may or may not
+        // have finished.  Either way, processing_torrents should be lockable
+        // without blocking (it would be held only briefly by the background
+        // thread's cleanup).  The second release for a *different* file
+        // must succeed immediately — even though both share source_path "".
+        let (ino2, fh2) = create_torrent_file(&mut svc, "b.torrent");
+        svc.write(ino2, 0, &data).expect("write ok");
+
+        let start = std::time::Instant::now();
+        svc.release(fh2).expect("release ok");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_secs() < 5,
+            "second release took {:?} — should not wait for first",
+            elapsed
+        );
+
+        // Wait for both background threads to finish.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if svc.processing_torrents.lock().unwrap().is_empty() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("processing_torrents not cleaned up after 10s");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Both torrents must be in the DB — the tuple dedup key prevents
+        // the second from being skipped as a duplicate of the first.
+        let db_guard = svc.db.as_ref().unwrap().lock().unwrap();
+        let t1 = db_guard
+            .get_torrent_by_filename_and_source_path("a.torrent", "")
+            .expect("db query");
+        assert!(t1.is_some(), "a.torrent should be in DB");
+        let t2 = db_guard
+            .get_torrent_by_filename_and_source_path("b.torrent", "")
+            .expect("db query");
+        assert!(t2.is_some(), "b.torrent should be in DB");
+    }
+
+    /// TSI-2247: `flush` for an empty `.torrent` returns `EINVAL` (fast
+    /// path — no FFI call to libtorrent).
+    #[test]
+    fn flush_empty_torrent_returns_einval() {
+        let mut svc = service_with_db();
+        let (ino, _fh) = create_torrent_file(&mut svc, "empty.torrent");
+
+        let err = svc.flush(ino).unwrap_err();
+        assert_eq!(err, FsError::InvalidArgument);
+    }
+
+    // ── TSI-2234: unlink-while-open keeps the inode alive ───────────────
+
+    /// TSI-2234: `unlink` on a file with no open handle destroys the
+    /// inode immediately — the name is gone and the inode is absent.
+    #[test]
+    fn unlink_closed_file_destroys_inode() {
+        let mut svc = bare_service();
+        // Create a file, write valid torrent bytes, and close the handle.
+        // `release` for valid data does NOT remove the inode (no DB in
+        // bare_service, so the add_torrent path is skipped but the inode
+        // lingers), so the inode is alive with zero open handles — the
+        // precondition for immediate destruction on unlink.
+        let created = svc.create(METADATA_INO, "closed.torrent").expect("create");
+        let ino = created.attr.ino;
+        let fh = created.fh;
+        let data = minimal_torrent_bytes();
+        svc.write(ino, 0, &data).expect("write valid torrent");
+        svc.release(fh).expect("close handle");
+        assert!(svc.inode_mgr.inodes.contains_key(&ino));
+        assert_eq!(svc.inode_mgr.open_handle_count(ino), 0);
+
+        // unlink with no open handle → immediate destruction.
+        svc.unlink(METADATA_INO, "closed.torrent").expect("unlink");
+        assert_eq!(
+            svc.inode_mgr
+                .find_child_by_name(METADATA_INO, "closed.torrent"),
+            None
+        );
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+    }
+
+    /// TSI-2234: an open handle keeps read/write working after unlink, and
+    /// the inode is destroyed only on the LAST release (not the first).
+    #[test]
+    fn unlink_while_open_keeps_handle_until_last_release() {
+        let mut svc = bare_service();
+        let created = svc.create(METADATA_INO, "open.torrent").expect("create");
+        let ino = created.attr.ino;
+        let fh1 = created.fh;
+        // Open a second handle on the same inode.
+        let fh2 = match svc.open(ino).expect("open") {
+            OpenOutcome { fh, .. } => fh,
+        };
+        svc.write(ino, 0, b"hello").expect("write");
+
+        // unlink while both handles are open.
+        svc.unlink(METADATA_INO, "open.torrent").expect("unlink");
+        // Name gone, inode lingers (unlinked).
+        assert_eq!(
+            svc.inode_mgr
+                .find_child_by_name(METADATA_INO, "open.torrent"),
+            None
+        );
+        assert!(svc.inode_mgr.is_unlinked_file(ino));
+        assert_eq!(svc.inode_mgr.open_handle_count(ino), 2);
+
+        // read/write via fh1's ino still succeed.
+        svc.write(ino, 5, b"!").expect("write after unlink");
+        let outcome = svc.read(ino, 0, 6).expect("read after unlink");
+        let buf = match outcome {
+            ReadOutcome::Ready(b) => b,
+            _ => panic!("expected Ready read"),
+        };
+        assert_eq!(&buf, b"hello!");
+
+        // First release: inode survives (fh2 still open).
+        svc.release(fh1).expect("release fh1");
+        assert!(svc.inode_mgr.inodes.contains_key(&ino));
+        assert_eq!(svc.inode_mgr.open_handle_count(ino), 1);
+
+        // Second (last) release: inode destroyed.
+        svc.release(fh2).expect("release fh2");
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+    }
+
+    /// TSI-2234: after unlink, `readdir` no longer lists the file even
+    /// though its inode lingers for an open handle.
+    #[test]
+    fn unlink_hides_name_from_readdir_while_open() {
+        let mut svc = bare_service();
+        let created = svc.create(METADATA_INO, "hidden.torrent").expect("create");
+        let ino = created.attr.ino;
+        let fh = created.fh;
+        // Visible before unlink.
+        let names: Vec<String> = svc
+            .readdir(METADATA_INO, 0)
+            .expect("readdir")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(names.iter().any(|n| n == "hidden.torrent"));
+
+        svc.unlink(METADATA_INO, "hidden.torrent").expect("unlink");
+
+        // Gone from readdir after unlink.
+        let names: Vec<String> = svc
+            .readdir(METADATA_INO, 0)
+            .expect("readdir")
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert!(!names.iter().any(|n| n == "hidden.torrent"));
+        // Inode still alive.
+        assert!(svc.inode_mgr.inodes.contains_key(&ino));
+        svc.release(fh).expect("release");
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+    }
+
+    /// TSI-2234: a second `unlink` of the same name returns `ENOENT`
+    /// because `find_child_by_name` skips the unlinked inode.
+    #[test]
+    fn unlink_twice_returns_not_found() {
+        let mut svc = bare_service();
+        let created = svc.create(METADATA_INO, "twice.torrent").expect("create");
+        let _fh = created.fh;
+        svc.unlink(METADATA_INO, "twice.torrent")
+            .expect("first unlink");
+        let err = svc.unlink(METADATA_INO, "twice.torrent").unwrap_err();
+        assert_eq!(err, FsError::NotFound);
+    }
+
+    /// TSI-2234: creating a new file with the same name as an unlinked-but-
+    /// still-open inode succeeds (the old name is freed even though the
+    /// old inode lingers).
+    #[test]
+    fn recreate_name_after_unlink_while_open_succeeds() {
+        let mut svc = bare_service();
+        let created = svc.create(METADATA_INO, "reuse.torrent").expect("create");
+        let old_ino = created.attr.ino;
+        let _fh = created.fh;
+        svc.unlink(METADATA_INO, "reuse.torrent").expect("unlink");
+        // Re-create with the same name — must not collide with the lingering
+        // unlinked inode.
+        let created2 = svc.create(METADATA_INO, "reuse.torrent").expect("recreate");
+        assert_ne!(created2.attr.ino, old_ino);
+        // Both inodes coexist: old one (unlinked, open) + new one (linked).
+        assert!(svc.inode_mgr.is_unlinked_file(old_ino));
+        assert!(!svc.inode_mgr.is_unlinked_file(created2.attr.ino));
+    }
+
+    /// TSI-2234: an unlinked `.torrent` is NOT re-persisted on release —
+    /// the torrent was already removed from the DB by `unlink`, so
+    /// `release` just destroys the buffered inode.
+    #[test]
+    fn unlinked_torrent_not_repersisted_on_release() {
+        let mut svc = service_with_db();
+        let (ino, fh) = create_torrent_file(&mut svc, "repersist.torrent");
+        svc.write(ino, 0, &minimal_torrent_bytes()).expect("write");
+        svc.unlink(METADATA_INO, "repersist.torrent")
+            .expect("unlink");
+        assert!(svc.inode_mgr.is_unlinked_file(ino));
+        // release must NOT spawn a background add_torrent for an unlinked
+        // file — processing_torrents stays empty.
+        svc.release(fh).expect("release");
+        assert!(svc.processing_torrents.lock().unwrap().is_empty());
+        // Inode destroyed on last release.
+        assert!(!svc.inode_mgr.inodes.contains_key(&ino));
+    }
+
+    /// TSI-2234 (review blocking #1): a directory whose only remaining
+    /// child is an unlinked-but-still-open file must be removable — POSIX
+    /// treats "only unlinked-but-open files" as empty. Before the fix,
+    /// `rmdir` saw the lingering unlinked `File` inode as a child and
+    /// wrongly returned `ENOTEMPTY`.
+    #[test]
+    fn rmdir_succeeds_after_unlink_while_open() {
+        let mut svc = bare_service();
+        // Create a subdirectory under metadata/ and a .torrent inside it.
+        let dir = svc.mkdir(METADATA_INO, "sub").expect("mkdir sub").ino;
+        let created = svc.create(dir, "x.torrent").expect("create");
+        let _fh = created.fh;
+        // Unlink the file while its handle is open — inode lingers (unlinked).
+        svc.unlink(dir, "x.torrent").expect("unlink");
+        assert!(svc.inode_mgr.is_unlinked_file(created.attr.ino));
+        assert!(svc.inode_mgr.inodes.contains_key(&created.attr.ino));
+        // The directory now has no *visible* children; rmdir must succeed.
+        svc.rmdir(METADATA_INO, "sub")
+            .expect("rmdir after unlink-while-open");
+        assert!(!svc.inode_mgr.inodes.contains_key(&dir));
     }
 }

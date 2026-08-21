@@ -10,6 +10,9 @@
 //!
 //! Only the consumer thread ever calls `pop_alerts`, so it is the single
 //! owner of the alert queue and the `set_alert_notify` 0→1 semantics hold.
+//! Shutdown ordering (TSI-2244): `stop()` joins the consumer thread *before*
+//! unregistering the notify hook, so `set_alert_notify(None)` never races
+//! with a concurrent `pop_alerts` on the same session.
 
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -212,17 +215,34 @@ impl AlertConsumer {
         }
     }
 
-    /// Signal the alert consumer to stop and unregister the notify callback.
-    /// Must be called while the session is still alive. Does not join — call
-    /// `Drop` (or join the handle) for that.
-    pub fn stop(&self) {
-        // Unregister the hook first so libtorrent stops invoking the callback
-        // before the shared `notify` state is freed.
+    /// Stop the alert consumer and unregister the notify callback.
+    ///
+    /// Must be called while the session is still alive. Ordering is critical
+    /// to eliminate the FFI race with `drain_alerts` (issue TSI-2244):
+    /// 1. Set the stop flag and notify the condvar — wakes the consumer.
+    /// 2. Join the consumer thread — once joined, no `pop_alerts` FFI call is
+    ///    in flight, so `set_alert_notify(None)` cannot race with it.
+    /// 3. Unregister the notify hook — safe because the consumer is gone and
+    ///    the session is still alive.
+    ///
+    /// `Drop` only does steps 1–2 (defensive); it cannot do step 3 because the
+    /// session may already be destroyed by the time `Drop` runs.
+    pub fn stop(&mut self) {
+        // 1. Signal the consumer thread to exit.
+        self.stop_flag.store(true, Ordering::Relaxed);
+        self.notify.cv.notify_all();
+
+        // 2. Join the consumer thread so no `pop_alerts` FFI call is in flight.
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+
+        // 3. Unregister the notify hook. No concurrent `pop_alerts` is possible
+        //    because the consumer thread has exited. The session is still alive
+        //    (caller's contract), so the FFI call is safe.
         unsafe {
             libtorrent_sys::lt_session_set_alert_notify(self.session, None, std::ptr::null_mut());
         }
-        self.stop_flag.store(true, Ordering::Relaxed);
-        self.notify.cv.notify_all();
     }
 }
 
