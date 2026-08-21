@@ -439,7 +439,7 @@ fn update_status_impl(
     for (info_hash, handle) in handles.iter() {
         if let Ok(status) = handle.status() {
             if let Some(info) = seeding_info.get_mut(info_hash) {
-                info.uploaded = status.total_done;
+                info.uploaded = status.total_upload.max(0) as u64;
                 info.state = match status.state {
                     TorrentState::Seeding => SeedingState::Seeding,
                     TorrentState::Finished => SeedingState::Seeding,
