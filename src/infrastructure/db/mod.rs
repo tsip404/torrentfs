@@ -7,6 +7,15 @@
 //! - `file_ops` — file and directory query operations
 //! - `metadata_ops` — metadata directory management operations
 
+/// Escape SQLite LIKE metacharacters (`%`, `_`) and the escape character (`\`)
+/// in a literal string so it can be embedded into a LIKE pattern and matched
+/// verbatim. Must be paired with `ESCAPE '\\'` in the SQL statement.
+pub(super) fn escape_like_pattern(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 mod database;
 mod file_ops;
 mod metadata_ops;

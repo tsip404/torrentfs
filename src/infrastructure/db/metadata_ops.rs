@@ -84,12 +84,15 @@ impl Database {
             params![new_name, new_path, old_path],
         )?;
 
-        // 2. Update all child directories' paths (replace old_path prefix with new_path)
+        // 2. Update all child directories' paths (replace old_path prefix with new_path).
+        // Escape LIKE metacharacters in old_prefix so directory names containing
+        // %, _, or \ are matched literally rather than as glob wildcards.
         let old_prefix = format!("{}/", old_path);
         let new_prefix = format!("{}/", new_path);
+        let escaped_old_prefix = super::escape_like_pattern(&old_prefix);
         tx.execute(
-            "UPDATE metadata_directories SET path = ? || substr(path, ?) WHERE path LIKE ?",
-            params![new_prefix, old_prefix.len() + 1, format!("{}%", old_prefix)],
+            "UPDATE metadata_directories SET path = ? || substr(path, ?) WHERE path LIKE ? ESCAPE '\\'",
+            params![new_prefix, old_prefix.len() + 1, format!("{}%", escaped_old_prefix)],
         )?;
 
         // 3. Update torrents whose source_path matches exactly
@@ -100,8 +103,8 @@ impl Database {
 
         // 4. Update torrents whose source_path starts with old_path/
         tx.execute(
-            "UPDATE torrents SET source_path = ? || substr(source_path, ?) WHERE source_path LIKE ?",
-            params![new_prefix, old_prefix.len() + 1, format!("{}%", old_prefix)],
+            "UPDATE torrents SET source_path = ? || substr(source_path, ?) WHERE source_path LIKE ? ESCAPE '\\'",
+            params![new_prefix, old_prefix.len() + 1, format!("{}%", escaped_old_prefix)],
         )?;
 
         tx.commit()?;
@@ -212,9 +215,13 @@ impl Database {
                 }
             };
 
+            // Escape LIKE metacharacters in the prefix so source_path components
+            // containing %, _, or \ are matched literally, not as wildcards.
+            let escaped_current = super::escape_like_pattern(&current);
+            let like_pattern = format!("{}/%", escaped_current);
             let torrent_count: i64 = self.conn.query_row(
-                "SELECT COUNT(*) FROM torrents WHERE source_path = ?1 OR source_path LIKE (?1 || '/%')",
-                params![&current],
+                "SELECT COUNT(*) FROM torrents WHERE source_path = ?1 OR source_path LIKE ?2 ESCAPE '\\'",
+                params![&current, like_pattern],
                 |row| row.get(0),
             )?;
 
