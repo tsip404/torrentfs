@@ -35,6 +35,8 @@
 #include <set>
 #include <unistd.h>
 #include <fcntl.h>
+#include <shared_mutex>
+#include <unordered_map>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
@@ -54,6 +56,46 @@ static bool torrentfs_diag_enabled() {
 
 #define TORRENTFS_DIAG(...) \
     do { if (torrentfs_diag_enabled()) { fprintf(stderr, __VA_ARGS__); } } while (0)
+
+// ── Per-info-hash shared mutex for read/write synchronization (TSI-2262) ──
+// The C++ PieceStorage::write_piece acquires an exclusive lock before writing
+// blocks to a piece file. The Rust PieceStore::read_piece acquires a shared
+// lock before reading. This prevents the write-during-read race that caused
+// concurrent readers to get inconsistent (partial) data during active
+// downloads.
+//
+// The mutexes are stored as shared_ptr<shared_mutex> and are intentionally
+// NEVER erased from the map. This avoids two use-after-free scenarios:
+//   1. get_piece_lock returns a shared_ptr copy (not a reference), so even
+//      if the map entry were erased, the mutex stays alive until the last
+//      shared_ptr is released.
+//   2. lt_unlock_piece_read uses .find() (not operator[]), so it never
+//      creates a spurious new mutex to unlock.
+// The memory cost is ~48 bytes per torrent ever added — negligible for a
+// FUSE filesystem that processes a bounded number of torrents.
+static std::mutex g_piece_lock_map_mutex;
+static std::unordered_map<std::string, std::shared_ptr<std::shared_mutex>> g_piece_locks;
+
+// Look up or create the shared_mutex for the given info_hash (hex string).
+// Returns a shared_ptr copy so the mutex outlives the map entry.
+static std::shared_ptr<std::shared_mutex> get_piece_lock(const std::string& info_hash_hex) {
+    std::lock_guard<std::mutex> map_lock(g_piece_lock_map_mutex);
+    auto& ptr = g_piece_locks[info_hash_hex];
+    if (!ptr) {
+        ptr = std::make_shared<std::shared_mutex>();
+    }
+    return ptr;
+}
+
+// Find the shared_mutex without creating a new entry.
+// Returns nullptr if the info_hash has no entry (e.g. no libtorrent session
+// was ever created for it — happens in unit tests with synthetic keys).
+static std::shared_ptr<std::shared_mutex> find_piece_lock(const std::string& info_hash_hex) {
+    std::lock_guard<std::mutex> map_lock(g_piece_lock_map_mutex);
+    auto it = g_piece_locks.find(info_hash_hex);
+    if (it == g_piece_locks.end()) return nullptr;
+    return it->second;
+}
 
 struct lt_error {
     std::string message;
@@ -1322,6 +1364,13 @@ public:
 
     bool write_piece(int piece_index, int offset, const char* buf, int size) {
         std::lock_guard<std::mutex> lock(m_mutex);
+        // TSI-2262: acquire an exclusive lock on the per-info-hash
+        // shared_mutex so that Rust-side reads (PieceStore::read_piece)
+        // cannot read a partially-written piece file. The shared_mutex
+        // is separate from m_mutex (which serializes C++-internal
+        // reads/writes) because the Rust read path bypasses m_mutex.
+        auto piece_lock = get_piece_lock(m_info_hash_hex);
+        std::unique_lock<std::shared_mutex> write_lock(*piece_lock);
         if (!ensure_dir_recursive(m_base_path + "/" + m_info_hash_hex)) {
             fprintf(stderr, "[DIAG] write_piece: ensure_dir_recursive failed for %s/%s\n",
                     m_base_path.c_str(), m_info_hash_hex.c_str());
@@ -1524,6 +1573,12 @@ public:
     // disk_interface: remove_torrent
     void remove_torrent(lt::storage_index_t idx) override {
         std::lock_guard<std::mutex> lock(m_mutex);
+        // TSI-2262: the per-info-hash shared_mutex is intentionally NOT
+        // erased from g_piece_locks here. A concurrent lt_unlock_piece_read
+        // may still hold a shared_ptr to it; erasing would invalidate the
+        // map entry's shared_ptr, but since get_piece_lock returns a copy,
+        // the mutex stays alive until the last reference drops. Leaving
+        // the entry avoids the erase-during-use UB entirely.
         m_storages.erase(idx);
     }
 
@@ -2027,5 +2082,40 @@ lt_torrent_handle_t lt_session_add_torrent_with_custom_storage_upload_mode(
             error->message = err_msg.c_str();
         }
         return nullptr;
+    }
+}
+
+// ============================================================================
+// C API: TSI-2262 — Per-info-hash shared read lock for Rust PieceStore
+// Allows the Rust read path (PieceStore::read_piece) to acquire a shared
+// (read) lock on the same per-info-hash shared_mutex that the C++
+// PieceStorage::write_piece holds exclusively. This prevents concurrent
+// readers from reading partially-written piece files during active
+// downloads.
+// ============================================================================
+
+// Acquire a shared (read) lock on the per-info-hash mutex.
+// Blocks if a writer (write_piece) currently holds the exclusive lock.
+// The caller MUST pair this with lt_unlock_piece_read before accessing
+// the piece file via Rust's std::fs::read.
+void lt_lock_piece_read(const char* info_hash_hex) {
+    if (!info_hash_hex || !*info_hash_hex) return;
+    // get_piece_lock returns a shared_ptr copy, so the mutex outlives
+    // the map entry even if a concurrent remove_torrent happens.
+    auto lock = get_piece_lock(std::string(info_hash_hex));
+    lock->lock_shared();
+}
+
+// Release a previously-acquired shared (read) lock.
+// Uses find_piece_lock (not operator[]) so it never creates a spurious
+// new mutex. If no entry exists (e.g. torrent never had a write_piece
+// call), the unlock is a no-op — the matching lock would also have been
+// a no-op on a freshly created empty mutex, but find avoids the UB of
+// unlocking a mutex that was never locked.
+void lt_unlock_piece_read(const char* info_hash_hex) {
+    if (!info_hash_hex || !*info_hash_hex) return;
+    auto lock = find_piece_lock(std::string(info_hash_hex));
+    if (lock) {
+        lock->unlock_shared();
     }
 }

@@ -63,11 +63,23 @@ impl PieceStore {
     }
 
     /// Read a whole piece from the on-disk cache, recording an access.
+    ///
+    /// TSI-2262: acquires a per-info-hash shared read lock (via the C++
+    /// FFI `lt_lock_piece_read`/`lt_unlock_piece_read`) before reading the
+    /// piece file. This prevents reading a partially-written piece file
+    /// while libtorrent's `PieceStorage::write_piece` is still writing
+    /// blocks to it on the disk thread. Without this lock, concurrent
+    /// readers during active download could get inconsistent data (some
+    /// readers saw partial piece files before all blocks were flushed).
     pub fn read_piece(&self, piece_key: &str) -> TorrentResult<Vec<u8>> {
         let path = {
             let cache = self.cache.lock().map_err(|_| Self::poisoned())?;
             cache.piece_path(piece_key)
         };
+        // Extract info_hash from the piece_key ("{info_hash}:piece:{index}")
+        // to acquire the per-info-hash shared read lock.
+        let info_hash_hex = piece_key.split(':').next().unwrap_or("");
+        let lock_guard = PieceReadLockGuard::new(info_hash_hex);
         let data = std::fs::read(&path).map_err(|e| {
             TorrentError::IoError(format!(
                 "Failed to read cached piece {} from {}: {}",
@@ -76,6 +88,7 @@ impl PieceStore {
                 e
             ))
         })?;
+        drop(lock_guard);
         if let Ok(mut cache) = self.cache.lock() {
             let _ = cache.record_access(piece_key);
         }
@@ -83,12 +96,18 @@ impl PieceStore {
     }
 
     /// Read a byte range from a piece file without loading the whole piece.
+    ///
+    /// TSI-2262: same shared read lock as `read_piece` to prevent reading
+    /// a partially-written piece file during active download.
     pub fn read_piece_range(
         &self,
         piece_key: &str,
         offset: u64,
         size: usize,
     ) -> TorrentResult<Vec<u8>> {
+        // Extract info_hash for the per-info-hash shared read lock.
+        let info_hash_hex = piece_key.split(':').next().unwrap_or("");
+        let _lock_guard = PieceReadLockGuard::new(info_hash_hex);
         let cache = self.cache.lock().map_err(|_| Self::poisoned())?;
         cache.read_piece_range(piece_key, offset, size)
     }
@@ -203,6 +222,55 @@ impl PieceStore {
         }
 
         Ok(true)
+    }
+}
+
+/// RAII guard for the C++ per-info-hash shared read lock (TSI-2262).
+///
+/// Acquires a shared (read) lock on the C++ `g_piece_locks` mutex for the
+/// given info_hash on construction, and releases it on drop. This prevents
+/// `PieceStorage::write_piece` (which holds the exclusive lock) from writing
+/// blocks to a piece file while the Rust side is reading it.
+///
+/// The lock is a no-op (skipped) when `info_hash_hex` is empty — this happens
+/// in unit tests that use synthetic piece keys without a real libtorrent
+/// session, or when the piece key format is malformed.
+struct PieceReadLockGuard {
+    info_hash_hex: String,
+    locked: bool,
+}
+
+impl PieceReadLockGuard {
+    fn new(info_hash_hex: &str) -> Self {
+        if info_hash_hex.is_empty() {
+            return Self {
+                info_hash_hex: String::new(),
+                locked: false,
+            };
+        }
+        let c_str = std::ffi::CString::new(info_hash_hex).unwrap_or_default();
+        // SAFETY: `lt_lock_piece_read` acquires a shared lock on a global
+        // per-info-hash shared_mutex. The info_hash_hex string is a valid
+        // C string. The lock is released in `Drop`.
+        unsafe {
+            libtorrent_sys::lt_lock_piece_read(c_str.as_ptr());
+        }
+        Self {
+            info_hash_hex: info_hash_hex.to_string(),
+            locked: true,
+        }
+    }
+}
+
+impl Drop for PieceReadLockGuard {
+    fn drop(&mut self) {
+        if self.locked {
+            let c_str = std::ffi::CString::new(self.info_hash_hex.as_str()).unwrap_or_default();
+            // SAFETY: paired with the `lt_lock_piece_read` call in `new`.
+            unsafe {
+                libtorrent_sys::lt_unlock_piece_read(c_str.as_ptr());
+            }
+        }
     }
 }
 

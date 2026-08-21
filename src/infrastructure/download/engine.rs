@@ -1097,6 +1097,36 @@ impl EngineState {
                 }
                 continue;
             }
+            // TSI-2262: verify the piece data length matches the expected
+            // piece size. A shorter file means the piece was read while
+            // libtorrent's write_piece was still writing blocks to it
+            // (the write-during-read race). The shared read lock should
+            // prevent this in normal operation, but this check is a safety
+            // net for edge cases (e.g. cache eviction + re-download).
+            let expected_piece_size = if piece_idx == num_pieces - 1 {
+                let remainder = total_size.saturating_sub(((num_pieces - 1) as u64) * piece_length);
+                if remainder > 0 {
+                    remainder
+                } else {
+                    piece_length
+                }
+            } else {
+                piece_length
+            };
+            if (piece_data.len() as u64) < expected_piece_size {
+                let piece_start = (piece_idx as u64) * piece_length;
+                let piece_end_theoretical = piece_start + piece_length;
+                if absolute_offset < piece_end_theoretical && end_offset > piece_start {
+                    return Err(TorrentError::PieceNotReady(format!(
+                        "Piece {} data is {} bytes, expected {} (possible \
+                         write-during-read race)",
+                        piece_idx,
+                        piece_data.len(),
+                        expected_piece_size
+                    )));
+                }
+                continue;
+            }
             // TSI-2225: the piece is being served from the local disk. If it is
             // not yet registered in the cache metadata (e.g. it was downloaded
             // eagerly by the access-window prefetch rather than through this
