@@ -347,3 +347,67 @@ fn test_ensure_handle_async_does_not_block_on_busy_engine() {
     read_thread.join().expect("read thread");
     engine.shutdown();
 }
+
+/// Regression test (TSI-2238): `shutdown()` must abort an in-flight
+/// `read_file_range` that is blocked in a wait loop (state-transition,
+/// peer-discovery, or piece-wait) instead of stalling until
+/// `read_timeout_secs` elapses.  Before the fix, the state-transition and
+/// peer-wait loops never checked `self.stopping`, so `shutdown()`'s
+/// `handle.join()` blocked for up to `read_timeout_secs` (default 30s).
+///
+/// Here the torrent has no tracker and no peers, so the read blocks in the
+/// peer-discovery wait loop.  A read timeout of 30s makes the contrast
+/// sharp: with the fix `shutdown()` returns in well under a second; without
+/// it the test would hang ~30s on the join.
+#[test]
+fn test_shutdown_aborts_blocked_read() {
+    let _session_guard = common::acquire_session_lock();
+
+    let cache_dir = tempfile::TempDir::new().expect("Failed to create cache dir");
+    let mut config = local_test_config();
+    config.dht.enabled = Some(false);
+    config.local_discovery.lsd_enabled = Some(false);
+    // Long timeout: the read would block this long without the shutdown fix.
+    config.timeouts.read_timeout_secs = Some(30);
+
+    let engine = Arc::new(
+        torrentfs::download::DownloadEngine::new(cache_dir.path(), &config)
+            .expect("Failed to create DownloadEngine"),
+    );
+
+    // A torrent with a fake tracker URL: no peers will ever connect, so the
+    // read blocks in the peer-discovery wait loop.
+    let info = Arc::new(
+        torrentfs::TorrentInfo::from_bytes(distinct_torrent("shutdown-abort.iso"))
+            .expect("Failed to parse torrent"),
+    );
+    engine.ensure_handle(info.clone()).expect("ensure handle");
+
+    let engine_for_read = engine.clone();
+    let info_for_read = info.clone();
+    let read_thread = thread::spawn(move || {
+        let _ = engine_for_read.read_file_range(info_for_read, 0, 0, 4096);
+    });
+
+    // Give the engine thread time to enter the blocking peer-wait loop.
+    thread::sleep(Duration::from_millis(500));
+
+    // shutdown() sets `stopping` and joins the engine thread.  The blocked
+    // read must observe `stopping` and return promptly; then the engine loop
+    // processes the queued `Command::Shutdown` and the join completes.
+    let start = std::time::Instant::now();
+    engine.shutdown();
+    let elapsed = start.elapsed();
+
+    // With the fix, shutdown completes in well under a second (the peer-wait
+    // loop polls `stopping` every 500ms).  Assert far below the 30s read
+    // timeout to catch regressions without being flaky on slow CI.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "shutdown took {:?} to abort a blocked read (read_timeout_secs=30); \
+         expected well under 5s",
+        elapsed
+    );
+
+    read_thread.join().expect("read thread panicked");
+}
