@@ -1219,3 +1219,108 @@ fn test_migrate_v5_dedup_conflicting_rows() {
         assert_eq!(torrents[0].name, "Torrent New");
     }
 }
+
+#[test]
+fn test_migrate_v5_cleans_orphaned_child_rows() {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test.db");
+
+    // Build a v4 database manually with two rows sharing (source_path, filename)
+    // but different info_hash (legal under old UNIQUE(info_hash, source_path)).
+    // Attach child rows to BOTH torrents so the non-retained one becomes an orphan.
+    let orphan_id;
+    let survivor_id;
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        Database::migrate_v1(&conn).unwrap();
+        Database::migrate_v3(&conn).unwrap();
+        Database::migrate_v4(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+
+        conn.execute(
+            "INSERT INTO torrents (info_hash, name, total_size, file_count, status, source_path, filename)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["hash1", "Old", 100i64, 1i64, "pending", "a", "T.torrent"],
+        ).unwrap();
+        orphan_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO torrents (info_hash, name, total_size, file_count, status, source_path, filename)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["hash2", "New", 200i64, 1i64, "pending", "a", "T.torrent"],
+        ).unwrap();
+        survivor_id = conn.last_insert_rowid();
+
+        // Child rows for the orphaned torrent
+        conn.execute(
+            "INSERT INTO torrent_directories (torrent_id, parent_id, name) VALUES (?1, NULL, 'dir_old')",
+            rusqlite::params![orphan_id],
+        ).unwrap();
+        let old_dir_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO torrent_files (torrent_id, directory_id, name, size) VALUES (?1, ?2, 'f_old', 10)",
+            rusqlite::params![orphan_id, old_dir_id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO directory_closure (ancestor_id, descendant_id, depth) VALUES (?1, ?1, 0)",
+            rusqlite::params![old_dir_id],
+        )
+        .unwrap();
+
+        // Child rows for the surviving torrent
+        conn.execute(
+            "INSERT INTO torrent_directories (torrent_id, parent_id, name) VALUES (?1, NULL, 'dir_new')",
+            rusqlite::params![survivor_id],
+        ).unwrap();
+        let new_dir_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO torrent_files (torrent_id, directory_id, name, size) VALUES (?1, ?2, 'f_new', 20)",
+            rusqlite::params![survivor_id, new_dir_id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO directory_closure (ancestor_id, descendant_id, depth) VALUES (?1, ?1, 0)",
+            rusqlite::params![new_dir_id],
+        )
+        .unwrap();
+    }
+
+    // Re-open: v5 migration must delete the orphan's child rows.
+    {
+        let db = Database::open(&db_path).unwrap();
+
+        // Survivor's child rows intact
+        let files = db.get_files_by_torrent_id(survivor_id).unwrap();
+        assert_eq!(files.len(), 1, "survivor files preserved");
+        assert_eq!(files[0].name, "f_new");
+
+        let dirs = db
+            .get_torrent_directories_by_parent(None, survivor_id)
+            .unwrap();
+        assert_eq!(dirs.len(), 1, "survivor directories preserved");
+
+        // Orphan's child rows gone (no dangling torrent_id references)
+        let orphan_files = db.get_files_by_torrent_id(orphan_id).unwrap();
+        assert_eq!(orphan_files.len(), 0, "orphan files cleaned up");
+
+        let orphan_dirs = db
+            .get_torrent_directories_by_parent(None, orphan_id)
+            .unwrap();
+        assert_eq!(orphan_dirs.len(), 0, "orphan directories cleaned up");
+
+        // directory_closure: no rows referencing the orphan's directory id
+        let conn = &db.conn;
+        let dangling: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM directory_closure WHERE ancestor_id IN (
+                    SELECT id FROM torrent_directories WHERE torrent_id = ?1
+                ) OR descendant_id IN (
+                    SELECT id FROM torrent_directories WHERE torrent_id = ?1
+                )",
+                rusqlite::params![orphan_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(dangling, 0, "orphan directory_closure rows cleaned up");
+    }
+}
