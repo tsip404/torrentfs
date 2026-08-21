@@ -170,7 +170,26 @@ fn worker_loop(rx: Arc<Mutex<Receiver<Job>>>) {
                 Err(_) => break, // sender dropped — queue drained
             }
         };
-        job();
+        // Isolate job panics so a single panicking job cannot permanently
+        // kill this worker (which would silently shrink the pool toward zero,
+        // eventually stalling `submit` forever). The worker catches the
+        // unwind and continues to the next job.
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || job()))
+        {
+            // Try to extract a human-readable message from the panic
+            // payload. `panic!` with a `&'static str` or `String` yields a
+            // payload that downcasts to those types; anything else is logged
+            // as an unknown panic so the worker still survives.
+            let msg = payload
+                .downcast_ref::<&'static str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            tracing::error!(
+                msg = %msg,
+                "worker pool job panicked; worker continues to next job"
+            );
+        }
     }
 }
 
@@ -328,6 +347,45 @@ mod tests {
 
         // Shutdown must return promptly: the job observes the stopping flag
         // and exits, so `join` is not blocked by the in-flight job.
+        pool.shutdown();
+    }
+
+    #[test]
+    fn panicking_job_does_not_kill_worker() {
+        // A single-worker pool: submit a panicking job, then a normal job.
+        // The first job signals that the worker has entered it, then panics.
+        // The panic is caught by `catch_unwind`, so the worker survives and
+        // dequeues the second job. The second job signals completion via a
+        // channel — if the worker had died on the panic, the second job would
+        // never run and the recv would time out.
+        let pool = WorkerPool::new(1, 4);
+        let (panic_started_tx, panic_started_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        // First job: signal start then panic.
+        assert!(pool
+            .try_submit(Box::new(move || {
+                let _ = panic_started_tx.send(());
+                panic!("boom from job");
+            }))
+            .is_ok());
+
+        // Wait until the worker has entered the panicking job.
+        panic_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("panicking job should start");
+
+        // Second job must still execute — the worker survived the panic.
+        assert!(pool
+            .try_submit(Box::new(move || {
+                let _ = done_tx.send(());
+            }))
+            .is_ok());
+
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second job must run after the first job panicked");
+
         pool.shutdown();
     }
 }
