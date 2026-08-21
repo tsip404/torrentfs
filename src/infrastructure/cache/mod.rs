@@ -76,6 +76,18 @@ impl CacheManager {
         Ok(())
     }
 
+    /// TSI-2263: persist the cache metadata to disk with fsync.
+    ///
+    /// `save_metadata_file` is already called on every mutation, but during
+    /// graceful shutdown we want an explicit, logged flush so the final
+    /// metadata state is durable before the process exits.  Without this,
+    /// a container restart can leave `cache_metadata.txt` stale, causing
+    /// the restart scan to register pieces at wrong sizes and the verifier
+    /// to purge them.
+    pub fn flush(&self) -> TorrentResult<()> {
+        self.save_metadata_file()
+    }
+
     fn load_metadata_file(&mut self, path: &Path) -> TorrentResult<()> {
         let file = File::open(path)
             .map_err(|e| TorrentError::IoError(format!("Failed to open metadata file: {}", e)))?;
@@ -249,9 +261,21 @@ impl CacheManager {
             .map_err(|e| TorrentError::IoError(format!("Failed to write metadata: {}", e)))?;
         }
 
+        // TSI-2263: flush the BufWriter into the OS page cache, then
+        // fsync the underlying file descriptor so the metadata reaches
+        // disk.  BufWriter::flush only pushes bytes to the OS buffer;
+        // without fsync a container restart can leave cache_metadata.txt
+        // empty or stale, causing scan_pieces_subdirectory to register
+        // pieces at wrong sizes and the verifier to purge them.
         writer
             .flush()
             .map_err(|e| TorrentError::IoError(format!("Failed to flush metadata file: {}", e)))?;
+        let inner = writer
+            .into_inner()
+            .map_err(|e| TorrentError::IoError(format!("Failed to flush metadata file: {}", e)))?;
+        inner
+            .sync_all()
+            .map_err(|e| TorrentError::IoError(format!("Failed to fsync metadata file: {}", e)))?;
 
         Ok(())
     }
@@ -1373,6 +1397,65 @@ mod tests {
             4096,
             "after evicting the partial piece, current_size should reflect only the surviving piece"
         );
+
+        Ok(())
+    }
+
+    // ── TSI-2263: cache flush durability ──────────────────────────────
+
+    #[test]
+    fn test_flush_persists_metadata_for_restart() -> TorrentResult<()> {
+        // flush() must persist the current metadata to disk so that a
+        // restart discovers all pieces at their registered sizes.  This
+        // is the explicit shutdown flush that prevents the "cache piece
+        // cleaned after restart" bug.
+        let temp_dir = TempDir::new().unwrap();
+
+        let piece_key = "tsi2263_flush:piece:0";
+        {
+            let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+            let piece_path = cache.ensure_piece_dir(piece_key)?;
+            std::fs::write(&piece_path, vec![0u8; 256])?;
+            cache.add_piece(piece_key, 256)?;
+            assert!(cache.is_piece_verified(piece_key));
+
+            // Explicit flush — simulates the shutdown path.
+            cache.flush()?;
+        }
+
+        // Restart: metadata must reflect the flushed state.
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+        assert!(cache.has_piece(piece_key));
+        assert_eq!(cache.piece_metadata_size(piece_key), Some(256));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_flush_preserves_multiple_pieces_across_restart() -> TorrentResult<()> {
+        // Multiple pieces from different torrents, each flushed before
+        // shutdown, must all survive a restart at their correct sizes.
+        let temp_dir = TempDir::new().unwrap();
+
+        let key_a = "tsi2263_hash_a:piece:0";
+        let key_b = "tsi2263_hash_b:piece:1";
+        let key_c = "tsi2263_hash_a:piece:2";
+        {
+            let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+            for (key, sz) in [(key_a, 128u64), (key_b, 512u64), (key_c, 256u64)] {
+                let path = cache.ensure_piece_dir(key)?;
+                std::fs::write(&path, vec![0u8; sz as usize])?;
+                cache.add_piece(key, sz)?;
+            }
+            cache.flush()?;
+        }
+
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+        assert_eq!(cache.piece_metadata_size(key_a), Some(128));
+        assert_eq!(cache.piece_metadata_size(key_b), Some(512));
+        assert_eq!(cache.piece_metadata_size(key_c), Some(256));
+        assert_eq!(cache.piece_count(), 3);
+        assert_eq!(cache.current_size(), 896);
 
         Ok(())
     }
