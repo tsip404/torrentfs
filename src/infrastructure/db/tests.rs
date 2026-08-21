@@ -869,6 +869,61 @@ fn test_insert_torrent_with_files_atomic() {
 }
 
 #[test]
+fn test_insert_torrent_with_files_populates_path() {
+    let mut db = Database::open_in_memory().unwrap();
+
+    let files = vec![
+        FileEntry {
+            path: "dir1/file1.txt".to_string(),
+            size: 100,
+        },
+        FileEntry {
+            path: "file2.txt".to_string(),
+            size: 200,
+        },
+        FileEntry {
+            path: "a/b/c/deep.txt".to_string(),
+            size: 300,
+        },
+    ];
+
+    let torrent_id = match db
+        .insert_torrent_with_files("path1", "Test", "Test.torrent", 600, "hash1", 3, &files)
+        .unwrap()
+    {
+        InsertTorrentResult::Inserted(id) => id,
+        _ => panic!("Expected Inserted"),
+    };
+
+    let all_files = db.get_files_by_torrent_id(torrent_id).unwrap();
+    assert_eq!(all_files.len(), 3);
+
+    let file1 = all_files.iter().find(|f| f.name == "file1.txt").unwrap();
+    assert_eq!(file1.path, "dir1/file1.txt");
+
+    let file2 = all_files.iter().find(|f| f.name == "file2.txt").unwrap();
+    assert_eq!(file2.path, "file2.txt");
+
+    let deep = all_files.iter().find(|f| f.name == "deep.txt").unwrap();
+    assert_eq!(deep.path, "a/b/c/deep.txt");
+
+    // Nested file must sit under the `c` directory, not at root (directory_id != None).
+    let dir_a = db
+        .get_torrent_directory(torrent_id, None, "a")
+        .unwrap()
+        .expect("dir `a` exists");
+    let dir_b = db
+        .get_torrent_directory(torrent_id, Some(dir_a.id), "b")
+        .unwrap()
+        .expect("dir `b` exists");
+    let dir_c = db
+        .get_torrent_directory(torrent_id, Some(dir_b.id), "c")
+        .unwrap()
+        .expect("dir `c` exists");
+    assert_eq!(deep.directory_id, Some(dir_c.id));
+}
+
+#[test]
 fn test_insert_torrent_with_files_duplicate() {
     let mut db = Database::open_in_memory().unwrap();
 
