@@ -41,6 +41,13 @@ pub enum InodeData {
         parent: u64,
         name: String,
         data: Vec<u8>,
+        /// TSI-2234: `true` once `unlink` removed the directory entry.
+        /// The inode + buffered data stay alive (readable/writable via
+        /// still-open handles) until the last handle is `release`d, then
+        /// the inode is destroyed. `find_child_by_name` / `readdir` skip
+        /// unlinked inodes so the name is gone even though the inode
+        /// lingers — matching FUSE "open-but-unlinked" semantics.
+        unlinked: bool,
     },
 }
 
@@ -108,6 +115,7 @@ impl InodeManager {
                 parent: ROOT_INO,
                 name: ".stats".to_string(),
                 data: Vec::new(),
+                unlinked: false,
             },
         );
 
@@ -235,8 +243,11 @@ impl InodeManager {
                     return Some(*ino);
                 }
                 InodeData::File {
-                    parent: p, name: n, ..
-                } if *p == parent && n == name => {
+                    parent: p,
+                    name: n,
+                    unlinked,
+                    ..
+                } if *p == parent && n == name && !*unlinked => {
                     return Some(*ino);
                 }
                 _ => {}
@@ -340,6 +351,7 @@ impl InodeManager {
                     parent: parent_ino,
                     name: filename,
                     data: torrent.torrent_data.clone().unwrap_or_default(),
+                    unlinked: false,
                 },
             );
         }
@@ -365,6 +377,57 @@ impl InodeManager {
             kind: FileKind::RegularFile,
             perm: 0o444,
             nlink: 1,
+        }
+    }
+
+    // ── Open-handle / unlink lifecycle helpers (TSI-2234) ──
+
+    /// Count how many open file handles currently reference `ino`.
+    /// `open_files` maps `fh -> ino`; this is the live reference count
+    /// used to decide when an unlinked inode can finally be destroyed.
+    pub fn open_handle_count(&self, ino: u64) -> usize {
+        self.open_files
+            .values()
+            .filter(|open_ino| **open_ino == ino)
+            .count()
+    }
+
+    /// `true` if `ino` is a `File` inode already unlinked but kept alive
+    /// only by still-open handles.
+    pub fn is_unlinked_file(&self, ino: u64) -> bool {
+        matches!(
+            self.inodes.get(&ino),
+            Some(InodeData::File { unlinked: true, .. })
+        )
+    }
+
+    /// Retire a `File` inode's directory entry (TSI-2234).
+    ///
+    /// If no open handle references the inode, the inode is destroyed
+    /// immediately. Otherwise it is marked `unlinked`: it stays alive
+    /// (readable/writable) via its open handles, and the last `release`
+    /// destroys it. The directory name disappears either way because
+    /// [`find_child_by_name`](Self::find_child_by_name) skips unlinked
+    /// inodes. Returns `true` if the inode was destroyed now.
+    pub fn unlink_file(&mut self, ino: u64) -> bool {
+        debug_assert!(
+            matches!(self.inodes.get(&ino), Some(InodeData::File { .. })),
+            "unlink_file called on non-file or unknown inode: {}",
+            ino
+        );
+        let unlinked_already = self.is_unlinked_file(ino);
+        if unlinked_already {
+            // Already retired; nothing to do.
+            return false;
+        }
+        let has_open = self.open_handle_count(ino) > 0;
+        if has_open {
+            if let Some(InodeData::File { unlinked, .. }) = self.inodes.get_mut(&ino) {
+                *unlinked = true;
+            }
+            false
+        } else {
+            self.inodes.remove(&ino).is_some()
         }
     }
 }
