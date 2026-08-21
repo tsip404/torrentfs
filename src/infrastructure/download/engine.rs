@@ -581,6 +581,11 @@ impl EngineState {
                 | TorrentState::Allocating
                 | TorrentState::CheckingResumeData
         ) {
+            if self.stopping.load(Ordering::Relaxed) {
+                return Err(TorrentError::Timeout(
+                    "shutdown requested, read aborted".to_string(),
+                ));
+            }
             if start.elapsed().as_secs() > max_wait_secs {
                 return Err(TorrentError::Timeout(format!(
                     "Torrent stuck in state {:?} for {} seconds",
@@ -666,6 +671,12 @@ impl EngineState {
             if status.num_peers == 0 && status.num_seeds == 0 {
                 let peer_wait_start = Instant::now();
                 loop {
+                    if self.stopping.load(Ordering::Relaxed) {
+                        self.release_reader(&info_hash);
+                        return Err(TorrentError::Timeout(
+                            "shutdown requested, read aborted".to_string(),
+                        ));
+                    }
                     if peer_wait_start.elapsed() >= peer_wait_timeout {
                         break;
                     }
