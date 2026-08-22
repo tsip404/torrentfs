@@ -400,12 +400,16 @@ fn test_shutdown_aborts_blocked_read() {
     let elapsed = start.elapsed();
 
     // With the fix, shutdown completes in well under a second (the peer-wait
-    // loop polls `stopping` every 500ms).  Assert far below the 30s read
-    // timeout to catch regressions without being flaky on slow CI.
+    // loop polls `stopping` every 500ms).  Assert well below the 30s read
+    // timeout to catch regressions; 15s (not 5s) leaves headroom for CPU
+    // starvation when the full workspace test suite runs in parallel and
+    // multiple libtorrent sessions contend for cores on a 2-core CI runner.
+    // The regression this guards against takes ~30s (the full read timeout),
+    // so 15s still catches it with a 2x margin.
     assert!(
-        elapsed < Duration::from_secs(5),
+        elapsed < Duration::from_secs(15),
         "shutdown took {:?} to abort a blocked read (read_timeout_secs=30); \
-         expected well under 5s",
+         expected well under 15s",
         elapsed
     );
 
