@@ -80,11 +80,9 @@ impl FsService {
         // eviction callback.  The Arc is kept on FsService so it can be
         // shared with TorrentService for seed removal on unlink (TSI-2232).
         let seeding_manager = match &download_service {
-            Some(ds) => match SeedingService::new(&cache_path, config) {
+            Some(_) => match SeedingService::new(&cache_path, config) {
                 Ok(seeding_svc) => {
                     let sm = seeding_svc.get_seeding_manager();
-                    ds.register_seeding_callback(sm.clone());
-                    info!("SeedingManager registered as CacheManager eviction callback");
                     Some(sm)
                 }
                 Err(e) => {

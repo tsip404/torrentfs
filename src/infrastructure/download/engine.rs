@@ -25,7 +25,6 @@ use crate::infrastructure::cache::CacheManager;
 use crate::infrastructure::config::TorrentfsConfig;
 use crate::infrastructure::metadata::TorrentInfo;
 use crate::infrastructure::metrics::Metrics;
-use crate::seeding::SeedingManager;
 use tracing::{info, warn};
 
 use super::piece_scheduler::{PiecePriorityConfig, PieceScheduler, PieceStatus};
@@ -63,11 +62,6 @@ pub enum Command {
         info_hash: String,
         num_pieces: i32,
         reply: SyncSender<TorrentResult<Vec<PieceStatus>>>,
-    },
-    /// Register a seeding manager (receives eviction + piece-ready callbacks).
-    RegisterSeeding {
-        seeding: Arc<SeedingManager>,
-        reply: SyncSender<()>,
     },
     /// Remove a torrent handle from the engine session and clear its
     /// scheduler state.  Used by the unlink/remove path when the last DB
@@ -127,10 +121,9 @@ struct EngineState {
     /// skipped to prevent PT passkey leakage and peer cross-pollination.
     private_torrents: HashMap<String, bool>,
     store: PieceStore,
+    read_timeout_secs: u64,
     scheduler: PieceScheduler,
     cache_dir: String,
-    read_timeout_secs: u64,
-    seeding: Option<Arc<SeedingManager>>,
     metrics: Arc<Metrics>,
     snapshot: Arc<Mutex<DownloadSnapshot>>,
     stopping: Arc<AtomicBool>,
@@ -216,7 +209,6 @@ impl DownloadEngine {
                     scheduler,
                     cache_dir: cache_dir_str,
                     read_timeout_secs,
-                    seeding: None,
                     metrics: thread_metrics,
                     snapshot: thread_snapshot,
                     stopping: thread_stopping,
@@ -405,18 +397,6 @@ impl DownloadEngine {
         })?;
         rx.recv().map_err(|_| Self::disconnected())?
     }
-
-    /// Register a seeding manager for eviction + piece-ready callbacks.
-    pub fn register_seeding(&self, seeding: Arc<SeedingManager>) {
-        let (tx, rx) = mpsc::sync_channel(1);
-        if self
-            .send(Command::RegisterSeeding { seeding, reply: tx })
-            .is_ok()
-        {
-            let _ = rx.recv();
-        }
-    }
-
     /// Stop the engine: abort in-flight reads and join the thread.
     /// Idempotent.
     pub fn shutdown(&self) {
@@ -510,10 +490,6 @@ impl EngineState {
                 reply,
             } => {
                 let _ = reply.send(self.build_pieces_status(&info_hash, num_pieces));
-            }
-            Command::RegisterSeeding { seeding, reply } => {
-                self.seeding = Some(seeding);
-                let _ = reply.send(());
             }
             Command::RemoveHandle { info_hash } => {
                 let _ = self.remove_handle(&info_hash);
@@ -1063,21 +1039,18 @@ impl EngineState {
                     // zero-seeder swarm that would mislead the user into
                     // checking tracker health for what is really a stale
                     // handle.
-                    let (progress, num_seeds) = match self
-                        .handles
-                        .get(&info_hash)
-                        .and_then(|h| h.status().ok())
-                    {
-                        Some(s) => (s.progress * 100.0, s.num_seeds),
-                        None => {
-                            return Err(TorrentError::Timeout(format!(
-                                "Timed out waiting for piece {} after {:.0}s \
+                    let (progress, num_seeds) =
+                        match self.handles.get(&info_hash).and_then(|h| h.status().ok()) {
+                            Some(s) => (s.progress * 100.0, s.num_seeds),
+                            None => {
+                                return Err(TorrentError::Timeout(format!(
+                                    "Timed out waiting for piece {} after {:.0}s \
                                  (status unavailable)",
-                                piece_idx,
-                                piece_wait_timeout.as_secs(),
-                            )));
-                        }
-                    };
+                                    piece_idx,
+                                    piece_wait_timeout.as_secs(),
+                                )));
+                            }
+                        };
                     if num_seeds == 0 {
                         return Err(TorrentError::NoPeers(format!(
                             "No seeder connected for info_hash {} after {:.0}s. \
@@ -1354,16 +1327,6 @@ impl EngineState {
             // forcing a re-download that can time out with EIO.
             if !self.store.has_piece(info_hash, piece_idx) {
                 self.register_piece(info_hash, piece_idx, piece_length, num_pieces, total_size);
-            }
-            if let Some(seeding) = &self.seeding {
-                if let Err(e) = seeding.mark_piece_available(info_hash, piece_idx) {
-                    tracing::warn!(
-                        "Failed to mark piece {} available for info_hash={}: {:?}",
-                        piece_idx,
-                        info_hash,
-                        e
-                    );
-                }
             }
             if let Some((local_start, local_end)) = Self::piece_chunk_bounds(
                 &piece_data,

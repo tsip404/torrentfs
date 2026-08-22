@@ -16,7 +16,6 @@ use crate::infrastructure::download::{
 };
 use crate::infrastructure::metadata::TorrentInfo;
 use crate::infrastructure::metrics::Metrics;
-use crate::seeding::SeedingManager;
 
 pub struct DownloadService {
     engine: Arc<DownloadEngine>,
@@ -47,11 +46,6 @@ impl DownloadService {
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
     }
-
-    pub fn register_seeding_callback(&self, seeding: Arc<SeedingManager>) {
-        self.engine.register_seeding(seeding);
-    }
-
     /// Ensure a lightweight handle exists for the given torrent info.
     ///
     /// Fire-and-forget: the handle is created on the engine thread eventually
@@ -138,10 +132,13 @@ impl DownloadService {
         offset: u64,
         size: u32,
     ) -> TorrentResult<bool> {
-        let cache = self.cache_manager.lock().map_err(|_| TorrentError::Unknown {
-            code: -1,
-            message: "Cache lock poisoned".to_string(),
-        })?;
+        let cache = self
+            .cache_manager
+            .lock()
+            .map_err(|_| TorrentError::Unknown {
+                code: -1,
+                message: "Cache lock poisoned".to_string(),
+            })?;
         PieceStore::pieces_on_disk(&cache, info, file_index, offset, size)
     }
 
