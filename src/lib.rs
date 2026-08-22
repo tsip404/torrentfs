@@ -14,6 +14,7 @@ pub use infrastructure::{
     cache, config, db, download, metadata, CacheManager, Database, DownloadEngine,
     DownloadTorrentStatus, FilePieceInfo, PieceMetadata, PiecePriorityConfig, PieceScheduler,
     PieceStatus, PieceStore, Session, TorrentHandle, TorrentInfo, TorrentState, TorrentfsConfig,
+    TrackerEntry,
 };
 
 // domain layer re-exports

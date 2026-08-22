@@ -20,6 +20,7 @@
 #include <libtorrent/storage_defs.hpp>
 #include <libtorrent/aux_/vector.hpp>
 #include <cstring>
+#include <cstdio>
 #include <cstdlib>
 #include <cerrno>
 #include <stdexcept>
@@ -686,8 +687,32 @@ static std::string parse_json_string(const char*& p) {
                 case 'n': result += '\n'; break;
                 case 't': result += '\t'; break;
                 case 'r': result += '\r'; break;
+                case 'b': result += '\b'; break;
+                case 'f': result += '\f'; break;
                 case '\\': result += '\\'; break;
                 case '"': result += '"'; break;
+                case '/': result += '/'; break;
+                case 'u': {
+                    // \uXXXX — decode 4 hex digits into UTF-8.
+                    // Covers BMP plane; surrogate pairs are not handled
+                    // (tracker URLs never contain astral-plane chars).
+                    if (p[1] && p[2] && p[3] && p[4]) {
+                        char hex[5] = {p[1], p[2], p[3], p[4], 0};
+                        unsigned int cp = static_cast<unsigned int>(strtoul(hex, nullptr, 16));
+                        p += 4; // advance past 4 hex digits (loop's p++ covers the 5th)
+                        if (cp < 0x80) {
+                            result += static_cast<char>(cp);
+                        } else if (cp < 0x800) {
+                            result += static_cast<char>(0xC0 | (cp >> 6));
+                            result += static_cast<char>(0x80 | (cp & 0x3F));
+                        } else {
+                            result += static_cast<char>(0xE0 | (cp >> 12));
+                            result += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                            result += static_cast<char>(0x80 | (cp & 0x3F));
+                        }
+                    }
+                    break;
+                }
                 default: result += c; break;
             }
         } else {
@@ -2117,5 +2142,212 @@ void lt_unlock_piece_read(const char* info_hash_hex) {
     auto lock = find_piece_lock(std::string(info_hash_hex));
     if (lock) {
         lock->unlock_shared();
+    }
+}
+
+// ============================================================================
+// TSI-2276: Tracker manipulation FFI — extract / replace / re-announce
+// ============================================================================
+
+// Build a JSON array string from a vector of (tier, url) pairs.
+// Format: [{"tier":0,"url":"http://..."},{"tier":1,"url":"udp://..."}]
+static std::string trackers_to_json(const std::vector<std::pair<int, std::string>>& trackers) {
+    std::string json = "[";
+    for (size_t i = 0; i < trackers.size(); i++) {
+        if (i > 0) json += ",";
+        json += "{\"tier\":";
+        json += std::to_string(trackers[i].first);
+        json += ",\"url\":\"";
+        // Escape JSON-special and control characters per RFC 8259.
+        for (unsigned char uc : trackers[i].second) {
+            switch (uc) {
+                case '"': json += "\\\""; break;
+                case '\\': json += "\\\\"; break;
+                case '\b': json += "\\b"; break;
+                case '\f': json += "\\f"; break;
+                case '\n': json += "\\n"; break;
+                case '\r': json += "\\r"; break;
+                case '\t': json += "\\t"; break;
+                default:
+                    if (uc < 0x20) {
+                        // U+0000–U+001F: \u00XX
+                        char buf[8];
+                        snprintf(buf, sizeof(buf), "\\u%04x", uc);
+                        json += buf;
+                    } else {
+                        json += static_cast<char>(uc);
+                    }
+                    break;
+            }
+        }
+        json += "\"}";
+    }
+    json += "]";
+    return json;
+}
+
+int lt_torrent_info_trackers(lt_torrent_info_t info, char** out_json, lt_error_t* error) {
+    if (!info || !out_json) {
+        if (error) {
+            error->code = -1;
+            error->message = "Invalid arguments";
+        }
+        return -1;
+    }
+
+    try {
+        auto ti = static_cast<lt::torrent_info*>(info);
+
+        // torrent_info::trackers() returns the merged list from both
+        // 'announce' and 'announce-list', with tier numbers preserved.
+        std::vector<std::pair<int, std::string>> trackers;
+        const auto& announce_list = ti->trackers();
+        for (const auto& t : announce_list) {
+            trackers.emplace_back(static_cast<int>(t.tier), t.url);
+        }
+        std::string json = trackers_to_json(trackers);
+        *out_json = strdup(json.c_str());
+        if (!*out_json) {
+            if (error) {
+                error->code = -1;
+                error->message = "strdup failed";
+            }
+            return -1;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        if (error) {
+            error->code = -1;
+            static thread_local std::string err_msg;
+            err_msg = e.what();
+            error->message = err_msg.c_str();
+        }
+        return -1;
+    }
+}
+
+// Minimal JSON array parser for tracker replacement.
+// Parses: [{"tier":N,"url":"..."},...]
+// Uses the existing skip_json_ws / parse_json_string helpers defined above.
+// Invariant: parse_json_string fully consumes quoted strings (including any
+// '}' or '{' characters inside the string), so the object-end check (*p != '}')
+// only triggers on the actual closing brace — never on a brace inside a URL.
+static int parse_trackers_json(const char* json, std::vector<lt::announce_entry>& out) {
+    if (!json) return -1;
+    const char* p = json;
+    skip_json_ws(p);
+    if (*p != '[') return -1;
+    p++; // skip '['
+    skip_json_ws(p);
+
+    while (*p && *p != ']') {
+        if (*p != '{') return -1;
+        p++; // skip '{'
+        skip_json_ws(p);
+
+        lt::announce_entry entry;
+        entry.tier = 0;
+        bool have_tier = false;
+        bool have_url = false;
+
+        while (*p && *p != '}') {
+            skip_json_ws(p);
+            if (*p != '"') return -1;
+            std::string key = parse_json_string(p);
+            skip_json_ws(p);
+            if (*p != ':') return -1;
+            p++; // skip ':'
+            skip_json_ws(p);
+
+            if (key == "tier") {
+                entry.tier = static_cast<int>(parse_json_int(p));
+                have_tier = true;
+            } else if (key == "url") {
+                if (*p != '"') return -1;
+                entry.url = parse_json_string(p);
+                have_url = true;
+            } else {
+                // Unknown key — skip its value.
+                if (*p == '"') {
+                    parse_json_string(p);
+                } else {
+                    parse_json_int(p);
+                }
+            }
+            skip_json_ws(p);
+            if (*p == ',') { p++; skip_json_ws(p); }
+        }
+
+        if (!have_url) return -1; // url is mandatory
+        if (!have_tier) entry.tier = 0;
+        out.push_back(std::move(entry));
+
+        if (*p != '}') return -1;
+        p++; // skip '}'
+        skip_json_ws(p);
+        if (*p == ',') { p++; skip_json_ws(p); }
+    }
+
+    if (*p != ']') return -1;
+    return 0;
+}
+
+int lt_torrent_handle_replace_trackers(lt_torrent_handle_t handle, const char* trackers_json, lt_error_t* error) {
+    if (!handle || !trackers_json) {
+        if (error) {
+            error->code = -1;
+            error->message = "Invalid arguments";
+        }
+        return -1;
+    }
+
+    auto h = static_cast<lt::torrent_handle*>(handle);
+    if (!h->is_valid()) {
+        if (error) {
+            error->code = -1;
+            error->message = "Invalid torrent handle";
+        }
+        return -1;
+    }
+
+    try {
+        std::vector<lt::announce_entry> trackers;
+        if (parse_trackers_json(trackers_json, trackers) != 0) {
+            if (error) {
+                error->code = -1;
+                error->message = "Failed to parse trackers JSON";
+            }
+            return -1;
+        }
+        h->replace_trackers(trackers);
+        return 0;
+    } catch (const std::exception& e) {
+        if (error) {
+            error->code = -1;
+            static thread_local std::string err_msg;
+            err_msg = e.what();
+            error->message = err_msg.c_str();
+        }
+        return -1;
+    }
+}
+
+int lt_torrent_handle_force_reannounce(lt_torrent_handle_t handle) {
+    if (!handle) return -1;
+
+    auto h = static_cast<lt::torrent_handle*>(handle);
+    if (!h->is_valid()) return -1;
+
+    try {
+        h->force_reannounce();
+        return 0;
+    } catch (const std::exception&) {
+        return -1;
+    }
+}
+
+void lt_string_free(char* str) {
+    if (str) {
+        std::free(str);
     }
 }
