@@ -189,7 +189,7 @@ fn wait_for_shutdown(
     if let Some(ds) = &download_service {
         if let Some(cache) = ds.get_cache_manager() {
             match cache.lock() {
-                Ok(cm) => {
+                Ok(mut cm) => {
                     if let Err(e) = cm.flush() {
                         warn!("Failed to flush cache metadata on shutdown: {:?}", e);
                     } else {

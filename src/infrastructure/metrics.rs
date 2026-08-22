@@ -16,6 +16,8 @@ pub struct MetricsSnapshot {
     /// L1 (memory) cache: whole-file reads served from `torrent_data_cache`.
     pub l1_hits: u64,
     pub l1_misses: u64,
+    /// TSI-2274: number of entries currently in the L1 range cache.
+    pub l1_entries: u64,
     /// L2 (disk piece) cache: reads whose pieces were all present on disk.
     pub l2_hits: u64,
     pub l2_misses: u64,
@@ -46,7 +48,8 @@ pub struct Metrics {
     // L1 memory cache
     l1_hits: AtomicU64,
     l1_misses: AtomicU64,
-    // L2 disk piece cache
+    /// TSI-2274: current L1 range cache entry count (gauge, not counter).
+    l1_entries: AtomicU64,
     l2_hits: AtomicU64,
     l2_misses: AtomicU64,
     // L3 metadata cache
@@ -82,6 +85,7 @@ impl Metrics {
         Self {
             l1_hits: AtomicU64::new(0),
             l1_misses: AtomicU64::new(0),
+            l1_entries: AtomicU64::new(0),
             l2_hits: AtomicU64::new(0),
             l2_misses: AtomicU64::new(0),
             l3_hits: AtomicU64::new(0),
@@ -108,6 +112,11 @@ impl Metrics {
 
     pub fn l1_miss(&self) {
         self.l1_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// TSI-2274: set the current L1 range cache entry count (gauge).
+    pub fn set_l1_entries(&self, n: u64) {
+        self.l1_entries.store(n, Ordering::Relaxed);
     }
 
     pub fn l2_hit(&self) {
@@ -192,6 +201,7 @@ impl Metrics {
         MetricsSnapshot {
             l1_hits: self.l1_hits.load(Ordering::Relaxed),
             l1_misses: self.l1_misses.load(Ordering::Relaxed),
+            l1_entries: self.l1_entries.load(Ordering::Relaxed),
             l2_hits: self.l2_hits.load(Ordering::Relaxed),
             l2_misses: self.l2_misses.load(Ordering::Relaxed),
             l3_hits: self.l3_hits.load(Ordering::Relaxed),
