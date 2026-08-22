@@ -200,7 +200,9 @@ start_torrentfs_rootless() {
 
     echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint (container-only)" >&2
 
-    wait "$torrentfs_pid" || true
+    local rc=0
+    wait "$torrentfs_pid" || rc=$?
+    exit "$rc"
 }
 
 # Rootful container (or Docker) path: two-stage bind mount for host visibility.
@@ -249,7 +251,9 @@ start_torrentfs_rootful() {
 
     echo "[entrypoint] torrentfs running (pid=$torrentfs_pid), available at $mountpoint" >&2
 
-    wait "$torrentfs_pid" || true
+    local rc=0
+    wait "$torrentfs_pid" || rc=$?
+    exit "$rc"
 }
 
 echo "[entrypoint] /dev/fuse is available" >&2
