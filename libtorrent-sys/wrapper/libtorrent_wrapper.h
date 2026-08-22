@@ -97,6 +97,12 @@ void lt_files_free(lt_file_entry_t* files);
 int lt_torrent_info_get_info_hash(lt_torrent_info_t info, uint8_t* hash_out);
 int lt_torrent_info_hash_for_piece(lt_torrent_info_t info, int piece_index, uint8_t* hash_out);
 
+// TSI-2277: Check whether the torrent's info dict has the 'private' flag
+// set (BEP-27). Returns 1 if private, 0 if not, -1 on error (null handle).
+// Used for PT (Private Tracker) isolation: private torrents must not
+// participate in cross-site tracker merging.
+int lt_torrent_info_is_private(lt_torrent_info_t info);
+
 
 lt_session_t lt_session_create(const char* listen_interface, lt_error_t* error);
 lt_session_t lt_session_create_with_custom_storage(const char* piece_cache_dir, const char* settings_json, lt_error_t* error);
@@ -164,6 +170,12 @@ int lt_torrent_handle_replace_trackers(lt_torrent_handle_t handle, const char* t
 // Force an immediate tracker re-announce on the handle. Calls
 // handle.force_reannounce(). Returns 0 on success, -1 on error.
 int lt_torrent_handle_force_reannounce(lt_torrent_handle_t handle);
+
+// TSI-2277: Extract the current tracker list from a torrent_handle (the
+// live list, reflecting any prior replace_trackers calls). Same JSON format
+// as lt_torrent_info_trackers. Used by the tracker merge logic to get the
+// existing handle's trackers for dedup. Returns 0 on success, -1 on error.
+int lt_torrent_handle_trackers(lt_torrent_handle_t handle, char** out_json, lt_error_t* error);
 
 // Free a string returned by lt_torrent_info_trackers (or any wrapper
 // function that returns a strdup'd char* via out-parameter).

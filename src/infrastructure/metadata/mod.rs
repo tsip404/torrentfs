@@ -236,6 +236,27 @@ impl TorrentInfo {
         }
     }
 
+    /// Whether the torrent's info dict has the `private` flag set (BEP-27).
+    ///
+    /// PT (Private Tracker) torrents set `private=1` in the info dict to
+    /// signal that peers must only use trackers (no DHT/PEX). torrentfs
+    /// uses this to **isolate** private torrents: they must never
+    /// participate in cross-site tracker merging, because merged trackers
+    /// would expose passkeys across swarms and cross-pollinate peers
+    /// (TSI-2277).
+    ///
+    /// On FFI error (-1: null handle / exception), returns `true` — the
+    /// conservative default is "treat as private" so the PT isolation guard
+    /// in `engine.rs:merge_trackers` skips the merge rather than risking
+    /// passkey leakage on an uncertain private flag.
+    pub fn is_private(&self) -> bool {
+        // SAFETY: `self.inner` is a valid handle; the FFI call is a pure
+        // getter with no side effects. Returns 1 if private, 0 if not,
+        // -1 on error (treated as private — conservative skip-merge).
+        let result = unsafe { libtorrent_sys::lt_torrent_info_is_private(self.inner) };
+        result != 0
+    }
+
     /// The on-disk byte length of the piece at `piece_index`: `piece_length`
     /// for every piece except the last, which is the trailing remainder of
     /// `total_size`. Returns `None` when the index is out of range.
@@ -572,5 +593,75 @@ mod tests {
         assert!(json.contains("\\t"));
         assert!(json.contains("\\r"));
         assert!(json.contains("\\n"));
+    }
+
+    // ── TSI-2277: private flag tests ──────────────────────────────────
+
+    /// Build a torrent with the `private` flag set inside the info dict.
+    /// `private=1` marks the torrent as a PT (Private Tracker) torrent.
+    fn build_private_torrent(total: usize, piece_length: usize) -> Vec<u8> {
+        let content = (0..total).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+        let mut pieces = Vec::new();
+        for chunk in content.chunks(piece_length) {
+            use sha1_smol::Sha1;
+            pieces.extend_from_slice(&Sha1::from(chunk).digest().bytes());
+        }
+        let mut t = Vec::new();
+        t.push(b'd');
+        t.extend_from_slice(b"8:announce");
+        t.extend_from_slice(b"43:http://tracker.private.example.com/announce");
+        // info dict with private flag
+        t.extend_from_slice(b"4:infod");
+        t.extend_from_slice(b"6:lengthi");
+        t.extend_from_slice(total.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"4:name4:test");
+        t.extend_from_slice(b"12:piece lengthi");
+        t.extend_from_slice(piece_length.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"6:pieces");
+        t.extend_from_slice(pieces.len().to_string().as_bytes());
+        t.push(b':');
+        t.extend_from_slice(&pieces);
+        // private=1 — must come before the closing 'e' of the info dict
+        t.extend_from_slice(b"7:privatei1e");
+        t.extend_from_slice(b"ee");
+        t
+    }
+
+    #[test]
+    fn test_is_private_true_for_private_torrent() {
+        let torrent = build_private_torrent(32, 16);
+        let info = TorrentInfo::from_bytes(torrent).expect("parse private torrent");
+        assert!(
+            info.is_private(),
+            "PT torrent with private=1 should return true"
+        );
+    }
+
+    #[test]
+    fn test_is_private_false_for_public_torrent() {
+        // build_test_torrent has no private field in the info dict.
+        let torrent = build_test_torrent(32, 16);
+        let info = TorrentInfo::from_bytes(torrent).expect("parse public torrent");
+        assert!(
+            !info.is_private(),
+            "Public torrent without private flag should return false"
+        );
+    }
+
+    #[test]
+    fn test_is_private_false_for_torrent_with_trackers() {
+        // A torrent with announce-list but no private flag.
+        let torrent = build_torrent_with_announce_list(
+            &[vec!["http://tracker.example.com/announce"]],
+            32,
+            16,
+        );
+        let info = TorrentInfo::from_bytes(torrent).expect("parse torrent");
+        assert!(
+            !info.is_private(),
+            "Public torrent with trackers but no private flag should return false"
+        );
     }
 }

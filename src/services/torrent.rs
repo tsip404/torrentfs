@@ -53,6 +53,7 @@ impl TorrentService {
             ))
         })?;
 
+        let info = Arc::new(info);
         let info_hash_hex = hex::encode(metadata.info_hash);
 
         let is_new = {
@@ -120,8 +121,8 @@ impl TorrentService {
         // Create upload_mode handle so peer/seed info is visible immediately
         // without triggering any data download (all pieces at priority 0).
         if is_new {
-            if let Some(ref ds) = self.download_service {
-                match ds.ensure_handle_lightweight(Arc::new(info)) {
+            if let Some(ds) = &self.download_service {
+                match ds.ensure_handle_lightweight(info.clone()) {
                     Ok(_) => {
                         info!(
                             "Created lightweight handle for torrent '{}' (upload_mode)",
@@ -136,6 +137,24 @@ impl TorrentService {
                         // Non-fatal: the torrent is already in the database and
                         // a handle will be created lazily when first accessed.
                     }
+                }
+            }
+        } else {
+            // Duplicate info_hash: merge trackers from this torrent into the
+            // existing handle (TSI-2275). The engine checks the private flag
+            // (TSI-2277) and skips the merge for private torrents — PT
+            // isolation prevents passkey leakage and peer cross-pollination
+            // across private tracker swarms.
+            if let Some(ds) = &self.download_service {
+                if let Err(e) = ds.merge_trackers(info.clone()) {
+                    warn!(
+                        "Failed to merge trackers for duplicate torrent '{}': {:?}",
+                        metadata.name, e
+                    );
+                    // Non-fatal: the torrent is already in the DB; tracker
+                    // merge is a best-effort optimization, not a correctness
+                    // requirement. The existing handle's trackers are
+                    // unchanged.
                 }
             }
         }
@@ -539,5 +558,176 @@ mod tests {
         // the seeding manager must not track the deleted info_hash.
         assert!(!seeding_manager.has_handle(&info_hash));
         assert!(seeding_manager.get_all_seeds().is_empty());
+    }
+
+    // ── TSI-2277: PT isolation tests ──────────────────────────────────
+
+    /// Build a minimal bencoded single-file torrent with a single tracker
+    /// URL and optional `private=1` flag in the info dict.
+    fn build_torrent_bencode(
+        announce_url: &str,
+        total: usize,
+        piece_length: usize,
+        is_private: bool,
+    ) -> Vec<u8> {
+        let content = (0..total).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+        let mut pieces = Vec::new();
+        for chunk in content.chunks(piece_length) {
+            use sha1_smol::Sha1;
+            pieces.extend_from_slice(&Sha1::from(chunk).digest().bytes());
+        }
+        let mut t = Vec::new();
+        t.push(b'd');
+        t.extend_from_slice(b"8:announce");
+        t.extend_from_slice(announce_url.len().to_string().as_bytes());
+        t.push(b':');
+        t.extend_from_slice(announce_url.as_bytes());
+        t.extend_from_slice(b"4:infod");
+        t.extend_from_slice(b"6:lengthi");
+        t.extend_from_slice(total.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"4:name4:test");
+        t.extend_from_slice(b"12:piece lengthi");
+        t.extend_from_slice(piece_length.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"6:pieces");
+        t.extend_from_slice(pieces.len().to_string().as_bytes());
+        t.push(b':');
+        t.extend_from_slice(&pieces);
+        if is_private {
+            t.extend_from_slice(b"7:privatei1e");
+        }
+        t.extend_from_slice(b"ee");
+        t
+    }
+
+    /// PT isolation test: two private torrents with the same info_hash but
+    /// different tracker URLs. The handle is created with torrent A's
+    /// trackers, then `merge_trackers` is called with torrent B. The
+    /// assertion: torrent B's tracker URL must NOT appear in the handle's
+    /// tracker list — private torrents are isolated from cross-site merge.
+    #[test]
+    fn test_pt_isolation_private_torrent_skips_merge() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+        let config = TorrentfsConfig::default_config();
+        let ds = DownloadService::new(&cache_dir, &config).unwrap();
+
+        let url_a = "http://tracker.private-a.com/announce";
+        let url_b = "http://tracker.private-b.com/announce";
+
+        let torrent_a = build_torrent_bencode(url_a, 32, 16, true);
+        let torrent_b = build_torrent_bencode(url_b, 32, 16, true);
+
+        let info_a =
+            Arc::new(crate::metadata::TorrentInfo::from_bytes(torrent_a).expect("parse torrent A"));
+        let info_b =
+            Arc::new(crate::metadata::TorrentInfo::from_bytes(torrent_b).expect("parse torrent B"));
+
+        // Both torrents must have the same info_hash (same content).
+        let hash_a = hex::encode(info_a.info_hash().expect("hash A"));
+        let hash_b = hex::encode(info_b.info_hash().expect("hash B"));
+        assert_eq!(hash_a, hash_b, "torrents must share info_hash");
+
+        // Both must be private.
+        assert!(info_a.is_private(), "torrent A must be private");
+        assert!(info_b.is_private(), "torrent B must be private");
+
+        // Create the handle with torrent A's trackers.
+        ds.ensure_handle_lightweight(info_a.clone()).unwrap();
+        // Give the engine thread time to process the async command.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Verify the handle has torrent A's tracker.
+        let trackers_before = ds.get_trackers(&hash_a).expect("get trackers");
+        assert!(
+            trackers_before.iter().any(|t| t.url == url_a),
+            "handle should have tracker A's URL before merge"
+        );
+
+        // Trigger merge_trackers with torrent B (private → must skip).
+        ds.merge_trackers(info_b).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Assert: torrent B's tracker must NOT be in the handle's list.
+        let trackers_after = ds.get_trackers(&hash_a).expect("get trackers after merge");
+        assert!(
+            !trackers_after.iter().any(|t| t.url == url_b),
+            "PT isolation: private torrent B's tracker must NOT be merged \
+             into the handle (found: {:?})",
+            trackers_after
+        );
+        assert_eq!(
+            trackers_after.len(),
+            trackers_before.len(),
+            "tracker count must not change (merge was skipped)"
+        );
+    }
+
+    /// PT isolation test: two public torrents with the same info_hash but
+    /// different tracker URLs. The handle is created with torrent A's
+    /// trackers, then `merge_trackers` is called with torrent B. The
+    /// assertion: torrent B's tracker URL MUST appear in the handle's
+    /// tracker list — public torrents are merge-eligible.
+    #[test]
+    fn test_pt_isolation_public_torrent_merges_trackers() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+        let config = TorrentfsConfig::default_config();
+        let ds = DownloadService::new(&cache_dir, &config).unwrap();
+
+        let url_a = "http://tracker-a.example.com/announce";
+        let url_b = "http://tracker-b.example.com/announce";
+
+        let torrent_a = build_torrent_bencode(url_a, 32, 16, false);
+        let torrent_b = build_torrent_bencode(url_b, 32, 16, false);
+
+        let info_a =
+            Arc::new(crate::metadata::TorrentInfo::from_bytes(torrent_a).expect("parse torrent A"));
+        let info_b =
+            Arc::new(crate::metadata::TorrentInfo::from_bytes(torrent_b).expect("parse torrent B"));
+
+        // Both torrents must have the same info_hash (same content).
+        let hash_a = hex::encode(info_a.info_hash().expect("hash A"));
+        let hash_b = hex::encode(info_b.info_hash().expect("hash B"));
+        assert_eq!(hash_a, hash_b, "torrents must share info_hash");
+
+        // Both must be public (not private).
+        assert!(!info_a.is_private(), "torrent A must be public");
+        assert!(!info_b.is_private(), "torrent B must be public");
+
+        // Create the handle with torrent A's trackers.
+        ds.ensure_handle_lightweight(info_a.clone()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Verify the handle has torrent A's tracker only.
+        let trackers_before = ds.get_trackers(&hash_a).expect("get trackers");
+        assert!(
+            trackers_before.iter().any(|t| t.url == url_a),
+            "handle should have tracker A's URL before merge"
+        );
+        assert!(
+            !trackers_before.iter().any(|t| t.url == url_b),
+            "handle should NOT have tracker B's URL before merge"
+        );
+
+        // Trigger merge_trackers with torrent B (public → must merge).
+        ds.merge_trackers(info_b).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Assert: torrent B's tracker MUST be in the handle's list.
+        let trackers_after = ds.get_trackers(&hash_a).expect("get trackers after merge");
+        assert!(
+            trackers_after.iter().any(|t| t.url == url_b),
+            "public torrent B's tracker MUST be merged into the handle \
+             (found: {:?})",
+            trackers_after
+        );
+        assert!(
+            trackers_after.len() > trackers_before.len(),
+            "tracker count must increase (merge happened): before={}, after={}",
+            trackers_before.len(),
+            trackers_after.len()
+        );
     }
 }

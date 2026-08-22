@@ -286,6 +286,20 @@ int lt_torrent_info_hash_for_piece(lt_torrent_info_t info, int piece_index, uint
     }
 }
 
+// TSI-2277: Extract the private flag from the torrent info dict.
+// libtorrent's torrent_info::priv() returns true when the 'private'
+// field in the info dict is set to 1 (BEP-27 / PT isolation).
+// Returns 1 if private, 0 if not, -1 on error (null handle).
+int lt_torrent_info_is_private(lt_torrent_info_t info) {
+    if (!info) return -1;
+    try {
+        auto ti = static_cast<lt::torrent_info*>(info);
+        return ti->priv() ? 1 : 0;
+    } catch (const std::exception&) {
+        return -1;
+    }
+}
+
 lt_torrent_metadata_t* lt_torrent_info_get_metadata(lt_torrent_info_t info) {
     if (!info) return nullptr;
 
@@ -2342,6 +2356,57 @@ int lt_torrent_handle_force_reannounce(lt_torrent_handle_t handle) {
         h->force_reannounce();
         return 0;
     } catch (const std::exception&) {
+        return -1;
+    }
+}
+
+// TSI-2277: Extract the current tracker list from a torrent_handle.
+// Returns the live trackers (after any replace_trackers calls) as a JSON
+// array string, same format as lt_torrent_info_trackers. Used by the
+// tracker merge logic to get the existing handle's trackers for dedup.
+int lt_torrent_handle_trackers(lt_torrent_handle_t handle, char** out_json, lt_error_t* error) {
+    if (!handle || !out_json) {
+        if (error) {
+            error->code = -1;
+            error->message = "Invalid arguments";
+        }
+        return -1;
+    }
+
+    try {
+        auto h = static_cast<lt::torrent_handle*>(handle);
+        if (!h->is_valid()) {
+            if (error) {
+                error->code = -1;
+                error->message = "Invalid torrent handle";
+            }
+            return -1;
+        }
+
+        // torrent_handle::trackers() returns the current announce_entry list
+        // (reflecting any prior replace_trackers calls).
+        std::vector<std::pair<int, std::string>> trackers;
+        const auto& announce_list = h->trackers();
+        for (const auto& t : announce_list) {
+            trackers.emplace_back(static_cast<int>(t.tier), t.url);
+        }
+        std::string json = trackers_to_json(trackers);
+        *out_json = strdup(json.c_str());
+        if (!*out_json) {
+            if (error) {
+                error->code = -1;
+                error->message = "strdup failed";
+            }
+            return -1;
+        }
+        return 0;
+    } catch (const std::exception& e) {
+        if (error) {
+            error->code = -1;
+            static thread_local std::string err_msg;
+            err_msg = e.what();
+            error->message = err_msg.c_str();
+        }
         return -1;
     }
 }
