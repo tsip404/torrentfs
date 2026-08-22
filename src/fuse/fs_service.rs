@@ -1806,7 +1806,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use crate::db::{Database, InsertTorrentResult};
+    use crate::db::{Database, FileEntry, InsertTorrentResult};
     use crate::infrastructure::metrics::Metrics;
     use crate::metadata::TorrentInfo;
     use crate::services::torrent::TorrentService;
@@ -2845,5 +2845,166 @@ mod tests {
         cache.insert(key_large, vec![0u8; 131072]);
         // Both entries coexist — no truncation.
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_non_ascii_filenames_db_round_trip() {
+        // TSI-2278: Verify that multi-file torrents with non-ASCII (UTF-8)
+        // file names can be inserted, retrieved, and looked up by name
+        // through the DB — the same path FUSE lookup/readdir uses.
+        let name = "测试种子".as_bytes();
+        let file1 = "你好.txt".as_bytes().to_vec();
+        let file2 = "世界.txt".as_bytes().to_vec();
+        let torrent_bytes = crate::infrastructure::metadata::build_multifile_torrent(
+            name,
+            &[(file1, 16), (file2, 16)],
+            16,
+        );
+        let info = TorrentInfo::from_bytes(torrent_bytes.clone()).expect("parse torrent");
+        let metadata = info.metadata().expect("get metadata");
+        let info_hash_hex = hex::encode(metadata.info_hash);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = Database::open(&dir.path().join("test.db")).unwrap();
+
+        let file_entries: Vec<FileEntry> = metadata
+            .files
+            .iter()
+            .map(|f| FileEntry {
+                path: f.path.clone(),
+                size: f.size as i64,
+            })
+            .collect();
+
+        let result = db
+            .insert_torrent_with_files(
+                "",
+                &metadata.name,
+                "test.torrent",
+                metadata.total_size as i64,
+                &info_hash_hex,
+                metadata.num_files as i64,
+                &file_entries,
+            )
+            .expect("insert");
+        let torrent_id = match result {
+            InsertTorrentResult::Inserted(id) => id,
+            _ => panic!("expected insertion"),
+        };
+
+        // Root directory = torrent name (first component of file_path).
+        let root_dirs = db
+            .get_torrent_directories_by_parent(None, torrent_id)
+            .expect("get root dirs");
+        assert_eq!(root_dirs.len(), 1);
+        assert_eq!(root_dirs[0].name, "测试种子");
+
+        // Files under the root directory.
+        let dir_files = db
+            .get_files_in_directory(root_dirs[0].id)
+            .expect("get dir files");
+        assert_eq!(dir_files.len(), 2);
+        assert_eq!(dir_files[0].name, "你好.txt");
+        assert_eq!(dir_files[1].name, "世界.txt");
+
+        // Simulate FUSE lookup: find a file by name in the directory.
+        let found = dir_files.iter().find(|f| f.name == "你好.txt");
+        assert!(found.is_some(), "lookup should find 你好.txt");
+
+        // TSI-2278: The read path maps file_id → file_index via
+        // `files.iter().position(|f| f.id == file_id)` where `files`
+        // comes from `get_files_by_torrent_id` (ordered by `id`).  This
+        // must match the libtorrent file index order (the order
+        // `info.files()` returns).  If the orderings diverge, the read
+        // path would use the wrong file_index → wrong piece range → EIO.
+        //
+        // Both the DB insertion (`insert_torrent_with_files`) and
+        // `info.files()` iterate the torrent's file list in the same
+        // order, so the DB `id` order must match the libtorrent index.
+        let all_files = db
+            .get_files_by_torrent_id(torrent_id)
+            .expect("get all files");
+        let info_files = info.files().expect("get libtorrent files");
+        assert_eq!(all_files.len(), info_files.len());
+        for (db_idx, db_file) in all_files.iter().enumerate() {
+            // Each DB file's `path` must match the corresponding
+            // libtorrent file's path at the same index.
+            assert_eq!(
+                db_file.path, info_files[db_idx].path,
+                "DB file at index {} (id={}, name={:?}) has path {:?} \
+                 but libtorrent file at index {} has path {:?} — \
+                 ordering mismatch would cause wrong file_index in reads",
+                db_idx, db_file.id, db_file.name, db_file.path, db_idx, info_files[db_idx].path,
+            );
+        }
+        // Two calls must return the same order (stability).
+        let all_files_2 = db
+            .get_files_by_torrent_id(torrent_id)
+            .expect("get all files (2nd call)");
+        let ids_1: Vec<i64> = all_files.iter().map(|f| f.id).collect();
+        let ids_2: Vec<i64> = all_files_2.iter().map(|f| f.id).collect();
+        assert_eq!(ids_1, ids_2, "DB file ordering must be stable across calls");
+    }
+
+    #[test]
+    fn test_non_utf8_filenames_db_round_trip() {
+        // TSI-2278: Non-UTF-8 (e.g. GBK) file names are sanitized by
+        // libtorrent to '_' before reaching Rust.  The sanitized names
+        // are valid UTF-8 and can be stored/retrieved from the DB.
+        let name: &[u8] = b"\xb2\xe2\xca\xd4"; // 测试 in GBK
+        let file1: &[u8] = b"\xc4\xe3\xba\xc3.txt"; // 你好.txt in GBK
+        let file2: &[u8] = b"\xca\xc0\xbd\xe7.txt"; // 世界.txt in GBK
+        let torrent_bytes = crate::infrastructure::metadata::build_multifile_torrent(
+            name,
+            &[(file1.to_vec(), 16), (file2.to_vec(), 16)],
+            16,
+        );
+        let info = TorrentInfo::from_bytes(torrent_bytes).expect("parse torrent");
+        let metadata = info.metadata().expect("get metadata");
+
+        // Sanitized names must be valid UTF-8 for SQLite TEXT storage.
+        for f in &metadata.files {
+            assert!(
+                std::str::from_utf8(f.path.as_bytes()).is_ok(),
+                "sanitized path must be valid UTF-8: {:?}",
+                f.path
+            );
+        }
+
+        let info_hash_hex = hex::encode(metadata.info_hash);
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut db = Database::open(&dir.path().join("test.db")).unwrap();
+
+        let file_entries: Vec<FileEntry> = metadata
+            .files
+            .iter()
+            .map(|f| FileEntry {
+                path: f.path.clone(),
+                size: f.size as i64,
+            })
+            .collect();
+
+        let result = db
+            .insert_torrent_with_files(
+                "",
+                &metadata.name,
+                "test.torrent",
+                metadata.total_size as i64,
+                &info_hash_hex,
+                metadata.num_files as i64,
+                &file_entries,
+            )
+            .expect("insert");
+        let torrent_id = match result {
+            InsertTorrentResult::Inserted(id) => id,
+            _ => panic!("expected insertion"),
+        };
+
+        // Verify files are retrievable and have unique names.
+        let all_files = db.get_files_by_torrent_id(torrent_id).expect("get files");
+        assert_eq!(all_files.len(), 2);
+        let name0 = all_files[0].name.as_str();
+        let name1 = all_files[1].name.as_str();
+        assert_ne!(name0, name1, "sanitized file names must be unique");
     }
 }
