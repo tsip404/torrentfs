@@ -28,6 +28,12 @@ pub struct CacheManager {
     /// registered solely by scan_pieces_subdirectory at startup are
     /// NOT in this set — they may be incomplete sparse files.
     verified_piece_keys: HashSet<String>,
+    /// TSI-2274: metadata dirtied since the last `save_metadata_file`.
+    /// Mutating methods (`record_access`, `add_piece`, `remove_piece`,
+    /// `remove_infohash_pieces`, `mark_verified`) set this instead of
+    /// fsyncing on every call; the engine loop calls
+    /// `flush_metadata_if_dirty` periodically and `flush` on shutdown.
+    metadata_dirty: bool,
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -45,7 +51,6 @@ impl CacheManager {
                 TorrentError::IoError(format!("Failed to create cache directory: {}", e))
             })?;
         }
-
         let mut manager = CacheManager {
             cache_dir,
             metadata: HashMap::new(),
@@ -55,6 +60,7 @@ impl CacheManager {
             hit_count: 0,
             evict_callbacks: Vec::new(),
             verified_piece_keys: HashSet::new(),
+            metadata_dirty: false,
         };
 
         manager.rebuild_index()?;
@@ -72,20 +78,38 @@ impl CacheManager {
         self.scan_cache_directory()?;
 
         self.save_metadata_file()?;
+        self.metadata_dirty = false;
 
         Ok(())
     }
 
-    /// TSI-2263: persist the cache metadata to disk with fsync.
+    /// TSI-2263 / TSI-2274: persist the cache metadata to disk with fsync.
     ///
-    /// `save_metadata_file` is already called on every mutation, but during
-    /// graceful shutdown we want an explicit, logged flush so the final
-    /// metadata state is durable before the process exits.  Without this,
+    /// Mutating methods only flag `metadata_dirty` instead of fsyncing on
+    /// every call (TSI-2274: `record_access` was fsyncing on every piece
+    /// read, limiting throughput to ~1.2 MB/s).  This flush is called on
+    /// shutdown (graceful) and periodically by the engine loop so the
+    /// metadata state is durable before the process exits.  Without fsync,
     /// a container restart can leave `cache_metadata.txt` stale, causing
     /// the restart scan to register pieces at wrong sizes and the verifier
     /// to purge them.
-    pub fn flush(&self) -> TorrentResult<()> {
-        self.save_metadata_file()
+    pub fn flush(&mut self) -> TorrentResult<()> {
+        let result = self.save_metadata_file();
+        if result.is_ok() {
+            self.metadata_dirty = false;
+        }
+        result
+    }
+
+    /// TSI-2274: write the metadata file only if dirty since the last
+    /// flush.  Called periodically from the engine loop so the on-disk
+    /// metadata does not lag too far behind the in-memory state.  Returns
+    /// `Ok(())` when nothing needs writing.
+    pub fn flush_metadata_if_dirty(&mut self) -> TorrentResult<()> {
+        if !self.metadata_dirty {
+            return Ok(());
+        }
+        self.flush()
     }
 
     fn load_metadata_file(&mut self, path: &Path) -> TorrentResult<()> {
@@ -295,7 +319,10 @@ impl CacheManager {
             )));
         }
 
-        self.save_metadata_file()
+        // TSI-2274: do not fsync on every read — mark dirty and let
+        // the engine loop flush periodically / on shutdown.
+        self.metadata_dirty = true;
+        Ok(())
     }
 
     pub fn add_piece(&mut self, piece_key: &str, size: u64) -> TorrentResult<()> {
@@ -337,7 +364,10 @@ impl CacheManager {
             self.evict_lru()?;
         }
 
-        self.save_metadata_file()
+        // TSI-2274: mark dirty — the engine loop flushes periodically
+        // and on shutdown instead of fsyncing on every add_piece.
+        self.metadata_dirty = true;
+        Ok(())
     }
 
     /// Register a callback that will be invoked when a piece is evicted.
@@ -399,7 +429,9 @@ impl CacheManager {
         self.metadata.remove(piece_key);
         self.verified_piece_keys.remove(piece_key);
 
-        self.save_metadata_file()
+        // TSI-2274: mark dirty instead of fsyncing on every removal.
+        self.metadata_dirty = true;
+        Ok(())
     }
 
     fn extract_info_hash<'a>(&self, piece_key: &'a str) -> &'a str {
@@ -517,6 +549,9 @@ impl CacheManager {
     /// verification against the torrent's expected piece hash (TSI-2199).
     pub fn mark_verified(&mut self, piece_key: &str) {
         self.verified_piece_keys.insert(piece_key.to_string());
+        // TSI-2274: mark dirty so the periodic flush persists the
+        // verified flag without fsyncing on every verification.
+        self.metadata_dirty = true;
     }
 
     /// Delete a piece from the cache (metadata + on-disk file + verified set).
@@ -574,7 +609,9 @@ impl CacheManager {
         }
 
         self.remove_infohash_metadata(info_hash);
-        self.save_metadata_file()
+        // TSI-2274: mark dirty instead of fsyncing on every purge.
+        self.metadata_dirty = true;
+        Ok(())
     }
 
     /// Sum of registered piece sizes for a given info_hash.
@@ -655,6 +692,19 @@ impl CacheManager {
             piece_count,
             total_size,
             hit_count: total_hit_count,
+        }
+    }
+}
+
+/// TSI-2274: flush dirty metadata when the CacheManager is dropped, so
+/// tests and other callers that do not run the engine loop still persist
+/// metadata mutations.  In production the engine loop flushes every tick
+/// and `main.rs` flushes on shutdown; this is the safety net for
+/// short-lived instances (tests, CLI tools).
+impl Drop for CacheManager {
+    fn drop(&mut self) {
+        if self.metadata_dirty {
+            let _ = self.flush();
         }
     }
 }
@@ -1457,6 +1507,86 @@ mod tests {
         assert_eq!(cache.piece_count(), 3);
         assert_eq!(cache.current_size(), 896);
 
+        Ok(())
+    }
+
+    // ── TSI-2274: record_access must not fsync on every read ───────────
+
+    #[test]
+    fn test_record_access_does_not_persist_until_flush() -> TorrentResult<()> {
+        // record_access updates the in-memory hit_count + last_accessed
+        // but must NOT fsync the metadata file on every call (the old
+        // behaviour limited read throughput to ~1.2 MB/s).  The metadata
+        // file is only persisted on an explicit flush or Drop.
+        let temp_dir = TempDir::new().unwrap();
+        let piece_key = "tsi2274:piece:0";
+        {
+            let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+            let path = cache.ensure_piece_dir(piece_key)?;
+            std::fs::write(&path, vec![0u8; 100])?;
+            cache.add_piece(piece_key, 100)?;
+            // flush so the initial add_piece state is on disk.
+            cache.flush()?;
+
+            // Record 50 accesses — none should touch the metadata file.
+            let meta_path = temp_dir.path().join("cache_metadata.txt");
+            let mtime_before = std::fs::metadata(&meta_path)?.modified()?;
+            for _ in 0..50 {
+                cache.record_access(piece_key)?;
+            }
+            let mtime_after = std::fs::metadata(&meta_path)?.modified()?;
+            assert_eq!(
+                mtime_before, mtime_after,
+                "metadata file must not be touched by record_access (no fsync per read)"
+            );
+            // In-memory hit_count is still updated.
+            assert_eq!(cache.piece_hit_count(piece_key), 50);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_drop_flushes_dirty_metadata() -> TorrentResult<()> {
+        // CacheManager::drop flushes dirty metadata so tests and other
+        // short-lived callers persist mutations without an explicit flush.
+        let temp_dir = TempDir::new().unwrap();
+        let piece_key = "tsi2274_drop:piece:0";
+        {
+            let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+            let path = cache.ensure_piece_dir(piece_key)?;
+            std::fs::write(&path, vec![0u8; 64])?;
+            cache.add_piece(piece_key, 64)?;
+            // No explicit flush — drop must persist.
+        }
+        let cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+        assert!(
+            cache.has_piece(piece_key),
+            "drop must have flushed dirty metadata so restart sees the piece"
+        );
+        assert_eq!(cache.piece_metadata_size(piece_key), Some(64));
+        Ok(())
+    }
+
+    #[test]
+    fn test_flush_metadata_if_dirty_skips_clean() -> TorrentResult<()> {
+        // flush_metadata_if_dirty is a no-op when nothing changed since the
+        // last flush — the metadata file must not be touched.
+        let temp_dir = TempDir::new().unwrap();
+        let piece_key = "tsi2274_clean:piece:0";
+        let mut cache = CacheManager::new(temp_dir.path(), 1024 * 1024)?;
+        let path = cache.ensure_piece_dir(piece_key)?;
+        std::fs::write(&path, vec![0u8; 32])?;
+        cache.add_piece(piece_key, 32)?;
+        cache.flush()?;
+
+        let meta_path = temp_dir.path().join("cache_metadata.txt");
+        let mtime_before = std::fs::metadata(&meta_path)?.modified()?;
+        cache.flush_metadata_if_dirty()?;
+        let mtime_after = std::fs::metadata(&meta_path)?.modified()?;
+        assert_eq!(
+            mtime_before, mtime_after,
+            "clean metadata must not be re-written"
+        );
         Ok(())
     }
 }

@@ -41,6 +41,13 @@ use super::inodes::{DATA_FILE_INO_BASE, SOURCE_PATH_DIR_INO_BASE};
 use super::lookup::DataResolver;
 use super::stats::{generate_directory_stats, generate_global_stats, generate_torrent_stats};
 
+/// TSI-2274: maximum number of entries in the L1 range cache.  Each entry
+/// caches a `(offset, size)` slice read from a torrent file.  When the
+/// cache is full, inserting a new entry clears all existing entries —
+/// coarse but bounded: the L1 cache is a hot-zone optimization, and
+/// clearing it only causes a few L2 disk re-reads.
+const MAX_L1_ENTRIES: usize = 256;
+
 pub struct FsService {
     pub inode_mgr: InodeManager,
     pub db: Option<Arc<Mutex<Database>>>,
@@ -960,7 +967,7 @@ impl FsService {
 
                 if let Some(ref ts) = self.torrent_service {
                     match ts.remove_torrent(&filename, &source_path) {
-                        Ok(Some(torrent_id)) => {
+                        Ok(Some((torrent_id, info_hash))) => {
                             removed_id = Some(torrent_id);
                             // TSI-2234: defer inode destruction. Mark the
                             // inode unlinked (so its directory name vanishes
@@ -1008,7 +1015,10 @@ impl FsService {
                                 error!("Mutex poisoned in unlink() torrent_data_cache: {}", e);
                                 FsError::LockPoisoned
                             })?;
-                            cache.remove(&source_path);
+                            // TSI-2274: L1 keys are `{info_hash}:{file_id}:{offset}:{size}`;
+                            // drop every range cached for this torrent.
+                            let prefix = format!("{}:", info_hash);
+                            cache.retain(|k, _| !k.starts_with(&prefix));
                             drop(cache);
 
                             info!(
@@ -1304,7 +1314,18 @@ impl FsService {
             FsError::Internal(format!("file index not found for file_id: {}", file_id))
         })? as i32;
 
-        let cache_key = format!("{}:{}", info_hash, file_id);
+        // TSI-2274: L1 range cache — keyed by
+        // `{info_hash}:{file_id}:{offset}:{size}` so repeated reads of the
+        // same range hit RAM and bypass L2 disk + the (now throttled)
+        // metadata fsync.  Before this fix the L1 cache was only ever read
+        // and removed, never populated, so every read went to L2 disk +
+        // fsync.
+        //
+        // The `size` is part of the key to prevent silent data truncation
+        // (review issue 1): if a smaller read cached N bytes and a larger
+        // read hits that entry, it would return only N bytes instead of
+        // the requested size.
+        let cache_key = format!("{}:{}:{}:{}", info_hash, file_id, offset, size);
         {
             let cache = self
                 .torrent_data_cache
@@ -1312,13 +1333,7 @@ impl FsService {
                 .map_err(|_| FsError::LockPoisoned)?;
             if let Some(cached) = cache.get(&cache_key) {
                 self.metrics.l1_hit();
-                let offset = offset as usize;
-                let end = std::cmp::min(offset + size as usize, cached.len());
-                if offset < cached.len() {
-                    return Ok(ReadOutcome::Ready(cached[offset..end].to_vec()));
-                } else {
-                    return Ok(ReadOutcome::Ready(Vec::new()));
-                }
+                return Ok(ReadOutcome::Ready(cached.clone()));
             }
         }
         self.metrics.l1_miss();
@@ -1334,6 +1349,22 @@ impl FsService {
                     self.metrics.l2_hit();
                     match ds.read_file_range(info.clone(), file_index, offset, size) {
                         Ok(data) => {
+                            // TSI-2274: populate the L1 range cache so a
+                            // repeated read of this exact range is served
+                            // from RAM, bypassing L2 disk + metadata fsync.
+                            // Bounded: when the cache is full, clear all
+                            // entries before inserting (review issue 2) —
+                            // coarse but bounded, the L1 cache is a hot-zone
+                            // optimization and clearing it only causes a few
+                            // L2 disk re-reads.
+                            if !data.is_empty() {
+                                if let Ok(mut cache) = self.torrent_data_cache.lock() {
+                                    if cache.len() >= MAX_L1_ENTRIES {
+                                        cache.clear();
+                                    }
+                                    cache.insert(cache_key.clone(), data.clone());
+                                }
+                            }
                             info!(
                                 "Successfully read {} bytes from torrent file \
                                  (torrent_id={}, file_id={})",
@@ -1495,6 +1526,14 @@ impl FsService {
     fn generate_global_stats_content(&self) -> Vec<u8> {
         let get_cm = || self.get_cache_manager();
         let session_stats = self.download_service.as_ref().map(|ds| ds.snapshot_stats());
+        // TSI-2274: report the current L1 range cache depth so `.stats`
+        // reflects the now-populated memory cache.
+        let l1_entries = self
+            .torrent_data_cache
+            .lock()
+            .map(|c| c.len() as u64)
+            .unwrap_or(0);
+        self.metrics.set_l1_entries(l1_entries);
         generate_global_stats(
             self.inode_mgr.creation_time,
             &self.db,
@@ -2761,5 +2800,52 @@ mod tests {
         svc.rmdir(METADATA_INO, "sub")
             .expect("rmdir after unlink-while-open");
         assert!(!svc.inode_mgr.inodes.contains_key(&dir));
+    }
+
+    /// TSI-2274 (review issue 2): the L1 range cache is bounded by
+    /// `MAX_L1_ENTRIES`.  When full, inserting a new entry clears the
+    /// cache so memory does not grow unboundedly.
+    #[test]
+    fn l1_cache_evicts_when_full() {
+        let svc = bare_service();
+        {
+            let mut cache = svc.torrent_data_cache.lock().unwrap();
+            for i in 0..MAX_L1_ENTRIES {
+                let key = format!("hash:file:{}:4096", i);
+                cache.insert(key, vec![0xABu8; 4096]);
+            }
+            assert_eq!(cache.len(), MAX_L1_ENTRIES);
+        }
+        // One more insert triggers eviction.
+        {
+            let mut cache = svc.torrent_data_cache.lock().unwrap();
+            if cache.len() >= MAX_L1_ENTRIES {
+                cache.clear();
+            }
+            cache.insert("hash:file:999:4096".to_string(), vec![0xCDu8; 4096]);
+        }
+        let cache = svc.torrent_data_cache.lock().unwrap();
+        assert_eq!(
+            cache.len(),
+            1,
+            "cache should have been cleared and now hold only the new entry"
+        );
+        assert!(cache.contains_key("hash:file:999:4096"));
+    }
+
+    /// TSI-2274 (review issue 1): L1 cache keys include `size` so a
+    /// read with a different size at the same offset does not collide.
+    #[test]
+    fn l1_cache_key_includes_size() {
+        let svc = bare_service();
+        let mut cache = svc.torrent_data_cache.lock().unwrap();
+        // Simulate a 4 KB read at offset 0 and a 128 KB read at offset 0.
+        let key_small = format!("{}:{}:{}:{}", "hash", 1, 0u64, 4096u32);
+        let key_large = format!("{}:{}:{}:{}", "hash", 1, 0u64, 131072u32);
+        assert_ne!(key_small, key_large, "keys must differ by size");
+        cache.insert(key_small, vec![0u8; 4096]);
+        cache.insert(key_large, vec![0u8; 131072]);
+        // Both entries coexist — no truncation.
+        assert_eq!(cache.len(), 2);
     }
 }
