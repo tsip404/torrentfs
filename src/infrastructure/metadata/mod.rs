@@ -48,25 +48,50 @@ pub struct TrackerEntry {
 
 impl TorrentInfo {
     #[allow(dead_code)]
+    /// Parse a `.torrent` file from the filesystem.
+    ///
+    /// TSI-2278: On Unix, file paths are arbitrary byte sequences — they are
+    /// not required to be valid UTF-8.  The previous implementation called
+    /// `Path::to_str()`, which returns `None` for non-UTF-8 paths, causing
+    /// `from_file` to fail with `InvalidFile("Path contains invalid UTF-8")`
+    /// for torrents whose names contain non-ASCII bytes (e.g. GBK-encoded
+    /// Chinese filenames from legacy BT sites).
+    ///
+    /// The fix uses `OsStrExt::as_bytes()` (Unix) to obtain the raw path
+    /// bytes and constructs a `CString` directly, bypassing the UTF-8
+    /// validation.  libtorrent's `torrent_info(const std::string&)`
+    /// constructor accepts arbitrary bytes, so no encoding conversion is
+    /// needed.
     pub fn from_file<P: AsRef<Path>>(path: P) -> TorrentResult<Self> {
-        let path_str = path
-            .as_ref()
-            .to_str()
-            .ok_or_else(|| TorrentError::InvalidFile("Path contains invalid UTF-8".to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path_bytes = path.as_ref().as_os_str().as_bytes();
+            let c_path = CString::new(path_bytes)
+                .map_err(|_| TorrentError::InvalidFile("Path contains null byte".to_string()))?;
+            Self::from_file_cstr(&c_path)
+        }
+        #[cfg(not(unix))]
+        {
+            let path_str = path.as_ref().to_str().ok_or_else(|| {
+                TorrentError::InvalidFile("Path contains invalid UTF-8".to_string())
+            })?;
+            let c_path = CString::new(path_str)
+                .map_err(|_| TorrentError::InvalidFile("Path contains null byte".to_string()))?;
+            Self::from_file_cstr(&c_path)
+        }
+    }
 
-        let c_path = CString::new(path_str)
-            .map_err(|_| TorrentError::InvalidFile("Path contains null byte".to_string()))?;
-
+    /// Parse a `.torrent` file from a NUL-terminated C string path.
+    fn from_file_cstr(c_path: &CString) -> TorrentResult<Self> {
         let mut error = libtorrent_sys::lt_error_t {
             message: ptr::null(),
             code: 0,
         };
-
-        // SAFETY: `c_path` is a valid, NUL-terminated C string; `error` is
-        // stack-allocated and properly initialized. The FFI function is
-        // safe as long as these preconditions hold.
+        // SAFETY: `c_path` is a valid, NUL-terminated C string;
+        // `error` is stack-allocated and properly initialized. The FFI
+        // function is safe as long as these preconditions hold.
         let inner = unsafe { libtorrent_sys::lt_torrent_info_create(c_path.as_ptr(), &mut error) };
-
         if inner.is_null() {
             // SAFETY: `error` is a live, initialized stack variable; no
             // aliasing issues since it's passed by shared reference.
@@ -356,10 +381,61 @@ impl Drop for TorrentInfo {
 unsafe impl Send for TorrentInfo {}
 unsafe impl Sync for TorrentInfo {}
 
+/// TSI-2278: Shared test helper — build a multi-file bencoded torrent
+/// with arbitrary byte-string file names. Used by both `metadata::tests`
+/// and `fs_service::tests` to avoid duplication.
+#[cfg(test)]
+#[doc(hidden)]
+pub(crate) fn build_multifile_torrent(
+    name_bytes: &[u8],
+    files: &[(Vec<u8>, usize)],
+    piece_length: usize,
+) -> Vec<u8> {
+    let total: usize = files.iter().map(|(_, s)| s).sum();
+    let content: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    let mut pieces = Vec::new();
+    for chunk in content.chunks(piece_length) {
+        use sha1_smol::Sha1;
+        pieces.extend_from_slice(&Sha1::from(chunk).digest().bytes());
+    }
+    let mut t = Vec::new();
+    t.push(b'd');
+    t.extend_from_slice(b"4:infod");
+    t.extend_from_slice(b"5:filesl");
+    for (path, size) in files {
+        t.push(b'd');
+        t.extend_from_slice(b"6:lengthi");
+        t.extend_from_slice(size.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"4:pathl");
+        t.extend_from_slice(path.len().to_string().as_bytes());
+        t.push(b':');
+        t.extend_from_slice(path);
+        t.push(b'e');
+        t.push(b'e');
+    }
+    t.push(b'e');
+    t.extend_from_slice(b"4:name");
+    t.extend_from_slice(name_bytes.len().to_string().as_bytes());
+    t.push(b':');
+    t.extend_from_slice(name_bytes);
+    t.extend_from_slice(b"12:piece lengthi");
+    t.extend_from_slice(piece_length.to_string().as_bytes());
+    t.push(b'e');
+    t.extend_from_slice(b"6:pieces");
+    t.extend_from_slice(pieces.len().to_string().as_bytes());
+    t.push(b':');
+    t.extend_from_slice(&pieces);
+    t.extend_from_slice(b"ee");
+    t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
 
     fn create_test_torrent() -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -663,5 +739,98 @@ mod tests {
             !info.is_private(),
             "Public torrent with trackers but no private flag should return false"
         );
+    }
+
+    #[test]
+    fn test_multifile_utf8_nonascii_names() {
+        // Multi-file torrent with UTF-8 Chinese file names.
+        let name = "测试种子".as_bytes(); // 4 CJK chars, 12 bytes
+        let file1 = "你好.txt".as_bytes(); // 2 CJK + .txt
+        let file2 = "世界.txt".as_bytes();
+        let torrent =
+            build_multifile_torrent(name, &[(file1.to_vec(), 16), (file2.to_vec(), 16)], 16);
+        let info = TorrentInfo::from_bytes(torrent).expect("parse torrent");
+
+        // name() should preserve valid UTF-8.
+        assert_eq!(info.name(), "测试种子");
+
+        let files = info.files().expect("get files");
+        assert_eq!(files.len(), 2);
+        // file_path() prepends the torrent name for multi-file torrents.
+        assert_eq!(files[0].path, "测试种子/你好.txt");
+        assert_eq!(files[1].path, "测试种子/世界.txt");
+        assert_eq!(files[0].size, 16);
+        assert_eq!(files[1].size, 16);
+    }
+
+    #[test]
+    fn test_multifile_non_utf8_gbk_names() {
+        // Multi-file torrent with GBK-encoded file names (not valid UTF-8).
+        // libtorrent sanitizes non-UTF-8 bytes to '_' — the names are
+        // mangled but must be internally consistent so that DB lookups
+        // match readdir/lookup round-trips.
+        let name: &[u8] = b"\xb2\xe2\xca\xd4\xd6\xd6\xd7\xd3"; // 测试种子 in GBK
+        let file1: &[u8] = b"\xc4\xe3\xba\xc3.txt"; // 你好.txt in GBK
+        let file2: &[u8] = b"\xca\xc0\xbd\xe7.txt"; // 世界.txt in GBK
+        let torrent =
+            build_multifile_torrent(name, &[(file1.to_vec(), 16), (file2.to_vec(), 16)], 16);
+        let info = TorrentInfo::from_bytes(torrent).expect("parse torrent");
+
+        let files = info.files().expect("get files");
+        assert_eq!(files.len(), 2);
+        // The sanitized names must be valid UTF-8 (so they can be stored
+        // in SQLite TEXT columns and round-tripped through FUSE OsStr).
+        assert!(
+            std::str::from_utf8(files[0].path.as_bytes()).is_ok(),
+            "sanitized file path must be valid UTF-8"
+        );
+        assert!(
+            std::str::from_utf8(files[1].path.as_bytes()).is_ok(),
+            "sanitized file path must be valid UTF-8"
+        );
+        // The two files must have different names after sanitization
+        // (libtorrent appends a numeric suffix to avoid collisions).
+        let name0 = files[0].path.split('/').last().unwrap();
+        let name1 = files[1].path.split('/').last().unwrap();
+        assert_ne!(name0, name1, "sanitized file names must be unique");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_from_file_non_utf8_path() {
+        // TSI-2278: from_file must not fail on non-UTF-8 file paths.
+        // On Unix, file paths are arbitrary bytes.  A path with non-UTF-8
+        // bytes should be passed through to libtorrent as raw bytes, not
+        // rejected with "Path contains invalid UTF-8".
+        //
+        // We create a valid torrent file at a non-UTF-8 path and verify
+        // that from_file can open it.
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // Build a path containing a non-UTF-8 byte (0xff is invalid UTF-8).
+        let mut path_bytes = dir.path().as_os_str().as_bytes().to_vec();
+        path_bytes.push(std::path::MAIN_SEPARATOR as u8);
+        path_bytes.extend_from_slice(b"\xff");
+        path_bytes.extend_from_slice(b".torrent");
+        let non_utf8_path = std::ffi::OsString::from_vec(path_bytes);
+        let path = std::path::PathBuf::from(non_utf8_path);
+
+        // Write a valid single-file torrent to this path.
+        let torrent = build_test_torrent(32, 16);
+        std::fs::write(&path, &torrent).expect("write torrent to non-UTF-8 path");
+
+        // from_file should succeed — the old implementation would fail
+        // with "Path contains invalid UTF-8".
+        let result = TorrentInfo::from_file(&path);
+        assert!(
+            result.is_ok(),
+            "from_file should handle non-UTF-8 paths: {:?}",
+            result.err()
+        );
+
+        let info = result.unwrap();
+        assert_eq!(info.name(), "test");
+        assert_eq!(info.total_size(), 32);
     }
 }
