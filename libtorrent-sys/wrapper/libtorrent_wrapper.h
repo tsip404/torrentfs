@@ -145,6 +145,30 @@ void lt_session_set_alert_notify(lt_session_t session, void (*callback)(void* us
 void lt_lock_piece_read(const char* info_hash_hex);
 void lt_unlock_piece_read(const char* info_hash_hex);
 
+// ============================================================================
+// TSI-2276: Tracker manipulation FFI — extract / replace / re-announce
+// ============================================================================
+
+// Extract all trackers (announce + announce-list with tier) from a
+// torrent_info as a JSON array string: [{"tier":0,"url":"http://..."},...]
+// Returns 0 on success (writes a strdup'd string into *out_json), -1 on
+// error (sets *error). Caller MUST free *out_json via lt_string_free.
+int lt_torrent_info_trackers(lt_torrent_info_t info, char** out_json, lt_error_t* error);
+
+// Replace all trackers on a torrent_handle with the given JSON array:
+// [{"tier":0,"url":"http://..."},...]. Internally calls
+// handle.replace_trackers(vector<announce_entry>). Returns 0 on success,
+// -1 on error (sets *error).
+int lt_torrent_handle_replace_trackers(lt_torrent_handle_t handle, const char* trackers_json, lt_error_t* error);
+
+// Force an immediate tracker re-announce on the handle. Calls
+// handle.force_reannounce(). Returns 0 on success, -1 on error.
+int lt_torrent_handle_force_reannounce(lt_torrent_handle_t handle);
+
+// Free a string returned by lt_torrent_info_trackers (or any wrapper
+// function that returns a strdup'd char* via out-parameter).
+void lt_string_free(char* str);
+
 #ifdef __cplusplus
 }
 #endif

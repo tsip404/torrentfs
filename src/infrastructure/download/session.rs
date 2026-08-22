@@ -415,6 +415,48 @@ impl TorrentHandle {
         unsafe { libtorrent_sys::lt_torrent_handle_force_recheck(self.inner) == 0 }
     }
 
+    /// Replace all trackers on the underlying handle with the given entries.
+    /// Internally calls `handle.replace_trackers(vector<announce_entry>)`.
+    /// After replacing, call `force_reannounce()` to immediately contact the
+    /// new trackers.
+    pub fn replace_trackers(&self, trackers: &[crate::TrackerEntry]) -> bool {
+        // Serialize via serde_json — guarantees RFC 8259 compliance
+        // (control char escaping, proper string handling).
+        let json = match serde_json::to_string(trackers) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let c_json = match CString::new(json) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+
+        let mut error = libtorrent_sys::lt_error_t {
+            message: ptr::null(),
+            code: 0,
+        };
+
+        // SAFETY: `self.inner` is a valid handle; `c_json` is a valid
+        // NUL-terminated C string; `error` is stack-allocated.
+        let result = unsafe {
+            libtorrent_sys::lt_torrent_handle_replace_trackers(
+                self.inner,
+                c_json.as_ptr(),
+                &mut error,
+            )
+        };
+
+        result == 0
+    }
+
+    /// Force an immediate tracker re-announce. After `replace_trackers`,
+    /// this tells libtorrent to contact the new tracker set right away
+    /// instead of waiting for the next scheduled announce interval.
+    pub fn force_reannounce(&self) -> bool {
+        // SAFETY: `self.inner` is a valid handle.
+        unsafe { libtorrent_sys::lt_torrent_handle_force_reannounce(self.inner) == 0 }
+    }
+
     pub fn info_hash(&self) -> &str {
         &self.info_hash
     }
