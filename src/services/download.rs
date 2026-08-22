@@ -70,6 +70,26 @@ impl DownloadService {
         self.engine.remove_handle(info_hash)
     }
 
+    /// Merge trackers from a duplicate-info_hash torrent into the existing
+    /// handle (TSI-2275 / TSI-2277). Fire-and-forget: the engine checks the
+    /// private flag and skips the merge for private torrents (PT isolation).
+    /// Call this from `add_torrent` when a duplicate info_hash is detected.
+    pub fn merge_trackers(&self, info: Arc<TorrentInfo>) -> TorrentResult<()> {
+        self.engine.merge_trackers(info)
+    }
+
+    /// Non-blocking private-flag check for `.stats` (TSI-2277).
+    pub fn try_is_private(&self, info_hash: &str) -> Option<bool> {
+        self.engine.try_is_private(info_hash)
+    }
+
+    /// Query the current tracker list on a torrent handle (TSI-2277).
+    /// Synchronous. Used by tests to verify PT isolation.
+    #[cfg(test)]
+    pub fn get_trackers(&self, info_hash: &str) -> TorrentResult<Vec<crate::TrackerEntry>> {
+        self.engine.get_trackers(info_hash)
+    }
+
     /// Read a range of bytes from a specific file within a torrent.
     pub fn read_file_range(
         &self,

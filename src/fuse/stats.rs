@@ -565,6 +565,23 @@ pub fn generate_torrent_stats(
     output.push_str(&format!("info_hash: {}\n", t.info_hash));
     output.push_str(&format!("source_path: \"{}\"\n", t.source_path));
 
+    // PT isolation info (TSI-2277): show the private flag and whether
+    // tracker merging is isolated. Private torrents (private=1 in the info
+    // dict) never participate in cross-site tracker merging.
+    let is_private = download_service
+        .as_ref()
+        .and_then(|ds| ds.try_is_private(info_hash))
+        .unwrap_or(false);
+    output.push_str(&format!(
+        "private: {}  tracker_isolation: {}\n",
+        if is_private { "yes" } else { "no" },
+        if is_private {
+            "isolated (no cross-site merge)"
+        } else {
+            "merge-eligible"
+        }
+    ));
+
     output.push('\n');
     output.push_str(BANNER_LINE);
     output.push('\n');
@@ -731,8 +748,18 @@ pub fn generate_directory_stats(
             .unwrap_or(progress as f64);
         let prog_pct = if ts > 0 { actual_progress * 100.0 } else { 0.0 };
 
+        // PT isolation indicator (TSI-2277): show a 🔒 marker for private
+        // torrents so users can see at a glance which torrents are isolated
+        // from cross-site tracker merging.
+        let is_private = download_service
+            .as_ref()
+            .and_then(|ds| ds.try_is_private(&t.info_hash))
+            .unwrap_or(false);
+        let private_marker = if is_private { "🔒" } else { "  " };
+
         output.push_str(&format!(
-            "  #{:<3} {:<40} {}  {:>5.1}%  ↓ {:<10}/s  ↑ {:<10}/s  {:>3}P/{:<3}S\n",
+            "  {}#{:<3} {:<40} {}  {:>5.1}%  ↓ {:<10}/s  ↑ {:<10}/s  {:>3}P/{:<3}S\n",
+            private_marker,
             idx + 1,
             if t.name.len() > 40 {
                 t.name.chars().take(37).collect::<String>() + "..."

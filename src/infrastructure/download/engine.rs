@@ -26,6 +26,7 @@ use crate::infrastructure::config::TorrentfsConfig;
 use crate::infrastructure::metadata::TorrentInfo;
 use crate::infrastructure::metrics::Metrics;
 use crate::seeding::SeedingManager;
+use tracing::{info, warn};
 
 use super::piece_scheduler::{PiecePriorityConfig, PieceScheduler, PieceStatus};
 use super::piece_store::PieceStore;
@@ -73,6 +74,19 @@ pub enum Command {
     /// reference to an info_hash is deleted, so the engine stops
     /// announcing/seeding a removed torrent (TSI-2232).
     RemoveHandle { info_hash: String },
+    /// Merge trackers from a duplicate-info_hash torrent into the existing
+    /// handle (TSI-2275). The engine checks the private flag (TSI-2277):
+    /// if either the existing or incoming torrent is private, the merge is
+    /// skipped to prevent PT passkey leakage and peer cross-pollination.
+    /// Fire-and-forget: the result is logged, not returned to the caller.
+    MergeTrackers { info: Arc<TorrentInfo> },
+    /// Query the current tracker list on a torrent handle (TSI-2277 test
+    /// support). Used by tests to verify PT isolation: private torrent
+    /// trackers must not be merged into the existing handle.
+    GetTrackers {
+        info_hash: String,
+        reply: SyncSender<TorrentResult<Vec<crate::TrackerEntry>>>,
+    },
     /// Stop the engine thread.
     Shutdown,
 }
@@ -84,6 +98,11 @@ pub struct DownloadSnapshot {
     pub statuses: HashMap<String, TorrentStatus>,
     /// Per-info_hash `(piece_length, piece statuses)`.
     pub pieces: HashMap<String, (u64, Vec<PieceStatus>)>,
+    /// Per-info_hash private flag (TSI-2277). A torrent is "private" when
+    /// its info dict has `private=1` (BEP-27). Private torrents are isolated
+    /// from cross-site tracker merging to prevent passkey leakage and peer
+    /// cross-pollination across PT swarms.
+    pub private_torrents: HashMap<String, bool>,
 }
 
 /// Handle to a running download engine.  Cheap to clone (`Send + Sync`).
@@ -102,6 +121,11 @@ pub struct DownloadEngine {
 struct EngineState {
     session: Session,
     handles: HashMap<String, TorrentHandle>,
+    /// Per-info_hash private flag (TSI-2277). Populated at handle creation
+    /// time from `TorrentInfo::is_private()`. Used to guard tracker merging:
+    /// if either the existing or incoming torrent is private, the merge is
+    /// skipped to prevent PT passkey leakage and peer cross-pollination.
+    private_torrents: HashMap<String, bool>,
     store: PieceStore,
     scheduler: PieceScheduler,
     cache_dir: String,
@@ -187,6 +211,7 @@ impl DownloadEngine {
                 let state = EngineState {
                     session,
                     handles: HashMap::new(),
+                    private_torrents: HashMap::new(),
                     store,
                     scheduler,
                     cache_dir: cache_dir_str,
@@ -254,6 +279,20 @@ impl DownloadEngine {
             .cloned()
     }
 
+    /// Non-blocking private-flag check from the last engine snapshot
+    /// (TSI-2277). Returns `Some(true)` if the torrent's info dict has
+    /// `private=1`, `Some(false)` if not, `None` if the info_hash has no
+    /// handle in the snapshot. Used by `.stats` to display the PT isolation
+    /// state.
+    pub fn try_is_private(&self, info_hash: &str) -> Option<bool> {
+        self.snapshot
+            .try_lock()
+            .ok()?
+            .private_torrents
+            .get(info_hash)
+            .copied()
+    }
+
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
     }
@@ -303,6 +342,27 @@ impl DownloadEngine {
         self.send(Command::RemoveHandle {
             info_hash: info_hash.to_string(),
         })
+    }
+
+    /// Merge trackers from a duplicate-info_hash torrent into the existing
+    /// handle (TSI-2275 / TSI-2277). Fire-and-forget: the command is queued
+    /// and executed on the engine thread; this call does not block. The
+    /// engine checks the private flag — if either the existing or incoming
+    /// torrent is private, the merge is skipped (PT isolation).
+    pub fn merge_trackers(&self, info: Arc<TorrentInfo>) -> TorrentResult<()> {
+        self.send(Command::MergeTrackers { info })
+    }
+
+    /// Query the current tracker list on a torrent handle (TSI-2277).
+    /// Synchronous: blocks until the engine thread responds. Used by tests
+    /// to verify PT isolation — private torrent trackers must not be merged.
+    pub fn get_trackers(&self, info_hash: &str) -> TorrentResult<Vec<crate::TrackerEntry>> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(Command::GetTrackers {
+            info_hash: info_hash.to_string(),
+            reply: tx,
+        })?;
+        rx.recv().map_err(|_| Self::disconnected())?
     }
 
     /// Read a file range, driving piece download on the engine thread.
@@ -458,6 +518,19 @@ impl EngineState {
             Command::RemoveHandle { info_hash } => {
                 let _ = self.remove_handle(&info_hash);
             }
+            Command::MergeTrackers { info } => {
+                self.merge_trackers(&info);
+            }
+            Command::GetTrackers { info_hash, reply } => {
+                let result = match self.handles.get(&info_hash) {
+                    Some(handle) => handle.trackers(),
+                    None => Err(TorrentError::Unknown {
+                        code: -1,
+                        message: "No handle for info_hash".to_string(),
+                    }),
+                };
+                let _ = reply.send(result);
+            }
             Command::Shutdown => return true,
         }
         false
@@ -489,6 +562,11 @@ impl EngineState {
         let (piece_length, num_pieces) = handle.get_torrent_info()?;
         self.scheduler
             .init_torrent(&info_hash, num_pieces as i32, piece_length)?;
+        // Record the private flag (TSI-2277) so that tracker merging can
+        // check it without re-parsing the torrent_info on every duplicate
+        // add. The flag is immutable for the lifetime of the info_hash.
+        self.private_torrents
+            .insert(info_hash.clone(), info.is_private());
         self.handles.insert(info_hash, handle);
         Ok(())
     }
@@ -503,7 +581,143 @@ impl EngineState {
             self.session.remove_torrent(handle, false);
         }
         self.scheduler.remove_torrent(info_hash);
+        self.private_torrents.remove(info_hash);
         Ok(())
+    }
+
+    /// Merge trackers from a duplicate-info_hash torrent into the existing
+    /// handle (TSI-2275), with PT isolation guard (TSI-2277).
+    ///
+    /// Called when `add_torrent` detects a duplicate info_hash (a second
+    /// torrent with the same content hash but potentially different trackers).
+    /// The new torrent's trackers are deduplicated against the existing
+    /// handle's trackers and merged in, then `force_reannounce` is called to
+    /// immediately contact the new trackers.
+    ///
+    /// **PT isolation**: if either the existing handle's torrent or the
+    /// incoming torrent has the `private` flag set (BEP-27), the merge is
+    /// **skipped entirely**. Private torrents embed passkeys in their
+    /// announce URLs; merging trackers across PT sites would leak passkeys
+    /// to foreign swarms and cross-pollinate peers, risking account bans.
+    /// Private torrents keep their independent tracker lists and only share
+    /// the local piece cache.
+    ///
+    /// All failures are non-fatal (warn-logged): the torrent is already in
+    /// the DB and the handle exists, so a merge failure only means the new
+    /// trackers won't be announced — the existing behavior is unchanged.
+    fn merge_trackers(&mut self, info: &TorrentInfo) {
+        let info_hash = match info.info_hash() {
+            Ok(h) => hex::encode(h),
+            Err(e) => {
+                warn!("merge_trackers: failed to get info_hash, skipping: {:?}", e);
+                return;
+            }
+        };
+
+        // PT isolation guard (TSI-2277): if the incoming torrent is private,
+        // do not merge its trackers into the existing handle.
+        let incoming_private = info.is_private();
+
+        // Look up the existing handle. If no handle exists yet, there's
+        // nothing to merge into — the handle will be created on first
+        // access with this torrent's own trackers.
+        let existing_handle = match self.handles.get(&info_hash) {
+            Some(h) => h,
+            None => {
+                // No handle yet — ensure_handle will create one from this
+                // torrent's trackers on first access. Nothing to merge.
+                return;
+            }
+        };
+
+        // PT isolation guard: check the existing torrent's private flag.
+        // Conservative: if the private flag is somehow missing from the map
+        // (shouldn't happen — ensure_handle always populates it), treat as
+        // private to avoid risking passkey leakage on an uncertain flag.
+        let existing_private = self
+            .private_torrents
+            .get(&info_hash)
+            .copied()
+            .unwrap_or(true);
+
+        if incoming_private || existing_private {
+            info!(
+                "PT isolation (TSI-2277): skipping tracker merge for {} — \
+                 private flag on existing={} / incoming={}. \
+                 Trackers remain independent; piece cache is shared.",
+                info_hash, existing_private, incoming_private
+            );
+            return;
+        }
+
+        // Extract trackers from the incoming torrent.
+        let incoming_trackers = match info.trackers() {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    "merge_trackers {}: failed to extract trackers: {:?}",
+                    info_hash, e
+                );
+                return;
+            }
+        };
+
+        if incoming_trackers.is_empty() {
+            // No trackers to merge — nothing to do.
+            return;
+        }
+
+        // Extract existing trackers from the handle's torrent_info.
+        // We use the handle's own tracker list via the FFI.
+        let existing_trackers = match existing_handle.trackers() {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    "merge_trackers {}: failed to get existing trackers: {:?}",
+                    info_hash, e
+                );
+                return;
+            }
+        };
+
+        // Deduplicate by URL, preserving tier information. Existing trackers
+        // keep their tier; incoming trackers that are new get their original
+        // tier (or a tier higher than any existing to avoid disrupting
+        // the announce priority order).
+        let mut seen: std::collections::HashSet<String> =
+            existing_trackers.iter().map(|t| t.url.clone()).collect();
+        let mut merged = existing_trackers.clone();
+        for tracker in &incoming_trackers {
+            if seen.insert(tracker.url.clone()) {
+                merged.push(tracker.clone());
+            }
+        }
+
+        if merged.len() == existing_trackers.len() {
+            // All incoming trackers were duplicates — nothing new to merge.
+            return;
+        }
+
+        // Replace trackers on the handle and force re-announce.
+        if !existing_handle.replace_trackers(&merged) {
+            warn!("merge_trackers {}: replace_trackers FFI failed", info_hash);
+            return;
+        }
+
+        if !existing_handle.force_reannounce() {
+            warn!(
+                "merge_trackers {}: force_reannounce FFI failed (non-fatal)",
+                info_hash
+            );
+        }
+
+        info!(
+            "merge_trackers {}: merged {} new tracker(s) into existing {} (total {})",
+            info_hash,
+            merged.len() - existing_trackers.len(),
+            existing_trackers.len(),
+            merged.len()
+        );
     }
 
     /// Read a file range, driving piece download if needed.  Runs entirely on
@@ -1279,7 +1493,11 @@ impl EngineState {
             }
         }
         if let Ok(mut snap) = self.snapshot.lock() {
-            *snap = DownloadSnapshot { statuses, pieces };
+            *snap = DownloadSnapshot {
+                statuses,
+                pieces,
+                private_torrents: self.private_torrents.clone(),
+            };
         }
     }
 

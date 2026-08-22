@@ -1,4 +1,4 @@
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::ptr;
 
@@ -455,6 +455,47 @@ impl TorrentHandle {
     pub fn force_reannounce(&self) -> bool {
         // SAFETY: `self.inner` is a valid handle.
         unsafe { libtorrent_sys::lt_torrent_handle_force_reannounce(self.inner) == 0 }
+    }
+
+    /// Extract the current tracker list from the handle (TSI-2277).
+    ///
+    /// Returns the live tracker list reflecting any prior `replace_trackers`
+    /// calls. Used by the tracker merge logic to get the existing handle's
+    /// trackers for dedup before merging in a duplicate torrent's trackers.
+    pub fn trackers(&self) -> TorrentResult<Vec<crate::TrackerEntry>> {
+        let mut error = libtorrent_sys::lt_error_t {
+            message: ptr::null(),
+            code: 0,
+        };
+        let mut json_ptr: *mut std::os::raw::c_char = ptr::null_mut();
+
+        // SAFETY: `self.inner` is a valid handle; `json_ptr` and `error`
+        // are stack-allocated and properly initialized.
+        let result = unsafe {
+            libtorrent_sys::lt_torrent_handle_trackers(self.inner, &mut json_ptr, &mut error)
+        };
+
+        if result != 0 {
+            return Err(unsafe { error_from_c(&error) });
+        }
+
+        if json_ptr.is_null() {
+            return Ok(Vec::new());
+        }
+
+        // SAFETY: `json_ptr` was populated by the successful FFI call and
+        // points to a NUL-terminated C string. We copy it before freeing.
+        let json_str = unsafe { CStr::from_ptr(json_ptr) }
+            .to_string_lossy()
+            .into_owned();
+
+        // SAFETY: `json_ptr` was allocated by `strdup` in the C++ wrapper;
+        // `lt_string_free` calls `free` exactly once.
+        unsafe { libtorrent_sys::lt_string_free(json_ptr) };
+
+        serde_json::from_str::<Vec<crate::TrackerEntry>>(&json_str).map_err(|e| {
+            TorrentError::ParseError(format!("Failed to parse handle trackers JSON: {e}"))
+        })
     }
 
     pub fn info_hash(&self) -> &str {
