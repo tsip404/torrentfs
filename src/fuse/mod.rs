@@ -25,15 +25,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use std::time::{Duration, UNIX_EPOCH};
 
-use fuser::{
-    consts::FOPEN_DIRECT_IO,
-    Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request,
-};
-use tracing::warn;
 pub use self::fs_service::FsService;
 use self::fs_types::{Attr, FileKind, OpenOutcome, ReadOutcome, StatsKind};
 pub use self::worker_pool::WorkerPool;
+use fuser::{
+    consts::FOPEN_DIRECT_IO, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+};
+use tracing::warn;
 
 use crate::cache::CacheManager;
 use crate::config::TorrentfsConfig;
@@ -220,8 +219,32 @@ impl<R: PendingReply> PendingTable<R> {
         }
         count
     }
-}
 
+    /// Resolve a pending entry with data, or with `ENODATA` when the data is
+    /// empty but a non-zero `size` was requested (TSI-2293).
+    ///
+    /// The deferred-read worker job calls this instead of `resolve` so that
+    /// an `Ok(Vec::new())` from `read_file_range_blocking` — which happens
+    /// when the engine's internal `file_offset` computation disagrees with
+    /// `pieces_on_disk`'s summed-file-sizes computation, landing on an
+    /// early-return that yields 0 bytes without error — is translated into
+    /// `ENODATA` rather than a 0-byte reply.  A 0-byte reply makes the
+    /// kernel see EOF, so `dd` exits 0 and the user never learns the
+    /// download failed.
+    ///
+    /// The `size` parameter is the originally requested read size (always
+    /// greater than zero for deferred reads: `fs_service::read` verifies
+    /// `offset < actual_size` before entering the Pending path).  When
+    /// `size == 0` the empty data is a legitimate EOF and is passed
+    /// through unchanged.
+    fn resolve_or_enodata(&self, id: u64, data: &[u8], size: u32) {
+        if data.is_empty() && size > 0 {
+            self.resolve_error(id, libc::ENODATA);
+        } else {
+            self.resolve(id, data);
+        }
+    }
+}
 /// FUSE entry TTL (seconds).
 const TTL: Duration = Duration::from_secs(1);
 
@@ -532,10 +555,22 @@ impl Filesystem for TorrentFs {
                         let metrics = self.service.metrics.clone();
                         let pt = self.pending_table.clone();
                         let job = Box::new(move || {
-                            let _worker = metrics.worker_guard();
                             match ds.read_file_range_blocking(info, file_index, offset, size) {
                                 Ok(data) => {
-                                    pt.resolve(id, &data);
+                                    if data.is_empty() && size > 0 {
+                                        warn!(
+                                            "Deferred read returned 0 bytes \
+                                             for non-zero size (ticket={}, \
+                                             size={}); resolving as ENODATA",
+                                            id, size
+                                        );
+                                    }
+                                    // TSI-2293: `resolve_or_enodata` guards
+                                    // against `Ok(empty)` for a non-zero
+                                    // `size`, which would otherwise be a
+                                    // silent 0-byte EOF.  See the method's
+                                    // doc comment for the root-cause analysis.
+                                    pt.resolve_or_enodata(id, &data, size);
                                     metrics.pending_reads_dec();
                                 }
                                 Err(e) => {
@@ -715,25 +750,61 @@ impl Filesystem for TorrentFs {
         }
     }
 }
-
 #[cfg(test)]
 mod pending_tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
     /// Counts how many times the reply is resolved (with data or error).  This
     /// is the test double for `fuser::ReplyData` and verifies the "consumed
     /// exactly once" invariant.
     #[derive(Debug)]
     struct MockReply {
         resolves: Arc<AtomicUsize>,
+        /// Last errno passed to `resolve_error` (0 if the reply was resolved
+        /// with data, or never resolved).
+        last_errno: Arc<AtomicI32>,
+        /// Whether `resolve_data` was called with a non-empty slice.
+        got_data: Arc<AtomicBool>,
+    }
+
+    impl MockReply {
+        /// Create a reply that tracks resolution count only (legacy tests).
+        fn tracking(resolves: Arc<AtomicUsize>) -> Self {
+            Self {
+                resolves,
+                last_errno: Arc::new(AtomicI32::new(0)),
+                got_data: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        /// Create a reply with full tracking: resolution count, last errno,
+        /// and whether non-empty data was delivered.
+        fn tracked() -> (Self, Arc<AtomicUsize>, Arc<AtomicI32>, Arc<AtomicBool>) {
+            let resolves = Arc::new(AtomicUsize::new(0));
+            let last_errno = Arc::new(AtomicI32::new(0));
+            let got_data = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    resolves: Arc::clone(&resolves),
+                    last_errno: Arc::clone(&last_errno),
+                    got_data: Arc::clone(&got_data),
+                },
+                resolves,
+                last_errno,
+                got_data,
+            )
+        }
     }
 
     impl PendingReply for MockReply {
-        fn resolve_data(self, _data: &[u8]) {
+        fn resolve_data(self, data: &[u8]) {
+            if !data.is_empty() {
+                self.got_data.store(true, Ordering::Relaxed);
+            }
             self.resolves.fetch_add(1, Ordering::Relaxed);
         }
-        fn resolve_error(self, _errno: libc::c_int) {
+        fn resolve_error(self, errno: libc::c_int) {
+            self.last_errno.store(errno, Ordering::Relaxed);
             self.resolves.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -749,9 +820,7 @@ mod pending_tests {
 
         for i in 0..MAX_PENDING {
             let id = table.insert(
-                MockReply {
-                    resolves: resolves.clone(),
-                },
+                MockReply::tracking(resolves.clone()),
                 i as i64,
                 deadline_in(std::time::Duration::from_secs(60)),
             );
@@ -764,9 +833,7 @@ mod pending_tests {
         let resolves_clone = Arc::clone(&resolves);
         let blocker = std::thread::spawn(move || {
             table_clone.insert(
-                MockReply {
-                    resolves: resolves_clone,
-                },
+                MockReply::tracking(resolves_clone),
                 MAX_PENDING as i64,
                 deadline_in(std::time::Duration::from_secs(60)),
             )
@@ -786,25 +853,18 @@ mod pending_tests {
     fn cancel_by_torrent_id_resolves_only_matching_tickets() {
         let table: PendingTable<MockReply> = PendingTable::new();
         let resolves = Arc::new(AtomicUsize::new(0));
-
         let a1 = table.insert(
-            MockReply {
-                resolves: resolves.clone(),
-            },
+            MockReply::tracking(resolves.clone()),
             1,
             deadline_in(std::time::Duration::from_secs(60)),
         );
         let a2 = table.insert(
-            MockReply {
-                resolves: resolves.clone(),
-            },
+            MockReply::tracking(resolves.clone()),
             1,
             deadline_in(std::time::Duration::from_secs(60)),
         );
         let b1 = table.insert(
-            MockReply {
-                resolves: resolves.clone(),
-            },
+            MockReply::tracking(resolves.clone()),
             2,
             deadline_in(std::time::Duration::from_secs(60)),
         );
@@ -829,16 +889,12 @@ mod pending_tests {
         let resolves = Arc::new(AtomicUsize::new(0));
 
         let overdue = table.insert(
-            MockReply {
-                resolves: resolves.clone(),
-            },
+            MockReply::tracking(resolves.clone()),
             7,
             deadline_in(std::time::Duration::from_secs(0)),
         );
         let future = table.insert(
-            MockReply {
-                resolves: resolves.clone(),
-            },
+            MockReply::tracking(resolves.clone()),
             7,
             deadline_in(std::time::Duration::from_secs(60)),
         );
@@ -854,5 +910,70 @@ mod pending_tests {
         // The overdue entry is gone.
         table.resolve(overdue, b"dup");
         assert_eq!(resolves.load(Ordering::Relaxed), 2);
+    }
+
+    /// TSI-2293: when a deferred read's worker returns `Ok(empty)` for a
+    /// non-zero-size request, `resolve_or_enodata` must resolve the reply
+    /// with `ENODATA` — not 0 bytes (which the kernel interprets as EOF
+    /// and `dd` exits 0).  This tests the production method directly.
+    #[test]
+    fn empty_data_for_nonzero_size_resolves_as_enodata() {
+        let table: PendingTable<MockReply> = PendingTable::new();
+        let (reply, _resolves, last_errno, got_data) = MockReply::tracked();
+
+        let id = table.insert(reply, 42, deadline_in(std::time::Duration::from_secs(60)));
+
+        // Worker got Ok(empty) for size=4096 → resolve_or_enodata must
+        // translate to ENODATA.
+        table.resolve_or_enodata(id, &[], 4096);
+
+        assert_eq!(
+            last_errno.load(Ordering::Relaxed),
+            libc::ENODATA,
+            "empty data for non-zero size must resolve as ENODATA"
+        );
+        assert!(
+            !got_data.load(Ordering::Relaxed),
+            "no data should have been delivered"
+        );
+    }
+
+    /// TSI-2293: empty data for a zero-size read is a legitimate EOF —
+    /// `resolve_or_enodata` must pass it through as data, not ENODATA.
+    #[test]
+    fn empty_data_for_zero_size_resolves_as_data() {
+        let table: PendingTable<MockReply> = PendingTable::new();
+        let (reply, _resolves, last_errno, got_data) = MockReply::tracked();
+
+        let id = table.insert(reply, 42, deadline_in(std::time::Duration::from_secs(60)));
+
+        table.resolve_or_enodata(id, &[], 0);
+
+        assert_eq!(
+            last_errno.load(Ordering::Relaxed),
+            0,
+            "zero-size read should not produce an error"
+        );
+        assert!(
+            !got_data.load(Ordering::Relaxed),
+            "empty data should not set got_data"
+        );
+    }
+
+    /// TSI-2293: non-empty data is always resolved as data, regardless of
+    /// `size`.
+    #[test]
+    fn nonempty_data_resolves_as_data() {
+        let table: PendingTable<MockReply> = PendingTable::new();
+        let (reply, _resolves, _last_errno, got_data) = MockReply::tracked();
+
+        let id = table.insert(reply, 42, deadline_in(std::time::Duration::from_secs(60)));
+
+        table.resolve_or_enodata(id, b"payload", 7);
+
+        assert!(
+            got_data.load(Ordering::Relaxed),
+            "non-empty data must be delivered"
+        );
     }
 }
