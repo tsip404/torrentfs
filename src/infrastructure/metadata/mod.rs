@@ -36,6 +36,16 @@ pub struct TorrentMetadata {
     pub info_hash: [u8; 20],
 }
 
+/// A single tracker entry extracted from a torrent file.
+///
+/// `tier` follows the BitTorrent BEP-12 convention: lower tier numbers
+/// are contacted first. The bare `announce` key maps to tier 0.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct TrackerEntry {
+    pub tier: i32,
+    pub url: String,
+}
+
 impl TorrentInfo {
     #[allow(dead_code)]
     pub fn from_file<P: AsRef<Path>>(path: P) -> TorrentResult<Self> {
@@ -265,6 +275,45 @@ impl TorrentInfo {
             info_hash: self.info_hash()?,
         })
     }
+
+    /// Extract all trackers (announce + announce-list with tier) from the
+    /// torrent file. Returns entries in the order libtorrent stores them
+    /// internally (libtorrent does not guarantee tier ordering, callers
+    /// should not rely on a specific sort order).
+    pub fn trackers(&self) -> TorrentResult<Vec<TrackerEntry>> {
+        let mut error = libtorrent_sys::lt_error_t {
+            message: ptr::null(),
+            code: 0,
+        };
+        let mut json_ptr: *mut std::os::raw::c_char = ptr::null_mut();
+
+        // SAFETY: `self.inner` is a valid handle; `json_ptr` and `error`
+        // are stack-allocated and properly initialized.
+        let result = unsafe {
+            libtorrent_sys::lt_torrent_info_trackers(self.inner, &mut json_ptr, &mut error)
+        };
+
+        if result != 0 {
+            return Err(unsafe { error_from_c(&error) });
+        }
+
+        if json_ptr.is_null() {
+            return Ok(Vec::new());
+        }
+
+        // SAFETY: `json_ptr` was populated by the successful FFI call and
+        // points to a NUL-terminated C string. We copy it before freeing.
+        let json_str = unsafe { CStr::from_ptr(json_ptr) }
+            .to_string_lossy()
+            .into_owned();
+
+        // SAFETY: `json_ptr` was allocated by `strdup` in the C++ wrapper;
+        // `lt_string_free` calls `free` exactly once.
+        unsafe { libtorrent_sys::lt_string_free(json_ptr) };
+
+        serde_json::from_str::<Vec<TrackerEntry>>(&json_str)
+            .map_err(|e| TorrentError::ParseError(format!("Failed to parse trackers JSON: {e}")))
+    }
 }
 
 impl Drop for TorrentInfo {
@@ -359,5 +408,169 @@ mod tests {
     fn test_nonexistent_file_returns_error() {
         let result = TorrentInfo::from_file("/nonexistent/path.torrent");
         assert!(result.is_err());
+    }
+
+    /// Build a torrent with a single `announce` key (no announce-list).
+    /// The announce URL is at the top level of the bencoded dict.
+    fn build_torrent_with_single_tracker(
+        announce_url: &str,
+        total: usize,
+        piece_length: usize,
+    ) -> Vec<u8> {
+        let content = (0..total).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+        let mut pieces = Vec::new();
+        for chunk in content.chunks(piece_length) {
+            use sha1_smol::Sha1;
+            pieces.extend_from_slice(&Sha1::from(chunk).digest().bytes());
+        }
+        let mut t = Vec::new();
+        t.push(b'd');
+        // announce key
+        t.extend_from_slice(b"8:announce");
+        t.extend_from_slice(announce_url.len().to_string().as_bytes());
+        t.push(b':');
+        t.extend_from_slice(announce_url.as_bytes());
+        // info dict
+        t.extend_from_slice(b"4:infod");
+        t.extend_from_slice(b"6:lengthi");
+        t.extend_from_slice(total.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"4:name4:test");
+        t.extend_from_slice(b"12:piece lengthi");
+        t.extend_from_slice(piece_length.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"6:pieces");
+        t.extend_from_slice(pieces.len().to_string().as_bytes());
+        t.push(b':');
+        t.extend_from_slice(&pieces);
+        t.extend_from_slice(b"ee");
+        t
+    }
+
+    /// Build a torrent with an `announce-list` (BEP-12 multi-tier).
+    /// Each inner Vec is a tier; the tier index is the position in the
+    /// outer Vec.
+    fn build_torrent_with_announce_list(
+        tiers: &[Vec<&str>],
+        total: usize,
+        piece_length: usize,
+    ) -> Vec<u8> {
+        let content = (0..total).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+        let mut pieces = Vec::new();
+        for chunk in content.chunks(piece_length) {
+            use sha1_smol::Sha1;
+            pieces.extend_from_slice(&Sha1::from(chunk).digest().bytes());
+        }
+        let mut t = Vec::new();
+        t.push(b'd');
+        // announce-list key
+        t.extend_from_slice(b"13:announce-listl");
+        for tier in tiers {
+            t.push(b'l');
+            for url in tier {
+                t.extend_from_slice(url.len().to_string().as_bytes());
+                t.push(b':');
+                t.extend_from_slice(url.as_bytes());
+            }
+            t.push(b'e'); // close tier list
+        }
+        t.push(b'e'); // close announce-list
+                      // info dict
+        t.extend_from_slice(b"4:infod");
+        t.extend_from_slice(b"6:lengthi");
+        t.extend_from_slice(total.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"4:name4:test");
+        t.extend_from_slice(b"12:piece lengthi");
+        t.extend_from_slice(piece_length.to_string().as_bytes());
+        t.push(b'e');
+        t.extend_from_slice(b"6:pieces");
+        t.extend_from_slice(pieces.len().to_string().as_bytes());
+        t.push(b':');
+        t.extend_from_slice(&pieces);
+        t.extend_from_slice(b"ee");
+        t
+    }
+
+    #[test]
+    fn test_trackers_single_tracker() {
+        let torrent =
+            build_torrent_with_single_tracker("http://tracker.example.com/announce", 32, 16);
+        let info = TorrentInfo::from_bytes(torrent).expect("parse valid torrent");
+        let trackers = info.trackers().expect("extract trackers");
+
+        assert_eq!(trackers.len(), 1);
+        assert_eq!(trackers[0].tier, 0);
+        assert_eq!(trackers[0].url, "http://tracker.example.com/announce");
+    }
+
+    #[test]
+    fn test_trackers_multi_tier() {
+        let torrent = build_torrent_with_announce_list(
+            &[
+                vec!["http://tracker1.example.com/announce"],
+                vec![
+                    "udp://tracker2.example.com:6969/announce",
+                    "http://tracker3.example.com/announce",
+                ],
+            ],
+            32,
+            16,
+        );
+        let info = TorrentInfo::from_bytes(torrent).expect("parse valid torrent");
+        let trackers = info.trackers().expect("extract trackers");
+
+        assert_eq!(trackers.len(), 3);
+        // Tier 0
+        assert_eq!(trackers[0].tier, 0);
+        assert_eq!(trackers[0].url, "http://tracker1.example.com/announce");
+        // Tier 1
+        assert_eq!(trackers[1].tier, 1);
+        assert_eq!(trackers[1].url, "udp://tracker2.example.com:6969/announce");
+        assert_eq!(trackers[2].tier, 1);
+        assert_eq!(trackers[2].url, "http://tracker3.example.com/announce");
+    }
+
+    #[test]
+    fn test_trackers_no_tracker() {
+        // build_test_torrent produces a torrent with no announce or announce-list.
+        let torrent = build_test_torrent(32, 16);
+        let info = TorrentInfo::from_bytes(torrent).expect("parse valid torrent");
+        let trackers = info.trackers().expect("extract trackers");
+
+        assert!(trackers.is_empty());
+    }
+
+    #[test]
+    fn test_tracker_entry_serde_roundtrip() {
+        let entries = vec![
+            TrackerEntry {
+                tier: 0,
+                url: "http://tracker.example.com/announce".to_string(),
+            },
+            TrackerEntry {
+                tier: 1,
+                url: "udp://tracker2.example.com:6969/announce".to_string(),
+            },
+        ];
+        let json = serde_json::to_string(&entries).expect("serialize");
+        let parsed: Vec<TrackerEntry> = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(entries, parsed);
+    }
+
+    #[test]
+    fn test_tracker_entry_serde_escapes_control_chars() {
+        let entry = TrackerEntry {
+            tier: 0,
+            url: "http://example.com/\t\r\n".to_string(),
+        };
+        let json = serde_json::to_string(&entry).expect("serialize");
+        // Control chars must be escaped, not literal.
+        assert!(!json.contains('\t'));
+        assert!(!json.contains('\r'));
+        assert!(!json.contains('\n'));
+        assert!(json.contains("\\t"));
+        assert!(json.contains("\\r"));
+        assert!(json.contains("\\n"));
     }
 }

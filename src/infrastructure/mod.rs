@@ -24,5 +24,5 @@ pub use download::{
     DownloadEngine, FilePieceInfo, PiecePriorityConfig, PieceScheduler, PieceStatus, PieceStore,
     Session, TorrentHandle, TorrentState, TorrentStatus as DownloadTorrentStatus,
 };
-pub use metadata::TorrentInfo;
+pub use metadata::{TorrentInfo, TrackerEntry};
 pub use metrics::{Metrics, MetricsSnapshot};
