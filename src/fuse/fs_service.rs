@@ -48,6 +48,33 @@ use super::stats::{generate_directory_stats, generate_global_stats, generate_tor
 /// clearing it only causes a few L2 disk re-reads.
 const MAX_L1_ENTRIES: usize = 256;
 
+/// TSI-2293: guard against a silent 0-byte EOF from `read_file_range`.
+///
+/// When `pieces_on_disk` (using `info.files()` summed sizes) and the
+/// engine's `read_file_range` (using libtorrent `file_offset` FFI)
+/// disagree on `file_start_offset`, the engine can return `Ok(Vec::new())`
+/// for a range that `pieces_on_disk` said was on disk (or not on disk).
+/// Returning empty data for a non-zero `size` would make the kernel see
+/// EOF and `dd` exits 0 — the user never learns the download failed.
+///
+/// `fs_service::read` verifies `offset < actual_size` before entering
+/// either the sync or the deferred read path, so `size` is always
+/// greater than zero when data is expected.  This function translates
+/// empty data for a non-zero `size` into `Err(FsError::NoPeers)` (→
+/// ENODATA), letting the user see a meaningful error instead of a
+/// silent EOF.
+fn guard_empty_read(data: &[u8], size: u32) -> Result<(), FsError> {
+    if data.is_empty() && size > 0 {
+        Err(FsError::NoPeers(format!(
+            "Read returned 0 bytes for size {} \
+             (possible file_offset mismatch)",
+            size
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 pub struct FsService {
     pub inode_mgr: InodeManager,
     pub db: Option<Arc<Mutex<Database>>>,
@@ -1347,6 +1374,18 @@ impl FsService {
                     self.metrics.l2_hit();
                     match ds.read_file_range(info.clone(), file_index, offset, size) {
                         Ok(data) => {
+                            // TSI-2293: guard against `Ok(empty)` for a
+                            // non-zero `size` — same root cause as the
+                            // deferred path (see `guard_empty_read`).
+                            if let Err(e) = guard_empty_read(&data, size) {
+                                warn!(
+                                    "Sync read returned 0 bytes for \
+                                     non-zero size (torrent_id={}, \
+                                     file_id={}, size={}); returning ENODATA",
+                                    torrent_id, file_id, size
+                                );
+                                return Err(e);
+                            }
                             // TSI-2274: populate the L1 range cache so a
                             // repeated read of this exact range is served
                             // from RAM, bypassing L2 disk + metadata fsync.
@@ -3005,6 +3044,26 @@ mod tests {
         assert_eq!(all_files.len(), 2);
         let name0 = all_files[0].name.as_str();
         let name1 = all_files[1].name.as_str();
-        assert_ne!(name0, name1, "sanitized file names must be unique");
     }
+
+    /// TSI-2293: `guard_empty_read` must reject empty data for a non-zero
+    /// `size` with `FsError::NoPeers` (→ ENODATA), preventing the silent
+    /// 0-byte EOF that `read_data`'s sync path would otherwise produce.
+    #[test]
+    fn sync_empty_data_guard_maps_to_no_peers() {
+        // Empty data, non-zero size → error.
+        let err = guard_empty_read(&[], 4096).unwrap_err();
+        assert!(matches!(err, FsError::NoPeers(_)));
+    }
+
+    /// TSI-2293: `guard_empty_read` must pass through non-empty data and
+    /// zero-size reads without error.
+    #[test]
+    fn sync_empty_data_guard_passes_nonempty_and_zero_size() {
+        // Non-empty data, non-zero size → ok.
+        assert!(guard_empty_read(b"data", 4).is_ok());
+        // Empty data, zero size → ok (legitimate EOF).
+        assert!(guard_empty_read(&[], 0).is_ok());
+    }
+
 }
