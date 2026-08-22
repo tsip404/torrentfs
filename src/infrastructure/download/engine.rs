@@ -460,16 +460,21 @@ fn engine_loop(mut state: EngineState, rx: Receiver<Command>) {
             Ok(cmd) => {
                 let stop = state.handle_command(cmd);
                 state.publish_snapshot();
+                state.flush_cache_metadata();
                 if stop {
                     break;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
                 state.publish_snapshot();
+                state.flush_cache_metadata();
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    // TSI-2274: final flush so metadata mutations that happened since the
+    // last tick are durable before the engine thread exits.
+    state.flush_cache_metadata();
     // Unregister the alert-notify hook before the session is dropped.
     if let Some(mut consumer) = state.alert_consumer.take() {
         consumer.stop();
@@ -1493,6 +1498,20 @@ impl EngineState {
                 pieces,
                 private_torrents: self.private_torrents.clone(),
             };
+        }
+    }
+
+    /// TSI-2274: periodically persist dirty cache metadata so the on-disk
+    /// state does not lag too far behind the in-memory state.  Mutating
+    /// cache methods (`record_access`, `add_piece`, `remove_piece`, …)
+    /// only flag `metadata_dirty` instead of fsyncing on every call; this
+    /// is the single flush point that hits disk.  The `main.rs` shutdown
+    /// path still calls `flush()` for the final fsync.
+    fn flush_cache_metadata(&self) {
+        if let Ok(mut cm) = self.store.cache_manager().lock() {
+            if let Err(e) = cm.flush_metadata_if_dirty() {
+                tracing::warn!("Failed to flush cache metadata: {:?}", e);
+            }
         }
     }
 

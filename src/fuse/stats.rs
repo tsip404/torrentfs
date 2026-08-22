@@ -251,10 +251,11 @@ fn write_observability(output: &mut String, metrics: Option<&MetricsSnapshot>) {
     let m = metrics.cloned().unwrap_or_default();
 
     output.push_str(&format!(
-        "  Cache L1 (memory):   hits {}  misses {}  hit rate {:.1}%\n",
+        "  Cache L1 (memory):   hits {}  misses {}  hit rate {:.1}%  entries {}\n",
         format_num(m.l1_hits),
         format_num(m.l1_misses),
-        hit_rate(m.l1_hits, m.l1_misses)
+        hit_rate(m.l1_hits, m.l1_misses),
+        format_num(m.l1_entries)
     ));
     output.push_str(&format!(
         "  Cache L2 (disk):     hits {}  misses {}  hit rate {:.1}%\n",

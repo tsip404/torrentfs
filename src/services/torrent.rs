@@ -169,7 +169,11 @@ impl TorrentService {
     /// DownloadEngine handle (and its scheduler state), and remove the
     /// SeedingManager seed — so a long-running daemon does not accumulate
     /// handles or keep announcing a deleted torrent (TSI-2232).
-    pub fn remove_torrent(&self, filename: &str, source_path: &str) -> FsResult<Option<i64>> {
+    pub fn remove_torrent(
+        &self,
+        filename: &str,
+        source_path: &str,
+    ) -> FsResult<Option<(i64, String)>> {
         let (torrent_id, info_hash, purge_pieces) = {
             let mut db_guard = self.db.lock().map_err(|_| {
                 error!("Database lock poisoned");
@@ -223,7 +227,7 @@ impl TorrentService {
             self.release_engine_and_seeding(&info_hash);
         }
 
-        Ok(torrent_id)
+        Ok(torrent_id.map(|id| (id, info_hash)))
     }
 
     /// Remove the `cache/pieces/<info_hash>/` directory and its cache metadata.
@@ -476,7 +480,7 @@ mod tests {
         assert!(pieces_dir.exists());
 
         let removed = svc.remove_torrent("foo.torrent", "src").unwrap();
-        assert_eq!(removed, Some(1));
+        assert_eq!(removed, Some((1, info_hash.clone())));
 
         // Directory and cache metadata are both gone.
         assert!(!pieces_dir.exists());
@@ -509,7 +513,7 @@ mod tests {
         assert!(pieces_dir.exists());
 
         let removed = svc.remove_torrent("foo.torrent", "a").unwrap();
-        assert_eq!(removed, Some(1));
+        assert_eq!(removed, Some((1, info_hash.clone())));
 
         // The other torrent still references this info_hash: pieces stay.
         assert!(pieces_dir.exists());
@@ -552,7 +556,7 @@ mod tests {
         assert!(!seeding_manager.has_handle(&info_hash));
 
         let removed = svc.remove_torrent("foo.torrent", "src").unwrap();
-        assert_eq!(removed, Some(1));
+        assert_eq!(removed, Some((1, info_hash.clone())));
 
         // remove_seed was called (best-effort, no-op if no handle existed);
         // the seeding manager must not track the deleted info_hash.
